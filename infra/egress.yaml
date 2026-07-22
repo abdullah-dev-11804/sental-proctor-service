@@ -1,0 +1,11 @@
+api_key: dev-livekit-key
+api_secret: dev-livekit-secret
+ws_url: ws://livekit:7880
+redis:
+  address: redis:6379
+s3:
+  access_key: sental-minio
+  secret: change-me-minio-secret
+  endpoint: http://minio:9000
+  bucket: proctoring-temp
+  force_path_style: true

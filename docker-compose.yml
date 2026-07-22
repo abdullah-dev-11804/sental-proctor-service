@@ -1,0 +1,61 @@
+services:
+  redis:
+    image: redis:7
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  livekit:
+    image: livekit/livekit-server:latest
+    command: --config /etc/livekit.yaml
+    volumes:
+      - ./infra/livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "50000-50100:50000-50100/udp"
+    depends_on:
+      - redis
+
+  livekit-egress:
+    image: livekit/egress:latest
+    environment:
+      EGRESS_CONFIG_FILE: /etc/egress.yaml
+    volumes:
+      - ./infra/egress.yaml:/etc/egress.yaml:ro
+    depends_on:
+      - redis
+      - livekit
+      - minio
+
+  api:
+    build:
+      context: ./apps/api
+    env_file:
+      - .env
+    environment:
+      LOCAL_STORAGE_ROOT: /app/storage
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8091:8091"
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      - redis
+      - minio
+
+volumes:
+  redis_data:
+  minio_data:
