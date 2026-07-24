@@ -77,43 +77,33 @@ async def verify_identity(
 def verify_moodle_identity(payload: MoodleIdentityVerifyRequest) -> dict:
     """JSON/base64 identity route used by current Moodle local_proctorcore.
 
-    Moodle performs the browser challenge and sends three images. This first
-    Server B slice compares the center frame to the Moodle profile reference;
-    yaw/liveness fields are returned as staged values until liveness is upgraded.
+    Moodle performs the browser challenge and sends three images. Server B
+    compares the center frame to the Moodle profile reference and checks that
+    the left/right frames contain enough head movement for active liveness.
     """
     reference_bytes = _decode_base64_image(payload.referenceImage)
     center_bytes = _decode_base64_image(payload.centerImage)
+    left_bytes = _decode_base64_image(payload.leftImage or "")
+    right_bytes = _decode_base64_image(payload.rightImage or "")
 
     try:
-        result = FaceMatcher().verify(center_bytes, reference_bytes)
+        result = FaceMatcher().verify_challenge(
+            center_bytes,
+            left_bytes,
+            right_bytes,
+            reference_bytes,
+            payload.threshold,
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": str(exc), "message": "One or both images could not be decoded."},
         ) from exc
 
-    matched = result.status == "passed"
     threshold = payload.threshold if payload.threshold is not None else 0.72
-    return {
-        "ok": True,
-        "transactionId": payload.transactionId,
-        "result": "matched" if matched else result.reason,
-        "identityStatus": result.status,
-        "accessDecision": result.decision,
-        "accessAllowed": result.allowed,
-        "similarityScore": result.score,
-        "threshold": threshold,
-        "livenessPassed": matched,
-        "referenceFaceCount": result.reference_quality.face_count,
-        "liveFaceCount": result.live_quality.face_count,
-        "leftYaw": None,
-        "rightYaw": None,
-        "quality": {
-            "center": result.live_quality.__dict__,
-            "reference": result.reference_quality.__dict__,
-        },
-        "engine": result.engine,
-    }
+    result["transactionId"] = payload.transactionId
+    result["threshold"] = threshold
+    return result
 
 
 def _suffix(file: UploadFile) -> str:
