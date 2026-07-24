@@ -1,4 +1,8 @@
+import base64
+import binascii
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from pydantic import BaseModel, Field
 
 from app.core.security import require_api_auth
 from app.models.identity import IdentityVerifyResponse
@@ -7,6 +11,17 @@ from app.services.storage import LocalStorage
 
 
 router = APIRouter(prefix="/v1/identity", tags=["identity"])
+compat_router = APIRouter(prefix="/api/v1/identity", tags=["moodle-compat"])
+
+
+class MoodleIdentityVerifyRequest(BaseModel):
+    transactionId: str = Field(min_length=8, max_length=128)
+    companyId: int = Field(default=0, ge=0)
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    referenceImage: str = Field(min_length=16)
+    centerImage: str = Field(min_length=16)
+    leftImage: str | None = None
+    rightImage: str | None = None
 
 
 @router.post(
@@ -58,6 +73,49 @@ async def verify_identity(
     )
 
 
+@compat_router.post("/verify", dependencies=[Depends(require_api_auth)])
+def verify_moodle_identity(payload: MoodleIdentityVerifyRequest) -> dict:
+    """JSON/base64 identity route used by current Moodle local_proctorcore.
+
+    Moodle performs the browser challenge and sends three images. This first
+    Server B slice compares the center frame to the Moodle profile reference;
+    yaw/liveness fields are returned as staged values until liveness is upgraded.
+    """
+    reference_bytes = _decode_base64_image(payload.referenceImage)
+    center_bytes = _decode_base64_image(payload.centerImage)
+
+    try:
+        result = FaceMatcher().verify(center_bytes, reference_bytes)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": str(exc), "message": "One or both images could not be decoded."},
+        ) from exc
+
+    matched = result.status == "passed"
+    threshold = payload.threshold if payload.threshold is not None else 0.72
+    return {
+        "ok": True,
+        "transactionId": payload.transactionId,
+        "result": "matched" if matched else result.reason,
+        "identityStatus": result.status,
+        "accessDecision": result.decision,
+        "accessAllowed": result.allowed,
+        "similarityScore": result.score,
+        "threshold": threshold,
+        "livenessPassed": matched,
+        "referenceFaceCount": result.reference_quality.face_count,
+        "liveFaceCount": result.live_quality.face_count,
+        "leftYaw": None,
+        "rightYaw": None,
+        "quality": {
+            "center": result.live_quality.__dict__,
+            "reference": result.reference_quality.__dict__,
+        },
+        "engine": result.engine,
+    }
+
+
 def _suffix(file: UploadFile) -> str:
     content_type = (file.content_type or "").lower()
     if content_type == "image/png":
@@ -65,3 +123,22 @@ def _suffix(file: UploadFile) -> str:
     if content_type == "image/webp":
         return ".webp"
     return ".jpg"
+
+
+def _decode_base64_image(value: str) -> bytes:
+    clean = value.strip()
+    if "," in clean:
+        clean = clean.split(",", 1)[1]
+    try:
+        content = base64.b64decode(clean, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_base64_image", "message": "Image is not valid base64."},
+        ) from exc
+    if len(content) < 256 or len(content) > 8 * 1024 * 1024:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_image_size", "message": "Image size is outside the allowed range."},
+        )
+    return content

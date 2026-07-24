@@ -1,7 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.identity import compat_router as identity_compat_router
 from app.api.identity import router as identity_router
+from app.api.sessions import compat_router as sessions_compat_router
 from app.api.sessions import router as sessions_router
 from app.api.staging import router as staging_router
 from app.core.config import get_settings
@@ -24,7 +26,9 @@ app.add_middleware(
 )
 
 app.include_router(identity_router)
+app.include_router(identity_compat_router)
 app.include_router(sessions_router)
+app.include_router(sessions_compat_router)
 app.include_router(staging_router)
 
 
@@ -32,6 +36,7 @@ app.include_router(staging_router)
 def health() -> dict:
     return {
         "ok": True,
+        "status": "healthy",
         "service": "sental-proctor-service",
         "environment": settings.app_env,
         "features": {
@@ -43,3 +48,9 @@ def health() -> dict:
             "moodle_webhooks": "staged",
         },
     }
+
+
+@app.get("/api/health")
+def api_health() -> dict:
+    """Compatibility health route for the Moodle local_proctorcore client."""
+    return health()
