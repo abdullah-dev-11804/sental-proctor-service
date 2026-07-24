@@ -83,44 +83,113 @@ class FaceMatcher:
         reference_bytes: bytes,
         pass_threshold: float | None = None,
     ) -> dict:
-        """Verifies identity plus a simple left/right active-liveness challenge."""
+        """Backwards-compatible one-frame challenge wrapper."""
+        return self.verify_sequence_challenge(
+            [center_bytes],
+            [left_bytes],
+            [right_bytes],
+            reference_bytes,
+            pass_threshold,
+        )
+
+    def verify_sequence_challenge(
+        self,
+        center_frames: list[bytes],
+        left_frames: list[bytes],
+        right_frames: list[bytes],
+        reference_bytes: bytes,
+        pass_threshold: float | None = None,
+    ) -> dict:
+        """Verifies identity plus left/right active-liveness from frame bursts."""
+        center_bytes, center_face, center_quality = self._best_frame(center_frames, prefer_frontal=True)
         match = self.verify(center_bytes, reference_bytes, pass_threshold)
         if match.status != "passed":
             return self._challenge_response(match, False, "identity_" + match.reason, 0.0, None, None)
 
-        center_image = self._decode_image(center_bytes)
-        left_image = self._decode_image(left_bytes)
-        right_image = self._decode_image(right_bytes)
-        center_face, center_quality = self._extract_primary_face(center_image)
-        left_face, left_quality = self._extract_primary_face(left_image)
-        right_face, right_quality = self._extract_primary_face(right_image)
-
         retry_reason = self._retry_reason(center_quality)
         if retry_reason:
             return self._challenge_response(match, False, retry_reason, 0.0, None, None)
-        if left_quality.face_count < 1 or right_quality.face_count < 1:
+
+        left_samples = self._valid_frame_samples(left_frames)
+        right_samples = self._valid_frame_samples(right_frames)
+        if len(left_samples) < 2 or len(right_samples) < 2:
             return self._challenge_response(match, False, "side_face_missing", 0.0, None, None)
-        if left_quality.face_count > 1 or right_quality.face_count > 1:
+        if any(sample[1].face_count > 1 for sample in left_samples + right_samples):
             return self._challenge_response(match, False, "multiple_faces", 0.0, None, None)
 
-        left_yaw = self._estimate_yaw(left_quality)
-        right_yaw = self._estimate_yaw(right_quality)
-        center_left_delta = 1.0 - self._similarity(center_face, left_face)
-        center_right_delta = 1.0 - self._similarity(center_face, right_face)
-        side_delta = 1.0 - self._similarity(left_face, right_face)
+        left_deltas = [1.0 - self._similarity(center_face, face) for face, _quality in left_samples]
+        right_deltas = [1.0 - self._similarity(center_face, face) for face, _quality in right_samples]
+        left_yaws = [self._estimate_yaw(quality) for _face, quality in left_samples]
+        right_yaws = [self._estimate_yaw(quality) for _face, quality in right_samples]
+        left_yaw = self._strongest_yaw(left_yaws)
+        right_yaw = self._strongest_yaw(right_yaws)
+
+        center_left_delta = max(left_deltas)
+        center_right_delta = max(right_deltas)
+        side_delta = max(
+            1.0 - self._similarity(left_face, right_face)
+            for left_face, _left_quality in left_samples
+            for right_face, _right_quality in right_samples
+        )
         movement_score = float(max(0.0, min(1.0, (center_left_delta + center_right_delta + side_delta) / 3.0)))
 
-        opposite_profiles = left_yaw is not None and right_yaw is not None and left_yaw * right_yaw < 0
-        enough_motion = movement_score >= 0.08
-        liveness_passed = bool(opposite_profiles or enough_motion)
+        profile_seen = any(abs(yaw or 0.0) >= 0.9 for yaw in left_yaws + right_yaws)
+        directional_change = (
+            left_yaw is not None
+            and right_yaw is not None
+            and abs(left_yaw - right_yaw) >= 0.35
+        )
+        enough_motion = center_left_delta >= 0.045 and center_right_delta >= 0.045 and side_delta >= 0.045
+        liveness_passed = bool(profile_seen or directional_change or enough_motion)
         reason = "ok" if liveness_passed else "head_turn_not_detected"
         response = self._challenge_response(match, liveness_passed, reason, movement_score, left_yaw, right_yaw)
         response["quality"].update({
             "center": center_quality.__dict__,
-            "left": left_quality.__dict__,
-            "right": right_quality.__dict__,
+            "leftFrames": [quality.__dict__ for _face, quality in left_samples],
+            "rightFrames": [quality.__dict__ for _face, quality in right_samples],
+            "centerLeftDelta": float(round(center_left_delta, 4)),
+            "centerRightDelta": float(round(center_right_delta, 4)),
+            "sideDelta": float(round(side_delta, 4)),
         })
         return response
+
+    def _best_frame(self, frames: list[bytes], prefer_frontal: bool) -> tuple[bytes, np.ndarray, FaceQuality]:
+        best: tuple[float, bytes, np.ndarray, FaceQuality] | None = None
+        for frame in frames:
+            image = self._decode_image(frame)
+            face, quality = self._extract_primary_face(image)
+            if quality.face_count < 1:
+                continue
+            score = self._quality_score(quality, prefer_frontal)
+            if best is None or score > best[0]:
+                best = (score, frame, face, quality)
+        if best is None:
+            image = self._decode_image(frames[0])
+            face, quality = self._extract_primary_face(image)
+            return frames[0], face, quality
+        return best[1], best[2], best[3]
+
+    def _valid_frame_samples(self, frames: list[bytes]) -> list[tuple[np.ndarray, FaceQuality]]:
+        samples: list[tuple[np.ndarray, FaceQuality]] = []
+        for frame in frames:
+            image = self._decode_image(frame)
+            face, quality = self._extract_primary_face(image)
+            if quality.face_count >= 1:
+                samples.append((face, quality))
+        return samples
+
+    def _quality_score(self, quality: FaceQuality, prefer_frontal: bool) -> float:
+        brightness_score = max(0.0, 1.0 - abs(quality.brightness - 115.0) / 115.0)
+        blur_score = min(1.0, quality.blur / 180.0)
+        face_score = 1.0 if quality.face_count == 1 else 0.15
+        detection_score = 0.2 if prefer_frontal and quality.detection == "frontal" else 0.0
+        return (brightness_score * 0.25) + (blur_score * 0.25) + (face_score * 0.4) + detection_score
+
+    def _strongest_yaw(self, yaws: list[float | None]) -> float | None:
+        values = [yaw for yaw in yaws if yaw is not None]
+        if not values:
+            return None
+        return max(values, key=lambda yaw: abs(yaw))
 
     def _decode_image(self, content: bytes) -> np.ndarray:
         array = np.frombuffer(content, dtype=np.uint8)
