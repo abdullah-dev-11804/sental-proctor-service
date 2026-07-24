@@ -92,6 +92,30 @@ class FaceMatcher:
             pass_threshold,
         )
 
+    def verify_center_sequence(
+        self,
+        center_frames: list[bytes],
+        reference_bytes: bytes,
+        pass_threshold: float | None = None,
+    ) -> dict:
+        """Verifies identity from a burst of straight-face frames only."""
+        center_bytes, _center_face, center_quality = self._best_frame(center_frames, prefer_frontal=True)
+        match = self.verify(center_bytes, reference_bytes, pass_threshold)
+        passed = match.status == "passed"
+        result = self._challenge_response(
+            match,
+            passed,
+            "ok" if passed else "identity_" + match.reason,
+            0.0,
+            None,
+            None,
+        )
+        result["quality"].update({
+            "center": center_quality.__dict__,
+            "mode": "face_match_only",
+        })
+        return result
+
     def verify_sequence_challenge(
         self,
         center_frames: list[bytes],

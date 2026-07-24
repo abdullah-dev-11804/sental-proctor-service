@@ -86,17 +86,21 @@ def verify_moodle_identity(payload: MoodleIdentityVerifyRequest) -> dict:
     """
     reference_bytes = _decode_base64_image(payload.referenceImage)
     center_frames = _decode_base64_images(payload.centerImages, payload.centerImage)
-    left_frames = _decode_base64_images(payload.leftImages, payload.leftImage)
-    right_frames = _decode_base64_images(payload.rightImages, payload.rightImage)
+    left_frames = _decode_optional_base64_images(payload.leftImages, payload.leftImage)
+    right_frames = _decode_optional_base64_images(payload.rightImages, payload.rightImage)
 
     try:
-        result = FaceMatcher().verify_sequence_challenge(
-            center_frames,
-            left_frames,
-            right_frames,
-            reference_bytes,
-            payload.threshold,
-        )
+        matcher = FaceMatcher()
+        if left_frames and right_frames:
+            result = matcher.verify_sequence_challenge(
+                center_frames,
+                left_frames,
+                right_frames,
+                reference_bytes,
+                payload.threshold,
+            )
+        else:
+            result = matcher.verify_center_sequence(center_frames, reference_bytes, payload.threshold)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -146,3 +150,8 @@ def _decode_base64_images(values: list[str] | None, fallback: str | None) -> lis
             detail={"code": "missing_image", "message": "At least one challenge frame is required."},
         )
     return frames
+
+
+def _decode_optional_base64_images(values: list[str] | None, fallback: str | None) -> list[bytes]:
+    source = values if values else ([fallback] if fallback else [])
+    return [_decode_base64_image(value) for value in source if value]
