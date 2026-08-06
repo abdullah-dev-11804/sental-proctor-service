@@ -69,6 +69,8 @@ docker compose up --build
 
 The Docker setup is a staging scaffold. For the first identity-verification slice, the API can run by itself without Redis, MinIO, or LiveKit.
 
+Kazakh server deployment notes live in `docs/deploy-kz-server.md`.
+
 ## Install Location
 
 Keep this outside Moodle plugin folders:
