@@ -116,6 +116,36 @@ class FaceMatcher:
         })
         return result
 
+    def select_enrollment_reference(self, center_frames: list[bytes]) -> dict:
+        """Selects and validates the best first-exam enrollment reference."""
+        reference_bytes, _face, quality = self._best_frame(center_frames, prefer_frontal=True)
+        retry_reason = self._enrollment_retry_reason(quality)
+        if retry_reason:
+            return {
+                "ok": True,
+                "result": retry_reason,
+                "accessAllowed": False,
+                "similarityScore": None,
+                "referenceBytes": None,
+                "referenceFaceCount": quality.face_count,
+                "liveFaceCount": quality.face_count,
+                "quality": {"reference": quality.__dict__, "mode": "enroll_reference"},
+                "reason": retry_reason,
+                "engine": "opencv-haar-quality-baseline-enrollment",
+            }
+        return {
+            "ok": True,
+            "result": "enrolled",
+            "accessAllowed": True,
+            "similarityScore": 1.0,
+            "referenceBytes": reference_bytes,
+            "referenceFaceCount": quality.face_count,
+            "liveFaceCount": quality.face_count,
+            "quality": {"reference": quality.__dict__, "mode": "enroll_reference"},
+            "reason": "ok",
+            "engine": "opencv-haar-quality-baseline-enrollment",
+        }
+
     def verify_sequence_challenge(
         self,
         center_frames: list[bytes],
@@ -306,6 +336,25 @@ class FaceMatcher:
             return "low_light"
         if live_quality.blur < self.settings.identity_min_blur:
             return "blurry"
+        return None
+
+    def _enrollment_retry_reason(self, quality: FaceQuality) -> str | None:
+        retry_reason = self._retry_reason(quality)
+        if retry_reason:
+            return retry_reason
+        if quality.face_count != 1:
+            return "multiple_faces"
+        if quality.detection != "frontal":
+            return "face_not_frontal"
+        if quality.face_center_x is None or quality.face_center_y is None:
+            return "face_not_framed"
+        face_ratio = quality.face_width / max(1, quality.width)
+        if face_ratio < 0.16:
+            return "face_too_far"
+        if face_ratio > 0.62:
+            return "face_too_close"
+        if not (0.30 <= quality.face_center_x <= 0.70 and 0.22 <= quality.face_center_y <= 0.78):
+            return "face_not_centered"
         return None
 
     def _similarity(self, live_face: np.ndarray, reference_face: np.ndarray) -> float:

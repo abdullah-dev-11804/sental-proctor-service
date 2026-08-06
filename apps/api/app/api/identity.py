@@ -27,6 +27,28 @@ class MoodleIdentityVerifyRequest(BaseModel):
     rightImages: list[str] | None = None
 
 
+class FaceReferenceEnrollRequest(BaseModel):
+    transactionId: str = Field(min_length=8, max_length=128)
+    companyId: int = Field(default=0, ge=0)
+    userId: int = Field(ge=1)
+    fullName: str = Field(min_length=1, max_length=255)
+    confirmedAt: int = Field(ge=1)
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    centerImages: list[str] = Field(min_length=1, max_length=12)
+
+
+class FaceReferenceVerifyRequest(BaseModel):
+    transactionId: str = Field(min_length=8, max_length=128)
+    companyId: int = Field(default=0, ge=0)
+    userId: int = Field(ge=1)
+    threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    centerImages: list[str] = Field(min_length=1, max_length=12)
+
+
+class FaceReferenceResetRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=1000)
+
+
 @router.post(
     "/verify",
     response_model=IdentityVerifyResponse,
@@ -78,12 +100,7 @@ async def verify_identity(
 
 @compat_router.post("/verify", dependencies=[Depends(require_api_auth)])
 def verify_moodle_identity(payload: MoodleIdentityVerifyRequest) -> dict:
-    """JSON/base64 identity route used by current Moodle local_proctorcore.
-
-    Moodle performs the browser challenge and sends three images. Server B
-    compares the center frame to the Moodle profile reference and checks that
-    the left/right frames contain enough head movement for active liveness.
-    """
+    """Legacy JSON/base64 route retained for older Moodle builds."""
     reference_bytes = _decode_base64_image(payload.referenceImage)
     center_frames = _decode_base64_images(payload.centerImages, payload.centerImage)
     left_frames = _decode_optional_base64_images(payload.leftImages, payload.leftImage)
@@ -111,6 +128,92 @@ def verify_moodle_identity(payload: MoodleIdentityVerifyRequest) -> dict:
     result["transactionId"] = payload.transactionId
     result["threshold"] = threshold
     return result
+
+
+@compat_router.get("/references/{user_id}", dependencies=[Depends(require_api_auth)])
+def get_face_reference(user_id: int, companyId: int = 0) -> dict:
+    stored = LocalStorage().latest_face_reference(companyId, user_id)
+    return {
+        "ok": True,
+        "exists": stored is not None,
+        "companyId": companyId,
+        "userId": user_id,
+        "referenceKey": stored[0] if stored else None,
+    }
+
+
+@compat_router.post("/references/enroll", dependencies=[Depends(require_api_auth)])
+def enroll_face_reference(payload: FaceReferenceEnrollRequest) -> dict:
+    center_frames = _decode_base64_images(payload.centerImages, None)
+    try:
+        result = FaceMatcher().select_enrollment_reference(center_frames)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": str(exc), "message": "One or more images could not be decoded."},
+        ) from exc
+
+    result["transactionId"] = payload.transactionId
+    result["threshold"] = payload.threshold
+    result["companyId"] = payload.companyId
+    result["userId"] = payload.userId
+
+    if result["result"] != "enrolled":
+        result.pop("referenceBytes", None)
+        return result
+
+    reference_bytes = result.pop("referenceBytes")
+    reference_id, reference_key = LocalStorage().save_face_reference(
+        payload.companyId,
+        payload.userId,
+        reference_bytes,
+    )
+    result["referenceId"] = reference_id
+    result["referenceKey"] = reference_key
+    return result
+
+
+@compat_router.post("/references/verify", dependencies=[Depends(require_api_auth)])
+def verify_face_reference(payload: FaceReferenceVerifyRequest) -> dict:
+    stored = LocalStorage().latest_face_reference(payload.companyId, payload.userId)
+    if stored is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "reference_not_found", "message": "No face reference is enrolled for this user."},
+        )
+
+    center_frames = _decode_base64_images(payload.centerImages, None)
+    reference_key, reference_bytes = stored
+    try:
+        result = FaceMatcher().verify_center_sequence(center_frames, reference_bytes, payload.threshold)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": str(exc), "message": "One or more images could not be decoded."},
+        ) from exc
+
+    result["transactionId"] = payload.transactionId
+    result["threshold"] = payload.threshold
+    result["companyId"] = payload.companyId
+    result["userId"] = payload.userId
+    result["referenceKey"] = reference_key
+    return result
+
+
+@compat_router.delete("/references/{user_id}", dependencies=[Depends(require_api_auth)])
+def reset_face_reference(
+    user_id: int,
+    payload: FaceReferenceResetRequest | None = None,
+    companyId: int = 0,
+) -> dict:
+    deleted = LocalStorage().delete_face_reference(companyId, user_id)
+    return {
+        "ok": True,
+        "deleted": deleted,
+        "companyId": companyId,
+        "userId": user_id,
+        "reason": payload.reason if payload else None,
+    }
 
 
 def _suffix(file: UploadFile) -> str:
