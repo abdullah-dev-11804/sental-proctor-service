@@ -35,6 +35,8 @@ class FaceReferenceEnrollRequest(BaseModel):
     confirmedAt: int = Field(ge=1)
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     centerImages: list[str] = Field(min_length=1, max_length=12)
+    leftImages: list[str] = Field(default_factory=list, max_length=16)
+    rightImages: list[str] = Field(default_factory=list, max_length=16)
 
 
 class FaceReferenceVerifyRequest(BaseModel):
@@ -43,6 +45,8 @@ class FaceReferenceVerifyRequest(BaseModel):
     userId: int = Field(ge=1)
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     centerImages: list[str] = Field(min_length=1, max_length=12)
+    leftImages: list[str] = Field(default_factory=list, max_length=16)
+    rightImages: list[str] = Field(default_factory=list, max_length=16)
 
 
 class FaceReferenceResetRequest(BaseModel):
@@ -145,8 +149,10 @@ def get_face_reference(user_id: int, companyId: int = 0) -> dict:
 @compat_router.post("/references/enroll", dependencies=[Depends(require_api_auth)])
 def enroll_face_reference(payload: FaceReferenceEnrollRequest) -> dict:
     center_frames = _decode_base64_images(payload.centerImages, None)
+    left_frames = _decode_optional_base64_images(payload.leftImages, None)
+    right_frames = _decode_optional_base64_images(payload.rightImages, None)
     try:
-        result = FaceMatcher().select_enrollment_reference(center_frames)
+        result = FaceMatcher().select_enrollment_reference(center_frames, left_frames, right_frames)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -183,9 +189,17 @@ def verify_face_reference(payload: FaceReferenceVerifyRequest) -> dict:
         )
 
     center_frames = _decode_base64_images(payload.centerImages, None)
+    left_frames = _decode_optional_base64_images(payload.leftImages, None)
+    right_frames = _decode_optional_base64_images(payload.rightImages, None)
     reference_key, reference_bytes = stored
     try:
-        result = FaceMatcher().verify_center_sequence(center_frames, reference_bytes, payload.threshold)
+        result = FaceMatcher().verify_sequence_challenge(
+            center_frames,
+            left_frames,
+            right_frames,
+            reference_bytes,
+            payload.threshold,
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

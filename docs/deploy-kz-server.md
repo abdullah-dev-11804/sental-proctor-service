@@ -116,7 +116,7 @@ Server API key: same as API_SHARED_SECRET
 Webhook secret: same as MOODLE_WEBHOOK_SECRET
 Verify SSL: No, while using plain HTTP
 LiveKit browser client URL: empty
-Identity threshold: 0.42 initial SFace auto-pass threshold
+Identity threshold: 0.36 initial SFace auto-pass threshold
 Identity mismatch mode: review during calibration
 ```
 

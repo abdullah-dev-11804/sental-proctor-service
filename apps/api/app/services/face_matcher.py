@@ -19,6 +19,7 @@ class FaceQuality:
     face_width: int = 0
     detection: str = "none"
     confidence: float | None = None
+    yaw: float | None = None
 
 
 @dataclass(frozen=True)
@@ -164,9 +165,14 @@ class FaceMatcher:
         })
         return result
 
-    def select_enrollment_reference(self, center_frames: list[bytes]) -> dict:
+    def select_enrollment_reference(
+        self,
+        center_frames: list[bytes],
+        left_frames: list[bytes] | None = None,
+        right_frames: list[bytes] | None = None,
+    ) -> dict:
         """Selects and validates the best first-exam enrollment reference."""
-        reference_bytes, _face, quality = self._best_frame(center_frames, prefer_frontal=True)
+        reference_bytes, reference_face, quality = self._best_frame(center_frames, prefer_frontal=True)
         retry_reason = self._enrollment_retry_reason(quality)
         if retry_reason:
             return {
@@ -181,6 +187,26 @@ class FaceMatcher:
                 "reason": retry_reason,
                 "engine": self.engine + "-enrollment",
             }
+        liveness = self._active_liveness(reference_face, quality, left_frames or [], right_frames or [])
+        if not liveness["passed"]:
+            return {
+                "ok": True,
+                "result": liveness["reason"],
+                "accessAllowed": False,
+                "similarityScore": None,
+                "referenceBytes": None,
+                "referenceFaceCount": quality.face_count,
+                "liveFaceCount": quality.face_count,
+                "livenessPassed": False,
+                "movementScore": liveness["movementScore"],
+                "quality": {
+                    "reference": quality.__dict__,
+                    "mode": "enroll_reference",
+                    "liveness": liveness["quality"],
+                },
+                "reason": liveness["reason"],
+                "engine": self.engine + "-enrollment",
+            }
         return {
             "ok": True,
             "result": "enrolled",
@@ -189,7 +215,13 @@ class FaceMatcher:
             "referenceBytes": reference_bytes,
             "referenceFaceCount": quality.face_count,
             "liveFaceCount": quality.face_count,
-            "quality": {"reference": quality.__dict__, "mode": "enroll_reference"},
+            "livenessPassed": True,
+            "movementScore": liveness["movementScore"],
+            "quality": {
+                "reference": quality.__dict__,
+                "mode": "enroll_reference",
+                "liveness": liveness["quality"],
+            },
             "reason": "ok",
             "engine": self.engine + "-enrollment",
         }
@@ -212,46 +244,18 @@ class FaceMatcher:
         if retry_reason:
             return self._challenge_response(match, False, retry_reason, 0.0, None, None)
 
-        left_samples = self._valid_frame_samples(left_frames)
-        right_samples = self._valid_frame_samples(right_frames)
-        if len(left_samples) < 2 or len(right_samples) < 2:
-            return self._challenge_response(match, False, "side_face_missing", 0.0, None, None)
-        if any(sample[1].face_count > 1 for sample in left_samples + right_samples):
-            return self._challenge_response(match, False, "multiple_faces", 0.0, None, None)
-
-        left_deltas = [1.0 - self._similarity(center_face, face) for face, _quality in left_samples]
-        right_deltas = [1.0 - self._similarity(center_face, face) for face, _quality in right_samples]
-        left_yaws = [self._estimate_yaw(quality) for _face, quality in left_samples]
-        right_yaws = [self._estimate_yaw(quality) for _face, quality in right_samples]
-        left_yaw = self._strongest_yaw(left_yaws)
-        right_yaw = self._strongest_yaw(right_yaws)
-
-        center_left_delta = max(left_deltas)
-        center_right_delta = max(right_deltas)
-        side_delta = max(
-            1.0 - self._similarity(left_face, right_face)
-            for left_face, _left_quality in left_samples
-            for right_face, _right_quality in right_samples
+        liveness = self._active_liveness(center_face, center_quality, left_frames, right_frames)
+        response = self._challenge_response(
+            match,
+            bool(liveness["passed"]),
+            "ok" if liveness["passed"] else str(liveness["reason"]),
+            float(liveness["movementScore"]),
+            liveness["leftYaw"],
+            liveness["rightYaw"],
         )
-        movement_score = float(max(0.0, min(1.0, (center_left_delta + center_right_delta + side_delta) / 3.0)))
-
-        profile_seen = any(abs(yaw or 0.0) >= 0.9 for yaw in left_yaws + right_yaws)
-        directional_change = (
-            left_yaw is not None
-            and right_yaw is not None
-            and abs(left_yaw - right_yaw) >= 0.35
-        )
-        enough_motion = center_left_delta >= 0.045 and center_right_delta >= 0.045 and side_delta >= 0.045
-        liveness_passed = bool(profile_seen or directional_change or enough_motion)
-        reason = "ok" if liveness_passed else "head_turn_not_detected"
-        response = self._challenge_response(match, liveness_passed, reason, movement_score, left_yaw, right_yaw)
         response["quality"].update({
             "center": center_quality.__dict__,
-            "leftFrames": [quality.__dict__ for _face, quality in left_samples],
-            "rightFrames": [quality.__dict__ for _face, quality in right_samples],
-            "centerLeftDelta": float(round(center_left_delta, 4)),
-            "centerRightDelta": float(round(center_right_delta, 4)),
-            "sideDelta": float(round(side_delta, 4)),
+            "liveness": liveness["quality"],
         })
         return response
 
@@ -279,6 +283,93 @@ class FaceMatcher:
             if quality.face_count >= 1:
                 samples.append((face, quality))
         return samples
+
+    def _active_liveness(
+        self,
+        center_face: np.ndarray,
+        center_quality: FaceQuality,
+        left_frames: list[bytes],
+        right_frames: list[bytes],
+    ) -> dict:
+        if not self.settings.identity_require_active_liveness:
+            return {
+                "passed": True,
+                "reason": "ok",
+                "movementScore": 1.0,
+                "leftYaw": None,
+                "rightYaw": None,
+                "quality": {"mode": "disabled"},
+            }
+
+        min_samples = max(1, int(self.settings.identity_min_liveness_samples))
+        left_samples = self._valid_frame_samples(left_frames)
+        right_samples = self._valid_frame_samples(right_frames)
+        if len(left_samples) < min_samples or len(right_samples) < min_samples:
+            return self._liveness_result(False, "side_face_missing", 0.0, None, None, {
+                "leftFrames": [quality.__dict__ for _face, quality in left_samples],
+                "rightFrames": [quality.__dict__ for _face, quality in right_samples],
+            })
+        if any(quality.face_count != 1 for _face, quality in left_samples + right_samples):
+            return self._liveness_result(False, "multiple_faces", 0.0, None, None, {
+                "leftFrames": [quality.__dict__ for _face, quality in left_samples],
+                "rightFrames": [quality.__dict__ for _face, quality in right_samples],
+            })
+
+        center_yaw = self._estimate_yaw(center_quality) or 0.0
+        left_yaws = [yaw for _face, quality in left_samples if (yaw := self._estimate_yaw(quality)) is not None]
+        right_yaws = [yaw for _face, quality in right_samples if (yaw := self._estimate_yaw(quality)) is not None]
+        if not left_yaws or not right_yaws:
+            return self._liveness_result(False, "head_turn_not_detected", 0.0, None, None, {
+                "centerYaw": center_yaw,
+                "leftFrames": [quality.__dict__ for _face, quality in left_samples],
+                "rightFrames": [quality.__dict__ for _face, quality in right_samples],
+            })
+
+        left_yaw = float(np.median(left_yaws))
+        right_yaw = float(np.median(right_yaws))
+        yaw_delta = abs(left_yaw - right_yaw)
+        center_delta = max(abs(left_yaw - center_yaw), abs(right_yaw - center_yaw))
+
+        left_embedding_delta = max(1.0 - self._similarity(center_face, face) for face, _quality in left_samples)
+        right_embedding_delta = max(1.0 - self._similarity(center_face, face) for face, _quality in right_samples)
+        embedding_delta = max(left_embedding_delta, right_embedding_delta)
+
+        min_yaw = float(self.settings.identity_min_liveness_yaw_delta)
+        min_embedding = float(self.settings.identity_min_liveness_embedding_delta)
+        yaw_score = min(1.0, yaw_delta / max(0.001, min_yaw))
+        embedding_score = min(1.0, embedding_delta / max(0.001, min_embedding))
+        movement_score = float(round((yaw_score * 0.70) + (embedding_score * 0.30), 4))
+        passed = yaw_delta >= min_yaw and center_delta >= (min_yaw * 0.45) and embedding_delta >= min_embedding
+        reason = "ok" if passed else "head_turn_not_detected"
+
+        return self._liveness_result(passed, reason, movement_score, left_yaw, right_yaw, {
+            "centerYaw": center_yaw,
+            "yawDelta": float(round(yaw_delta, 4)),
+            "centerDelta": float(round(center_delta, 4)),
+            "embeddingDelta": float(round(embedding_delta, 4)),
+            "leftEmbeddingDelta": float(round(left_embedding_delta, 4)),
+            "rightEmbeddingDelta": float(round(right_embedding_delta, 4)),
+            "leftFrames": [quality.__dict__ for _face, quality in left_samples],
+            "rightFrames": [quality.__dict__ for _face, quality in right_samples],
+        })
+
+    def _liveness_result(
+        self,
+        passed: bool,
+        reason: str,
+        movement_score: float,
+        left_yaw: float | None,
+        right_yaw: float | None,
+        quality: dict,
+    ) -> dict:
+        return {
+            "passed": passed,
+            "reason": reason,
+            "movementScore": movement_score,
+            "leftYaw": left_yaw,
+            "rightYaw": right_yaw,
+            "quality": quality,
+        }
 
     def _quality_score(self, quality: FaceQuality, prefer_frontal: bool) -> float:
         brightness_score = max(0.0, 1.0 - abs(quality.brightness - 115.0) / 115.0)
@@ -338,6 +429,7 @@ class FaceMatcher:
         face = max(faces, key=lambda row: float(row[2]) * float(row[3]))
         x, y, face_width, face_height = [float(value) for value in face[:4]]
         confidence = float(face[-1])
+        yaw = self._estimate_yunet_yaw(face)
         quality = FaceQuality(
             brightness=base_quality.brightness,
             blur=base_quality.blur,
@@ -349,6 +441,7 @@ class FaceMatcher:
             face_width=int(face_width),
             detection="yunet",
             confidence=confidence,
+            yaw=yaw,
         )
         aligned = self.dnn_recognizer.alignCrop(image, face)
         feature = self.dnn_recognizer.feature(aligned).astype(np.float32).reshape(1, -1)
@@ -414,6 +507,7 @@ class FaceMatcher:
             face_width=int(width),
             detection=detection,
             confidence=None,
+            yaw=None,
         )
         margin_x = int(width * 0.18)
         margin_y = int(height * 0.22)
@@ -427,6 +521,8 @@ class FaceMatcher:
         return normalised, quality
 
     def _estimate_yaw(self, quality: FaceQuality) -> float | None:
+        if quality.yaw is not None:
+            return quality.yaw
         if quality.detection == "profile_left":
             return -1.0
         if quality.detection == "profile_right":
@@ -434,6 +530,19 @@ class FaceMatcher:
         if quality.face_center_x is None:
             return None
         return float(max(-1.0, min(1.0, (quality.face_center_x - 0.5) * 2.0)))
+
+    def _estimate_yunet_yaw(self, face: np.ndarray) -> float | None:
+        if len(face) < 15:
+            return None
+        right_eye = np.array([float(face[4]), float(face[5])], dtype=np.float32)
+        left_eye = np.array([float(face[6]), float(face[7])], dtype=np.float32)
+        nose = np.array([float(face[8]), float(face[9])], dtype=np.float32)
+        eye_distance = float(np.linalg.norm(left_eye - right_eye))
+        if eye_distance <= 1e-6:
+            return None
+        eye_center = (left_eye + right_eye) / 2.0
+        raw = float((nose[0] - eye_center[0]) / eye_distance)
+        return float(max(-1.0, min(1.0, raw * 2.4)))
 
     def _retry_reason(self, live_quality: FaceQuality) -> str | None:
         if live_quality.face_count < 1:
