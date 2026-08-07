@@ -34,6 +34,8 @@ app.include_router(staging_router)
 
 @app.get("/health")
 def health() -> dict:
+    detector_model = settings.identity_model_root / settings.identity_yunet_model
+    recognizer_model = settings.identity_model_root / settings.identity_sface_model
     return {
         "ok": True,
         "status": "healthy",
@@ -41,6 +43,8 @@ def health() -> dict:
         "environment": settings.app_env,
         "features": {
             "identity_verification": True,
+            "identity_engine": settings.identity_engine,
+            "identity_models_ready": detector_model.is_file() and recognizer_model.is_file(),
             "sessions": "staged",
             "violations": "staged",
             "clips": "staged",

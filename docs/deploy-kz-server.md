@@ -79,6 +79,12 @@ Edit the file:
 nano .env
 ```
 
+Download the face detection and recognition models:
+
+```bash
+apps/api/scripts/download_face_models.sh
+```
+
 Start Server B:
 
 ```bash
@@ -96,7 +102,7 @@ curl http://vm8400.fst.kz:8091/api/health
 Expected:
 
 ```json
-{"ok":true,"status":"healthy"}
+{"ok":true,"status":"healthy","features":{"identity_engine":"opencv_sface","identity_models_ready":true}}
 ```
 
 ## Moodle Settings
@@ -110,7 +116,8 @@ Server API key: same as API_SHARED_SECRET
 Webhook secret: same as MOODLE_WEBHOOK_SECRET
 Verify SSL: No, while using plain HTTP
 LiveKit browser client URL: empty
-Identity threshold: 0.35 for the current baseline matcher
+Identity threshold: 0.42 initial SFace auto-pass threshold
+Identity mismatch mode: review during calibration
 ```
 
 Also ensure Moodle HTTP security allows port `8091`.
@@ -122,6 +129,7 @@ After pushing changes:
 ```bash
 cd /opt/sental-proctor-service
 git pull
+apps/api/scripts/download_face_models.sh
 docker compose up -d --build
 docker compose logs -f api
 ```

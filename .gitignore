@@ -9,6 +9,7 @@ storage/evidence/
 storage/references/
 storage/tmp/
 storage/reports/
+models/*.onnx
 *.log
 node_modules/
 dist/

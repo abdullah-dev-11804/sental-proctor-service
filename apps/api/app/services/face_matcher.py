@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -17,6 +18,7 @@ class FaceQuality:
     face_center_y: float | None = None
     face_width: int = 0
     detection: str = "none"
+    confidence: float | None = None
 
 
 @dataclass(frozen=True)
@@ -32,24 +34,70 @@ class FaceMatchResult:
 
 
 class FaceMatcher:
-    """Baseline face matcher for the first identity-verification slice.
+    """Face verification engine.
 
-    This intentionally uses local OpenCV primitives that work without model
-    downloads. It is good enough for staging the API and access flow. Production
-    should upgrade the internals to OpenCV YuNet + SFace ONNX models while
-    keeping this service interface stable.
+    Production mode uses OpenCV Zoo YuNet for detection and SFace for aligned
+    face embeddings. A Haar/pixel fallback can be enabled only for local
+    development smoke tests.
     """
 
     FACE_SIZE = (160, 160)
 
     def __init__(self) -> None:
         self.settings = get_settings()
+        self.engine = self.settings.identity_engine.strip().lower()
+        self.detector = None
+        self.profile_detector = None
+        self.dnn_detector = None
+        self.dnn_recognizer = None
+
+        if self.engine == "opencv_sface":
+            self._load_sface_engine()
+        else:
+            self._load_legacy_engine()
+
+    def _load_sface_engine(self) -> None:
+        detector_path = self._model_path(self.settings.identity_yunet_model)
+        recognizer_path = self._model_path(self.settings.identity_sface_model)
+        allow_legacy = self.settings.identity_allow_legacy_matcher or self.settings.app_env == "development"
+        if not detector_path.is_file() or not recognizer_path.is_file():
+            if allow_legacy:
+                self.engine = "legacy_opencv"
+                self._load_legacy_engine()
+                return
+            missing = [str(path) for path in [detector_path, recognizer_path] if not path.is_file()]
+            raise RuntimeError(
+                "Production face models are missing. Run apps/api/scripts/download_face_models.sh. "
+                + "Missing: "
+                + ", ".join(missing)
+            )
+
+        if not hasattr(cv2, "FaceDetectorYN") or not hasattr(cv2, "FaceRecognizerSF"):
+            raise RuntimeError("opencv-contrib-python-headless with FaceDetectorYN and FaceRecognizerSF is required.")
+
+        self.dnn_detector = cv2.FaceDetectorYN.create(
+            str(detector_path),
+            "",
+            (320, 320),
+            float(self.settings.identity_min_face_confidence),
+            0.3,
+            5000,
+        )
+        self.dnn_recognizer = cv2.FaceRecognizerSF.create(str(recognizer_path), "")
+
+    def _load_legacy_engine(self) -> None:
         self.detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
         self.profile_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_profileface.xml")
         if self.detector.empty():
             raise RuntimeError("OpenCV Haar face detector could not be loaded.")
         if self.profile_detector.empty():
             raise RuntimeError("OpenCV Haar profile-face detector could not be loaded.")
+
+    def _model_path(self, value: str) -> Path:
+        path = Path(value)
+        if path.is_absolute():
+            return path
+        return self.settings.identity_model_root / path
 
     def verify(self, live_bytes: bytes, reference_bytes: bytes, pass_threshold: float | None = None) -> FaceMatchResult:
         live_image = self._decode_image(live_bytes)
@@ -131,7 +179,7 @@ class FaceMatcher:
                 "liveFaceCount": quality.face_count,
                 "quality": {"reference": quality.__dict__, "mode": "enroll_reference"},
                 "reason": retry_reason,
-                "engine": "opencv-haar-quality-baseline-enrollment",
+                "engine": self.engine + "-enrollment",
             }
         return {
             "ok": True,
@@ -143,7 +191,7 @@ class FaceMatcher:
             "liveFaceCount": quality.face_count,
             "quality": {"reference": quality.__dict__, "mode": "enroll_reference"},
             "reason": "ok",
-            "engine": "opencv-haar-quality-baseline-enrollment",
+            "engine": self.engine + "-enrollment",
         }
 
     def verify_sequence_challenge(
@@ -236,8 +284,18 @@ class FaceMatcher:
         brightness_score = max(0.0, 1.0 - abs(quality.brightness - 115.0) / 115.0)
         blur_score = min(1.0, quality.blur / 180.0)
         face_score = 1.0 if quality.face_count == 1 else 0.15
-        detection_score = 0.2 if prefer_frontal and quality.detection == "frontal" else 0.0
-        return (brightness_score * 0.25) + (blur_score * 0.25) + (face_score * 0.4) + detection_score
+        detection_score = 0.2 if prefer_frontal and quality.detection in ("frontal", "yunet") else 0.0
+        confidence_score = quality.confidence if quality.confidence is not None else 1.0
+        face_ratio = quality.face_width / max(1, quality.width)
+        size_score = 1.0 if self.settings.identity_min_face_width_ratio <= face_ratio <= self.settings.identity_max_face_width_ratio else 0.3
+        return (
+            (brightness_score * 0.20)
+            + (blur_score * 0.20)
+            + (face_score * 0.30)
+            + (confidence_score * 0.15)
+            + (size_score * 0.10)
+            + detection_score
+        )
 
     def _strongest_yaw(self, yaws: list[float | None]) -> float | None:
         values = [yaw for yaw in yaws if yaw is not None]
@@ -253,6 +311,53 @@ class FaceMatcher:
         return image
 
     def _extract_primary_face(self, image: np.ndarray) -> tuple[np.ndarray, FaceQuality]:
+        if self.engine == "opencv_sface":
+            return self._extract_primary_face_sface(image)
+        return self._extract_primary_face_legacy(image)
+
+    def _extract_primary_face_sface(self, image: np.ndarray) -> tuple[np.ndarray, FaceQuality]:
+        if self.dnn_detector is None or self.dnn_recognizer is None:
+            raise RuntimeError("SFace engine is not loaded.")
+
+        height, width = image.shape[:2]
+        self.dnn_detector.setInputSize((int(width), int(height)))
+        _retval, faces = self.dnn_detector.detect(image)
+        face_count = 0 if faces is None else int(len(faces))
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        base_quality = FaceQuality(
+            brightness=float(np.mean(gray)),
+            blur=float(cv2.Laplacian(gray, cv2.CV_64F).var()),
+            face_count=face_count,
+            width=int(width),
+            height=int(height),
+            detection="yunet",
+        )
+        if faces is None or len(faces) == 0:
+            return np.zeros((1, 128), dtype=np.float32), base_quality
+
+        face = max(faces, key=lambda row: float(row[2]) * float(row[3]))
+        x, y, face_width, face_height = [float(value) for value in face[:4]]
+        confidence = float(face[-1])
+        quality = FaceQuality(
+            brightness=base_quality.brightness,
+            blur=base_quality.blur,
+            face_count=face_count,
+            width=base_quality.width,
+            height=base_quality.height,
+            face_center_x=float((x + (face_width / 2.0)) / max(1, width)),
+            face_center_y=float((y + (face_height / 2.0)) / max(1, height)),
+            face_width=int(face_width),
+            detection="yunet",
+            confidence=confidence,
+        )
+        aligned = self.dnn_recognizer.alignCrop(image, face)
+        feature = self.dnn_recognizer.feature(aligned).astype(np.float32).reshape(1, -1)
+        norm = float(np.linalg.norm(feature))
+        if norm > 1e-6:
+            feature = feature / norm
+        return feature, quality
+
+    def _extract_primary_face_legacy(self, image: np.ndarray) -> tuple[np.ndarray, FaceQuality]:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         frontal_faces = self.detector.detectMultiScale(
             gray,
@@ -308,6 +413,7 @@ class FaceMatcher:
             face_center_y=float((y + (height / 2)) / max(1, gray.shape[0])),
             face_width=int(width),
             detection=detection,
+            confidence=None,
         )
         margin_x = int(width * 0.18)
         margin_y = int(height * 0.22)
@@ -332,6 +438,8 @@ class FaceMatcher:
     def _retry_reason(self, live_quality: FaceQuality) -> str | None:
         if live_quality.face_count < 1:
             return "no_face"
+        if live_quality.confidence is not None and live_quality.confidence < self.settings.identity_min_face_confidence:
+            return "low_face_confidence"
         if live_quality.brightness < self.settings.identity_min_brightness:
             return "low_light"
         if live_quality.blur < self.settings.identity_min_blur:
@@ -344,20 +452,31 @@ class FaceMatcher:
             return retry_reason
         if quality.face_count != 1:
             return "multiple_faces"
-        if quality.detection != "frontal":
+        if self.engine != "opencv_sface" and quality.detection != "frontal":
             return "face_not_frontal"
         if quality.face_center_x is None or quality.face_center_y is None:
             return "face_not_framed"
         face_ratio = quality.face_width / max(1, quality.width)
-        if face_ratio < 0.16:
+        if face_ratio < self.settings.identity_min_face_width_ratio:
             return "face_too_far"
-        if face_ratio > 0.62:
+        if face_ratio > self.settings.identity_max_face_width_ratio:
             return "face_too_close"
-        if not (0.30 <= quality.face_center_x <= 0.70 and 0.22 <= quality.face_center_y <= 0.78):
+        min_x = 0.5 - self.settings.identity_center_tolerance_x
+        max_x = 0.5 + self.settings.identity_center_tolerance_x
+        min_y = 0.5 - self.settings.identity_center_tolerance_y
+        max_y = 0.5 + self.settings.identity_center_tolerance_y
+        if not (min_x <= quality.face_center_x <= max_x and min_y <= quality.face_center_y <= max_y):
             return "face_not_centered"
         return None
 
     def _similarity(self, live_face: np.ndarray, reference_face: np.ndarray) -> float:
+        if self.engine == "opencv_sface":
+            left = live_face.astype(np.float32).reshape(-1)
+            right = reference_face.astype(np.float32).reshape(-1)
+            denom = float(np.linalg.norm(left) * np.linalg.norm(right))
+            if denom <= 1e-6:
+                return 0.0
+            return float(max(0.0, min(1.0, np.dot(left, right) / denom)))
         hist_score = self._histogram_similarity(live_face, reference_face)
         pixel_score = self._cosine_similarity(live_face, reference_face)
         edge_score = self._edge_similarity(live_face, reference_face)
@@ -406,7 +525,7 @@ class FaceMatcher:
             reason=reason,
             live_quality=live_quality,
             reference_quality=reference_quality,
-            engine="opencv-haar-quality-baseline",
+            engine=self.engine,
         )
 
     def _challenge_response(

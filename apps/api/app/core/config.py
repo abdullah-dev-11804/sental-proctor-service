@@ -22,6 +22,16 @@ class Settings(BaseSettings):
     identity_review_threshold: float = 0.52
     identity_min_brightness: float = 35.0
     identity_min_blur: float = 35.0
+    identity_engine: str = "opencv_sface"
+    identity_allow_legacy_matcher: bool = False
+    identity_model_root: Path = Path("./models")
+    identity_yunet_model: str = "face_detection_yunet_2023mar.onnx"
+    identity_sface_model: str = "face_recognition_sface_2021dec.onnx"
+    identity_min_face_confidence: float = 0.88
+    identity_min_face_width_ratio: float = 0.16
+    identity_max_face_width_ratio: float = 0.62
+    identity_center_tolerance_x: float = 0.22
+    identity_center_tolerance_y: float = 0.28
 
     redis_url: str = "redis://localhost:6379/0"
 
@@ -51,4 +61,5 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     settings = Settings()
     settings.local_storage_root.mkdir(parents=True, exist_ok=True)
+    settings.identity_model_root.mkdir(parents=True, exist_ok=True)
     return settings
