@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     identity_require_active_liveness: bool = True
     identity_min_liveness_yaw_delta: float = 0.16
     identity_min_liveness_embedding_delta: float = 0.012
-    identity_min_liveness_samples: int = 3
+    identity_min_liveness_samples: int = 2
 
     redis_url: str = "redis://localhost:6379/0"
 

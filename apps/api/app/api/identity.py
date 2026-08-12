@@ -163,19 +163,24 @@ def enroll_face_reference(payload: FaceReferenceEnrollRequest) -> dict:
     result["threshold"] = payload.threshold
     result["companyId"] = payload.companyId
     result["userId"] = payload.userId
+    result["phase"] = "enrollment"
+    result["referenceSaved"] = False
 
     if result["result"] != "enrolled":
         result.pop("referenceBytes", None)
         return result
 
     reference_bytes = result.pop("referenceBytes")
-    reference_id, reference_key = LocalStorage().save_face_reference(
+    storage = LocalStorage()
+    storage.delete_face_reference(payload.companyId, payload.userId)
+    reference_id, reference_key = storage.save_face_reference(
         payload.companyId,
         payload.userId,
         reference_bytes,
     )
     result["referenceId"] = reference_id
     result["referenceKey"] = reference_key
+    result["referenceSaved"] = True
     return result
 
 
