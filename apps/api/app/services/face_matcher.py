@@ -5,6 +5,7 @@ import cv2
 import numpy as np
 
 from app.core.config import get_settings
+from app.services.advanced_face_engine import AdvancedFaceEngine
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,9 @@ class FaceQuality:
     detection: str = "none"
     confidence: float | None = None
     yaw: float | None = None
+    antispoof_score: float | None = None
+    antispoof_passed: bool | None = None
+    headpose_yaw_degrees: float | None = None
 
 
 @dataclass(frozen=True)
@@ -51,9 +55,13 @@ class FaceMatcher:
         self.profile_detector = None
         self.dnn_detector = None
         self.dnn_recognizer = None
+        self.advanced_engine = None
 
         if self.engine == "opencv_sface":
             self._load_sface_engine()
+        elif self.engine in ("scrfd_adaface", "production_face"):
+            self.engine = "scrfd_adaface"
+            self._load_advanced_engine()
         else:
             self._load_legacy_engine()
 
@@ -85,6 +93,9 @@ class FaceMatcher:
             5000,
         )
         self.dnn_recognizer = cv2.FaceRecognizerSF.create(str(recognizer_path), "")
+
+    def _load_advanced_engine(self) -> None:
+        self.advanced_engine = AdvancedFaceEngine(self.settings)
 
     def _load_legacy_engine(self) -> None:
         self.detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
@@ -375,7 +386,7 @@ class FaceMatcher:
         brightness_score = max(0.0, 1.0 - abs(quality.brightness - 115.0) / 115.0)
         blur_score = min(1.0, quality.blur / 180.0)
         face_score = 1.0 if quality.face_count == 1 else 0.15
-        detection_score = 0.2 if prefer_frontal and quality.detection in ("frontal", "yunet") else 0.0
+        detection_score = 0.2 if prefer_frontal and quality.detection in ("frontal", "yunet", "scrfd") else 0.0
         confidence_score = quality.confidence if quality.confidence is not None else 1.0
         face_ratio = quality.face_width / max(1, quality.width)
         size_score = 1.0 if self.settings.identity_min_face_width_ratio <= face_ratio <= self.settings.identity_max_face_width_ratio else 0.3
@@ -404,7 +415,31 @@ class FaceMatcher:
     def _extract_primary_face(self, image: np.ndarray) -> tuple[np.ndarray, FaceQuality]:
         if self.engine == "opencv_sface":
             return self._extract_primary_face_sface(image)
+        if self.engine == "scrfd_adaface":
+            return self._extract_primary_face_advanced(image)
         return self._extract_primary_face_legacy(image)
+
+    def _extract_primary_face_advanced(self, image: np.ndarray) -> tuple[np.ndarray, FaceQuality]:
+        if self.advanced_engine is None:
+            raise RuntimeError("Advanced face engine is not loaded.")
+        embedding, advanced_quality = self.advanced_engine.extract(image)
+        quality = FaceQuality(
+            brightness=advanced_quality.brightness,
+            blur=advanced_quality.blur,
+            face_count=advanced_quality.face_count,
+            width=advanced_quality.width,
+            height=advanced_quality.height,
+            face_center_x=advanced_quality.face_center_x,
+            face_center_y=advanced_quality.face_center_y,
+            face_width=advanced_quality.face_width,
+            detection=advanced_quality.detection,
+            confidence=advanced_quality.confidence,
+            yaw=advanced_quality.yaw,
+            antispoof_score=advanced_quality.antispoof_score,
+            antispoof_passed=advanced_quality.antispoof_passed,
+            headpose_yaw_degrees=advanced_quality.headpose_yaw_degrees,
+        )
+        return embedding, quality
 
     def _extract_primary_face_sface(self, image: np.ndarray) -> tuple[np.ndarray, FaceQuality]:
         if self.dnn_detector is None or self.dnn_recognizer is None:
@@ -549,6 +584,11 @@ class FaceMatcher:
             return "no_face"
         if live_quality.confidence is not None and live_quality.confidence < self.settings.identity_min_face_confidence:
             return "low_face_confidence"
+        if self.settings.identity_require_passive_antispoof:
+            if live_quality.antispoof_passed is None:
+                return "antispoof_unavailable"
+            if not live_quality.antispoof_passed:
+                return "spoof_detected"
         if live_quality.brightness < self.settings.identity_min_brightness:
             return "low_light"
         if live_quality.blur < self.settings.identity_min_blur:
@@ -561,7 +601,7 @@ class FaceMatcher:
             return retry_reason
         if quality.face_count != 1:
             return "multiple_faces"
-        if self.engine != "opencv_sface" and quality.detection != "frontal":
+        if self.engine == "legacy_opencv" and quality.detection != "frontal":
             return "face_not_frontal"
         if quality.face_center_x is None or quality.face_center_y is None:
             return "face_not_framed"
@@ -579,7 +619,7 @@ class FaceMatcher:
         return None
 
     def _similarity(self, live_face: np.ndarray, reference_face: np.ndarray) -> float:
-        if self.engine == "opencv_sface":
+        if self.engine in ("opencv_sface", "scrfd_adaface"):
             left = live_face.astype(np.float32).reshape(-1)
             right = reference_face.astype(np.float32).reshape(-1)
             denom = float(np.linalg.norm(left) * np.linalg.norm(right))

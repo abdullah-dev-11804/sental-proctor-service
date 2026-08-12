@@ -34,8 +34,7 @@ app.include_router(staging_router)
 
 @app.get("/health")
 def health() -> dict:
-    detector_model = settings.identity_model_root / settings.identity_yunet_model
-    recognizer_model = settings.identity_model_root / settings.identity_sface_model
+    identity_models = _identity_models()
     return {
         "ok": True,
         "status": "healthy",
@@ -44,7 +43,8 @@ def health() -> dict:
         "features": {
             "identity_verification": True,
             "identity_engine": settings.identity_engine,
-            "identity_models_ready": detector_model.is_file() and recognizer_model.is_file(),
+            "identity_models_ready": all(model["exists"] for model in identity_models if model["required"]),
+            "identity_models": identity_models,
             "sessions": "staged",
             "violations": "staged",
             "clips": "staged",
@@ -58,3 +58,31 @@ def health() -> dict:
 def api_health() -> dict:
     """Compatibility health route for the Moodle local_proctorcore client."""
     return health()
+
+
+def _identity_models() -> list[dict]:
+    engine = settings.identity_engine.strip().lower()
+    if engine in ("scrfd_adaface", "production_face"):
+        models = [
+            _model_status(settings.identity_scrfd_model, True, "scrfd_detector"),
+            _model_status(settings.identity_adaface_model, True, "adaface_recognizer"),
+        ]
+        if settings.identity_antispoof_model.strip() or settings.identity_require_passive_antispoof:
+            models.append(_model_status(settings.identity_antispoof_model, settings.identity_require_passive_antispoof, "passive_antispoof"))
+        if settings.identity_headpose_model.strip() or settings.identity_require_headpose_liveness:
+            models.append(_model_status(settings.identity_headpose_model, settings.identity_require_headpose_liveness, "head_pose"))
+        return models
+    return [
+        _model_status(settings.identity_yunet_model, engine == "opencv_sface", "yunet_detector"),
+        _model_status(settings.identity_sface_model, engine == "opencv_sface", "sface_recognizer"),
+    ]
+
+
+def _model_status(value: str, required: bool, role: str) -> dict:
+    path = settings.identity_model_root / value if value.strip() else settings.identity_model_root
+    return {
+        "role": role,
+        "path": str(path),
+        "required": required,
+        "exists": path.is_file() if value.strip() else False,
+    }

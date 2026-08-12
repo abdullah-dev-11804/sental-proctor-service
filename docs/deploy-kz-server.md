@@ -3,7 +3,7 @@
 Target server:
 
 ```text
-Domain: vm8400.fst.kz
+Domain: proctoring.sental.kz
 IP: 109.248.247.21
 OS: Ubuntu 22.04
 CPU/RAM/Disk: 4 vCPU, 16 GB RAM, 200 GB
@@ -79,10 +79,17 @@ Edit the file:
 nano .env
 ```
 
-Download the face detection and recognition models:
+Download the fallback face detection and recognition models:
 
 ```bash
 apps/api/scripts/download_face_models.sh
+```
+
+For the production face engine, also place the SCRFD/AdaFace ONNX files under:
+
+```text
+/opt/sental-proctor-service/models/scrfd_2.5g_kps.onnx
+/opt/sental-proctor-service/models/adaface_ir50_ms1mv2.onnx
 ```
 
 Start Server B:
@@ -96,13 +103,13 @@ Check health:
 
 ```bash
 curl http://109.248.247.21:8091/api/health
-curl http://vm8400.fst.kz:8091/api/health
+curl https://proctoring.sental.kz/api/health
 ```
 
 Expected:
 
 ```json
-{"ok":true,"status":"healthy","features":{"identity_engine":"opencv_sface","identity_models_ready":true}}
+{"ok":true,"status":"healthy","features":{"identity_engine":"scrfd_adaface","identity_models_ready":true}}
 ```
 
 ## Moodle Settings
@@ -111,16 +118,14 @@ In `local_proctorcore` settings:
 
 ```text
 Enabled: Yes
-Server B URL: http://vm8400.fst.kz:8091
+Server B URL: https://proctoring.sental.kz
 Server API key: same as API_SHARED_SECRET
 Webhook secret: same as MOODLE_WEBHOOK_SECRET
-Verify SSL: No, while using plain HTTP
+Verify SSL: Yes
 LiveKit browser client URL: empty
-Identity threshold: 0.36 initial SFace auto-pass threshold
+Identity threshold: 0.42 initial AdaFace auto-pass threshold
 Identity mismatch mode: review during calibration
 ```
-
-Also ensure Moodle HTTP security allows port `8091`.
 
 ## Redeploy
 

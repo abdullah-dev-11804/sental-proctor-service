@@ -26,4 +26,21 @@ download \
   "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx" \
   "${MODEL_DIR}/face_recognition_sface_2021dec.onnx"
 
-echo "Face models ready in ${MODEL_DIR}"
+cat <<EOF
+OpenCV fallback face models are ready in ${MODEL_DIR}.
+
+For the stricter IDENTITY_ENGINE=scrfd_adaface stack, place these files in the
+same directory:
+
+  ${MODEL_DIR}/scrfd_2.5g_kps.onnx
+  ${MODEL_DIR}/adaface_ir50_ms1mv2.onnx
+
+Optional hardening models:
+
+  ${MODEL_DIR}/minifasnet_antispoof.onnx
+  ${MODEL_DIR}/6drepnet_300w_lp.onnx
+
+The SCRFD project publishes KPS detector downloads from its official model zoo,
+and AdaFace publishes R50 pretrained weights from its official repository. Review
+model licensing with the client before government production use.
+EOF

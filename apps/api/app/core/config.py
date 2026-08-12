@@ -27,6 +27,11 @@ class Settings(BaseSettings):
     identity_model_root: Path = Path("./models")
     identity_yunet_model: str = "face_detection_yunet_2023mar.onnx"
     identity_sface_model: str = "face_recognition_sface_2021dec.onnx"
+    identity_scrfd_model: str = "scrfd_2.5g_kps.onnx"
+    identity_adaface_model: str = "adaface_ir50_ms1mv2.onnx"
+    identity_scrfd_input_size: int = 640
+    identity_adaface_input_size: int = 112
+    identity_adaface_color_order: str = "bgr"
     identity_min_face_confidence: float = 0.88
     identity_min_face_width_ratio: float = 0.16
     identity_max_face_width_ratio: float = 0.62
@@ -36,6 +41,13 @@ class Settings(BaseSettings):
     identity_min_liveness_yaw_delta: float = 0.16
     identity_min_liveness_embedding_delta: float = 0.012
     identity_min_liveness_samples: int = 2
+    identity_require_passive_antispoof: bool = False
+    identity_antispoof_model: str = ""
+    identity_antispoof_input_size: int = 80
+    identity_antispoof_live_class_index: int = 1
+    identity_antispoof_threshold: float = 0.78
+    identity_headpose_model: str = ""
+    identity_require_headpose_liveness: bool = False
 
     redis_url: str = "redis://localhost:6379/0"
 

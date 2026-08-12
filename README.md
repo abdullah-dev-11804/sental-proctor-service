@@ -13,7 +13,8 @@ Implemented now:
 
 - FastAPI service skeleton.
 - Authenticated health and staging APIs.
-- Face-recognition access endpoint using OpenCV Zoo YuNet + SFace ONNX models.
+- Face-recognition access endpoint with OpenCV Zoo YuNet + SFace fallback and a stricter SCRFD + AdaFace engine for staging/production.
+- First-exam face enrollment, reusable face reference verification, and admin reset support.
 - Local evidence/reference storage for development.
 - Staging routes for sessions, snapshot upload URLs, violations, finish-session, clips, reports, and webhooks.
 - Docker Compose scaffold for Redis, MinIO, LiveKit, and the API.
@@ -26,6 +27,7 @@ Not implemented yet:
 - HLS rolling buffer and clip worker.
 - PDF report worker.
 - Signed final webhook delivery to Moodle.
+- Audio/VAD monitoring.
 
 ## Quick Start
 
@@ -74,6 +76,10 @@ The Docker setup is a staging scaffold. For the first identity-verification slic
 Health output includes `identity_engine` and `identity_models_ready`. For staging/production,
 `identity_models_ready` must be `true`; do not enable final identity decisions while the
 service is using the development-only legacy matcher fallback.
+
+For the stronger face stack, set `IDENTITY_ENGINE=scrfd_adaface` and place the
+required SCRFD/AdaFace ONNX files under `models/`. Details are in
+`docs/identity-production-stack.md`.
 
 ## Identity Calibration
 
