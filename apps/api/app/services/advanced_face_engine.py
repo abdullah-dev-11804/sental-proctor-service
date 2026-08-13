@@ -26,6 +26,154 @@ class AdvancedFaceQuality:
     headpose_yaw_degrees: float | None = None
 
 
+class _ScrfdOnnxDetector:
+    def __init__(self, model_path: Path, input_size: int, nms_threshold: float = 0.4) -> None:
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise RuntimeError("SCRFD ONNX detection requires the onnxruntime package.") from exc
+
+        self.session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_names = [output.name for output in self.session.get_outputs()]
+        self.input_size = (int(input_size), int(input_size))
+        self.nms_threshold = float(nms_threshold)
+        self.strides = [8, 16, 32]
+        self.feature_count = 3
+        self.use_keypoints = len(self.output_names) >= 9
+        self.num_anchors = 2
+        self.center_cache: dict[tuple[int, int, int], np.ndarray] = {}
+
+    def detect(self, image: np.ndarray, threshold: float, max_num: int = 0, metric: str = "default") -> tuple[np.ndarray, np.ndarray | None]:
+        input_width, input_height = self.input_size
+        image_ratio = float(image.shape[0]) / max(1, image.shape[1])
+        model_ratio = float(input_height) / max(1, input_width)
+        if image_ratio > model_ratio:
+            resized_height = input_height
+            resized_width = int(resized_height / image_ratio)
+        else:
+            resized_width = input_width
+            resized_height = int(resized_width * image_ratio)
+
+        det_scale = float(resized_height) / max(1, image.shape[0])
+        resized = cv2.resize(image, (resized_width, resized_height))
+        canvas = np.zeros((input_height, input_width, 3), dtype=np.uint8)
+        canvas[:resized_height, :resized_width, :] = resized
+
+        blob = cv2.dnn.blobFromImage(
+            canvas,
+            scalefactor=1.0 / 128.0,
+            size=self.input_size,
+            mean=(127.5, 127.5, 127.5),
+            swapRB=True,
+        )
+        outputs = self.session.run(self.output_names, {self.input_name: blob})
+
+        scores_list = []
+        boxes_list = []
+        keypoints_list = []
+        for index, stride in enumerate(self.strides):
+            scores = outputs[index][0].reshape(-1)
+            box_predictions = outputs[index + self.feature_count][0] * stride
+            keypoint_predictions = None
+            if self.use_keypoints:
+                keypoint_predictions = outputs[index + (self.feature_count * 2)][0] * stride
+
+            height = input_height // stride
+            width = input_width // stride
+            centers = self._anchor_centers(height, width, stride)
+            selected = np.where(scores >= threshold)[0]
+            if selected.size == 0:
+                continue
+
+            decoded_boxes = self._distance_to_boxes(centers, box_predictions)
+            scores_list.append(scores[selected])
+            boxes_list.append(decoded_boxes[selected])
+            if keypoint_predictions is not None:
+                decoded_keypoints = self._distance_to_keypoints(centers, keypoint_predictions).reshape((-1, 5, 2))
+                keypoints_list.append(decoded_keypoints[selected])
+
+        if not boxes_list:
+            return np.zeros((0, 5), dtype=np.float32), None
+
+        scores = np.concatenate(scores_list).reshape(-1)
+        boxes = np.vstack(boxes_list) / det_scale
+        order = scores.argsort()[::-1]
+        detections = np.hstack((boxes, scores[:, None])).astype(np.float32, copy=False)[order]
+        keep = self._nms(detections)
+        detections = detections[keep]
+
+        keypoints = None
+        if keypoints_list:
+            keypoints = np.vstack(keypoints_list)[order][keep] / det_scale
+
+        if max_num > 0 and detections.shape[0] > max_num:
+            selected = self._select_best_faces(detections, image.shape, max_num, metric)
+            detections = detections[selected]
+            if keypoints is not None:
+                keypoints = keypoints[selected]
+        return detections, keypoints
+
+    def _anchor_centers(self, height: int, width: int, stride: int) -> np.ndarray:
+        key = (height, width, stride)
+        if key not in self.center_cache:
+            centers = np.stack(np.mgrid[:height, :width][::-1], axis=-1).astype(np.float32)
+            centers = (centers * stride).reshape((-1, 2))
+            centers = np.stack([centers] * self.num_anchors, axis=1).reshape((-1, 2))
+            self.center_cache[key] = centers
+        return self.center_cache[key]
+
+    def _distance_to_boxes(self, points: np.ndarray, distance: np.ndarray) -> np.ndarray:
+        return np.stack(
+            [
+                points[:, 0] - distance[:, 0],
+                points[:, 1] - distance[:, 1],
+                points[:, 0] + distance[:, 2],
+                points[:, 1] + distance[:, 3],
+            ],
+            axis=-1,
+        )
+
+    def _distance_to_keypoints(self, points: np.ndarray, distance: np.ndarray) -> np.ndarray:
+        values = []
+        for index in range(0, distance.shape[1], 2):
+            values.append(points[:, index % 2] + distance[:, index])
+            values.append(points[:, index % 2 + 1] + distance[:, index + 1])
+        return np.stack(values, axis=-1)
+
+    def _nms(self, detections: np.ndarray) -> list[int]:
+        x1 = detections[:, 0]
+        y1 = detections[:, 1]
+        x2 = detections[:, 2]
+        y2 = detections[:, 3]
+        scores = detections[:, 4]
+        areas = (x2 - x1 + 1.0) * (y2 - y1 + 1.0)
+        order = scores.argsort()[::-1]
+        keep = []
+        while order.size > 0:
+            current = int(order[0])
+            keep.append(current)
+            xx1 = np.maximum(x1[current], x1[order[1:]])
+            yy1 = np.maximum(y1[current], y1[order[1:]])
+            xx2 = np.minimum(x2[current], x2[order[1:]])
+            yy2 = np.minimum(y2[current], y2[order[1:]])
+            width = np.maximum(0.0, xx2 - xx1 + 1.0)
+            height = np.maximum(0.0, yy2 - yy1 + 1.0)
+            overlap = (width * height) / np.maximum(1e-6, areas[current] + areas[order[1:]] - (width * height))
+            order = order[np.where(overlap <= self.nms_threshold)[0] + 1]
+        return keep
+
+    def _select_best_faces(self, detections: np.ndarray, image_shape: tuple[int, ...], max_num: int, metric: str) -> np.ndarray:
+        areas = (detections[:, 2] - detections[:, 0]) * (detections[:, 3] - detections[:, 1])
+        image_center = image_shape[0] // 2, image_shape[1] // 2
+        offsets = np.vstack([
+            (detections[:, 0] + detections[:, 2]) / 2.0 - image_center[1],
+            (detections[:, 1] + detections[:, 3]) / 2.0 - image_center[0],
+        ])
+        values = areas if metric == "max" else areas - (np.sum(np.power(offsets, 2.0), axis=0) * 2.0)
+        return np.argsort(values)[::-1][:max_num]
+
+
 class AdvancedFaceEngine:
     """SCRFD detector + AdaFace embedding engine.
 
@@ -74,18 +222,7 @@ class AdvancedFaceEngine:
         detector_path = self._model_path(self.settings.identity_scrfd_model)
         if not detector_path.is_file():
             raise RuntimeError(f"SCRFD model is missing: {detector_path}")
-        try:
-            from insightface.model_zoo import get_model
-        except ImportError as exc:
-            raise RuntimeError("The scrfd_adaface engine requires the insightface package.") from exc
-
-        detector = get_model(str(detector_path), providers=["CPUExecutionProvider"])
-        detector.prepare(
-            ctx_id=-1,
-            input_size=(int(self.settings.identity_scrfd_input_size), int(self.settings.identity_scrfd_input_size)),
-            det_thresh=float(self.settings.identity_min_face_confidence),
-        )
-        return detector
+        return _ScrfdOnnxDetector(detector_path, int(self.settings.identity_scrfd_input_size))
 
     def _load_onnx(self, model_path: Path, label: str) -> Any:
         if not model_path.is_file():
@@ -102,7 +239,12 @@ class AdvancedFaceEngine:
         brightness = float(np.mean(gray))
         blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-        bboxes, keypoints = self.detector.detect(image, max_num=0, metric="default")
+        bboxes, keypoints = self.detector.detect(
+            image,
+            threshold=float(self.settings.identity_min_face_confidence),
+            max_num=0,
+            metric="default",
+        )
         face_count = 0 if bboxes is None else int(len(bboxes))
         base_quality = AdvancedFaceQuality(
             brightness=brightness,
