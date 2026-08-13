@@ -37,7 +37,8 @@ class Settings(BaseSettings):
     identity_max_face_width_ratio: float = 0.62
     identity_center_tolerance_x: float = 0.22
     identity_center_tolerance_y: float = 0.28
-    identity_require_active_liveness: bool = True
+    identity_require_active_liveness: bool = False
+    identity_require_enrollment_liveness: bool = False
     identity_min_liveness_yaw_delta: float = 0.16
     identity_min_liveness_embedding_delta: float = 0.012
     identity_min_liveness_samples: int = 2

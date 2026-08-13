@@ -198,7 +198,15 @@ class FaceMatcher:
                 "reason": retry_reason,
                 "engine": self.engine + "-enrollment",
             }
-        liveness = self._active_liveness(reference_face, quality, left_frames or [], right_frames or [])
+        if self.settings.identity_require_enrollment_liveness:
+            liveness = self._active_liveness(reference_face, quality, left_frames or [], right_frames or [])
+        else:
+            liveness = {
+                "passed": True,
+                "reason": "ok",
+                "movementScore": 0.0,
+                "quality": {"mode": "disabled_for_enrollment"},
+            }
         if not liveness["passed"]:
             return {
                 "ok": True,

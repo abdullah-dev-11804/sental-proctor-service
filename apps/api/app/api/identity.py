@@ -1,5 +1,6 @@
 import base64
 import binascii
+from functools import lru_cache
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
@@ -79,7 +80,7 @@ async def verify_identity(
     reference_key = storage.save_identity_image(company_id, session_id, "reference", reference_bytes, _suffix(reference_image))
 
     try:
-        result = FaceMatcher().verify(live_bytes, reference_bytes)
+        result = get_face_matcher().verify(live_bytes, reference_bytes)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -111,7 +112,7 @@ def verify_moodle_identity(payload: MoodleIdentityVerifyRequest) -> dict:
     right_frames = _decode_optional_base64_images(payload.rightImages, payload.rightImage)
 
     try:
-        matcher = FaceMatcher()
+        matcher = get_face_matcher()
         if left_frames and right_frames:
             result = matcher.verify_sequence_challenge(
                 center_frames,
@@ -152,7 +153,7 @@ def enroll_face_reference(payload: FaceReferenceEnrollRequest) -> dict:
     left_frames = _decode_optional_base64_images(payload.leftImages, None)
     right_frames = _decode_optional_base64_images(payload.rightImages, None)
     try:
-        result = FaceMatcher().select_enrollment_reference(center_frames, left_frames, right_frames)
+        result = get_face_matcher().select_enrollment_reference(center_frames, left_frames, right_frames)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -198,7 +199,7 @@ def verify_face_reference(payload: FaceReferenceVerifyRequest) -> dict:
     right_frames = _decode_optional_base64_images(payload.rightImages, None)
     reference_key, reference_bytes = stored
     try:
-        result = FaceMatcher().verify_sequence_challenge(
+        result = get_face_matcher().verify_sequence_challenge(
             center_frames,
             left_frames,
             right_frames,
@@ -242,6 +243,11 @@ def _suffix(file: UploadFile) -> str:
     if content_type == "image/webp":
         return ".webp"
     return ".jpg"
+
+
+@lru_cache(maxsize=1)
+def get_face_matcher() -> FaceMatcher:
+    return FaceMatcher()
 
 
 def _decode_base64_image(value: str) -> bytes:
