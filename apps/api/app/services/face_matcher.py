@@ -250,6 +250,9 @@ class FaceMatcher:
         template: dict,
         pass_threshold: float | None = None,
     ) -> dict:
+        if not isinstance(template, dict):
+            template = {}
+
         samples = self._collect_embedding_samples(
             center_frames,
             retry_reason_fn=self._enrollment_retry_reason,
@@ -274,7 +277,7 @@ class FaceMatcher:
             )
 
         scores: list[float] = []
-        mean_embedding = self._normalize_embedding(np.asarray(template.get("meanEmbedding") or [], dtype=np.float32))
+        mean_embedding = self._template_mean_embedding(template)
         if mean_embedding is not None:
             scores.extend(self._cosine_scores(live_embeddings, [mean_embedding]))
         scores.extend(self._cosine_scores(live_embeddings, reference_embeddings))
@@ -340,8 +343,11 @@ class FaceMatcher:
     ) -> list[dict]:
         samples: list[dict] = []
         for frame in frames[: max(1, int(self.settings.identity_max_enrollment_frames))]:
-            image = self._decode_image(frame)
-            embedding, quality = self._extract_primary_face(image)
+            try:
+                image = self._decode_image(frame)
+                embedding, quality = self._extract_primary_face(image)
+            except (ValueError, cv2.error):
+                continue
             if quality.face_count < 1:
                 continue
             retry_reason = retry_reason_fn(quality)
@@ -414,17 +420,39 @@ class FaceMatcher:
         }
 
     def _template_embeddings(self, template: dict) -> list[np.ndarray]:
+        if not isinstance(template, dict):
+            return []
         embeddings = []
-        for item in template.get("embeddings", []) or []:
-            normalized = self._normalize_embedding(np.asarray(item, dtype=np.float32))
+        raw_embeddings = template.get("embeddings", []) or []
+        if not isinstance(raw_embeddings, list):
+            return []
+        for item in raw_embeddings:
+            try:
+                normalized = self._normalize_embedding(np.asarray(item, dtype=np.float32))
+            except (TypeError, ValueError):
+                continue
             if normalized is not None:
                 embeddings.append(normalized)
         return embeddings
 
+    def _template_mean_embedding(self, template: dict) -> np.ndarray | None:
+        if not isinstance(template, dict):
+            return None
+        raw_embedding = template.get("meanEmbedding")
+        if raw_embedding is None:
+            return None
+        try:
+            return self._normalize_embedding(np.asarray(raw_embedding, dtype=np.float32))
+        except (TypeError, ValueError):
+            return None
+
     def _normalize_embedding(self, embedding: np.ndarray | list[float] | None) -> np.ndarray | None:
         if embedding is None:
             return None
-        vector = np.asarray(embedding, dtype=np.float32).reshape(1, -1)
+        try:
+            vector = np.asarray(embedding, dtype=np.float32).reshape(1, -1)
+        except (TypeError, ValueError):
+            return None
         norm = float(np.linalg.norm(vector))
         if norm <= 1e-6:
             return None
@@ -501,6 +529,10 @@ class FaceMatcher:
     ) -> dict:
         threshold = pass_threshold if pass_threshold is not None else self.settings.identity_pass_threshold
         review_threshold = float(self.settings.identity_review_threshold)
+        template_quality = template.get("quality", {}) if isinstance(template, dict) else {}
+        template_embeddings = template.get("embeddings", []) if isinstance(template, dict) else []
+        if not isinstance(template_embeddings, list):
+            template_embeddings = []
         retry_reasons = {
             "not_enough_good_live_frames",
             "not_enough_good_frames",
@@ -519,12 +551,12 @@ class FaceMatcher:
             "reviewThreshold": review_threshold,
             "livenessPassed": True,
             "movementScore": 0.0,
-            "referenceFaceCount": len(template.get("embeddings", []) or []),
+            "referenceFaceCount": len(template_embeddings),
             "liveFaceCount": len(samples),
             "quality": {
                 "live": [quality.__dict__ for _embedding, quality in samples],
-                "reference": template.get("quality", {}),
-                "template": template.get("quality", {}),
+                "reference": template_quality,
+                "template": template_quality,
             },
             "engine": self.engine + "-challenge",
             "reason": reason,
@@ -582,8 +614,11 @@ class FaceMatcher:
     def _valid_frame_samples(self, frames: list[bytes]) -> list[tuple[np.ndarray, FaceQuality]]:
         samples: list[tuple[np.ndarray, FaceQuality]] = []
         for frame in frames:
-            image = self._decode_image(frame)
-            face, quality = self._extract_primary_face(image)
+            try:
+                image = self._decode_image(frame)
+                face, quality = self._extract_primary_face(image)
+            except (ValueError, cv2.error):
+                continue
             if quality.face_count >= 1:
                 samples.append((face, quality))
         return samples

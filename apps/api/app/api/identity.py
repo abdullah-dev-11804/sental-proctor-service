@@ -1,5 +1,6 @@
 import base64
 import binascii
+import logging
 from functools import lru_cache
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -14,6 +15,7 @@ from app.services.storage import LocalStorage
 
 router = APIRouter(prefix="/v1/identity", tags=["identity"])
 compat_router = APIRouter(prefix="/api/v1/identity", tags=["moodle-compat"])
+logger = logging.getLogger(__name__)
 
 
 class MoodleIdentityVerifyRequest(BaseModel):
@@ -159,19 +161,32 @@ def get_face_reference(user_id: int, companyId: int = 0) -> dict:
 @compat_router.post("/references/enroll", dependencies=[Depends(require_api_auth)])
 def enroll_face_reference(payload: FaceReferenceEnrollRequest) -> dict:
     settings = get_settings()
-    center_frames = _decode_base64_images(payload.centerImages, payload.centerImage)
-    left_frames = _decode_optional_base64_images(payload.leftImages, payload.leftImage)
-    right_frames = _decode_optional_base64_images(payload.rightImages, payload.rightImage)
+    threshold = payload.threshold if payload.threshold is not None else float(settings.identity_pass_threshold)
     try:
+        center_frames = _decode_base64_images(payload.centerImages, payload.centerImage)
+        left_frames = _decode_optional_base64_images(payload.leftImages, payload.leftImage)
+        right_frames = _decode_optional_base64_images(payload.rightImages, payload.rightImage)
         result = get_face_matcher().select_enrollment_reference(center_frames, left_frames, right_frames)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": str(exc), "message": "One or more images could not be decoded."},
-        ) from exc
+    except (HTTPException, ValueError) as exc:
+        logger.warning(
+            "identity enrollment capture rejected: transaction=%s company=%s user=%s detail=%s",
+            payload.transactionId,
+            payload.companyId,
+            payload.userId,
+            _exception_detail(exc),
+        )
+        return _reference_retry_response(
+            payload.transactionId,
+            payload.companyId,
+            payload.userId,
+            threshold,
+            "enrollment",
+            "not_enough_good_frames",
+            _exception_detail(exc),
+        )
 
     result["transactionId"] = payload.transactionId
-    result["threshold"] = payload.threshold if payload.threshold is not None else float(settings.identity_pass_threshold)
+    result["threshold"] = threshold
     result["companyId"] = payload.companyId
     result["userId"] = payload.userId
     result["phase"] = "enrollment"
@@ -210,24 +225,38 @@ def verify_face_reference(payload: FaceReferenceVerifyRequest) -> dict:
             detail={"code": "reference_not_found", "message": "No face reference is enrolled for this user."},
         )
 
-    center_frames = _decode_base64_images(payload.centerImages, payload.centerImage)
-    left_frames = _decode_optional_base64_images(payload.leftImages, payload.leftImage)
-    right_frames = _decode_optional_base64_images(payload.rightImages, payload.rightImage)
+    threshold = payload.threshold if payload.threshold is not None else float(settings.identity_pass_threshold)
     reference_key, template = stored
     try:
+        center_frames = _decode_base64_images(payload.centerImages, payload.centerImage)
+        _decode_optional_base64_images(payload.leftImages, payload.leftImage)
+        _decode_optional_base64_images(payload.rightImages, payload.rightImage)
         result = get_face_matcher().verify_against_template(
             center_frames,
             template,
             payload.threshold,
         )
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": str(exc), "message": "One or more images could not be decoded."},
-        ) from exc
+    except (HTTPException, ValueError) as exc:
+        logger.warning(
+            "identity verification capture rejected: transaction=%s company=%s user=%s detail=%s",
+            payload.transactionId,
+            payload.companyId,
+            payload.userId,
+            _exception_detail(exc),
+        )
+        return _reference_retry_response(
+            payload.transactionId,
+            payload.companyId,
+            payload.userId,
+            threshold,
+            "verify",
+            "not_enough_good_live_frames",
+            _exception_detail(exc),
+            reference_key=reference_key,
+        )
 
     result["transactionId"] = payload.transactionId
-    result["threshold"] = payload.threshold if payload.threshold is not None else float(settings.identity_pass_threshold)
+    result["threshold"] = threshold
     result["companyId"] = payload.companyId
     result["userId"] = payload.userId
     result["referenceKey"] = reference_key
@@ -263,6 +292,52 @@ def _suffix(file: UploadFile) -> str:
 @lru_cache(maxsize=1)
 def get_face_matcher() -> FaceMatcher:
     return FaceMatcher()
+
+
+def _reference_retry_response(
+    transaction_id: str,
+    company_id: int,
+    user_id: int,
+    threshold: float,
+    phase: str,
+    reason: str,
+    error_detail,
+    reference_key: str | None = None,
+) -> dict:
+    response = {
+        "ok": True,
+        "result": reason,
+        "identityStatus": "needs_retry",
+        "accessDecision": "retry",
+        "accessAllowed": False,
+        "similarityScore": None,
+        "threshold": threshold,
+        "companyId": company_id,
+        "userId": user_id,
+        "transactionId": transaction_id,
+        "phase": phase,
+        "referenceFaceCount": 0,
+        "liveFaceCount": 0,
+        "livenessPassed": False,
+        "movementScore": 0.0,
+        "quality": {
+            "mode": phase,
+            "error": error_detail,
+        },
+        "reason": reason,
+        "engine": f"{get_face_matcher().engine}-{phase}",
+    }
+    if phase == "enrollment":
+        response["referenceSaved"] = False
+    if reference_key is not None:
+        response["referenceKey"] = reference_key
+    return response
+
+
+def _exception_detail(exc) -> str | dict:
+    if isinstance(exc, HTTPException):
+        return exc.detail
+    return str(exc)
 
 
 def _decode_base64_image(value: str) -> bytes:
