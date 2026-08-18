@@ -137,8 +137,8 @@ class _ScrfdOnnxDetector:
     def _distance_to_keypoints(self, points: np.ndarray, distance: np.ndarray) -> np.ndarray:
         values = []
         for index in range(0, distance.shape[1], 2):
-            values.append(points[:, index % 2] + distance[:, index])
-            values.append(points[:, index % 2 + 1] + distance[:, index + 1])
+            values.append(points[:, 0] + distance[:, index])
+            values.append(points[:, 1] + distance[:, index + 1])
         return np.stack(values, axis=-1)
 
     def _nms(self, detections: np.ndarray) -> list[int]:
@@ -199,6 +199,7 @@ class AdvancedFaceEngine:
         self.recognizer = self._load_onnx(self._model_path(settings.identity_adaface_model), "AdaFace")
         self.antispoof = None
         self.headpose = None
+        self.runtime = self._build_runtime()
 
         antispoof_model = str(settings.identity_antispoof_model).strip()
         if antispoof_model:
@@ -232,6 +233,33 @@ class AdvancedFaceEngine:
         except ImportError as exc:
             raise RuntimeError("The scrfd_adaface engine requires the onnxruntime package.") from exc
         return ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+
+    def _build_runtime(self) -> dict[str, Any]:
+        return {
+            "identity_engine_config": str(self.settings.identity_engine),
+            "identity_engine_loaded": "scrfd_adaface",
+            "scrfd_model_exists": self._model_path(self.settings.identity_scrfd_model).is_file(),
+            "adaface_model_exists": self._model_path(self.settings.identity_adaface_model).is_file(),
+            "adaface_input_shape": self._shape_list(self.recognizer.get_inputs()[0].shape),
+            "adaface_output_shape": self._shape_list(self.recognizer.get_outputs()[0].shape),
+            "adaface_color_order": str(self.settings.identity_adaface_color_order).strip().lower(),
+            "pass_threshold": float(self.settings.identity_pass_threshold),
+            "review_threshold": float(self.settings.identity_review_threshold),
+        }
+
+    def describe_runtime(self) -> dict[str, Any]:
+        return dict(self.runtime)
+
+    def _shape_list(self, shape: Any) -> list[Any]:
+        if isinstance(shape, (list, tuple)):
+            result = []
+            for value in shape:
+                if isinstance(value, (int, float)) and float(value).is_integer():
+                    result.append(int(value))
+                else:
+                    result.append(value)
+            return result
+        return [shape]
 
     def extract(self, image: np.ndarray) -> tuple[np.ndarray, AdvancedFaceQuality]:
         height, width = image.shape[:2]

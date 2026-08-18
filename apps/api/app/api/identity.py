@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from pydantic import BaseModel, Field
 
 from app.core.security import require_api_auth
+from app.core.config import get_settings
 from app.models.identity import IdentityVerifyResponse
 from app.services.face_matcher import FaceMatcher
 from app.services.storage import LocalStorage
@@ -106,6 +107,7 @@ async def verify_identity(
 @compat_router.post("/verify", dependencies=[Depends(require_api_auth)])
 def verify_moodle_identity(payload: MoodleIdentityVerifyRequest) -> dict:
     """Legacy JSON/base64 route retained for older Moodle builds."""
+    settings = get_settings()
     reference_bytes = _decode_base64_image(payload.referenceImage)
     center_frames = _decode_base64_images(payload.centerImages, payload.centerImage)
     left_frames = _decode_optional_base64_images(payload.leftImages, payload.leftImage)
@@ -129,7 +131,7 @@ def verify_moodle_identity(payload: MoodleIdentityVerifyRequest) -> dict:
             detail={"code": str(exc), "message": "One or both images could not be decoded."},
         ) from exc
 
-    threshold = payload.threshold if payload.threshold is not None else 0.72
+    threshold = payload.threshold if payload.threshold is not None else float(settings.identity_pass_threshold)
     result["transactionId"] = payload.transactionId
     result["threshold"] = threshold
     return result
@@ -137,18 +139,20 @@ def verify_moodle_identity(payload: MoodleIdentityVerifyRequest) -> dict:
 
 @compat_router.get("/references/{user_id}", dependencies=[Depends(require_api_auth)])
 def get_face_reference(user_id: int, companyId: int = 0) -> dict:
-    stored = LocalStorage().latest_face_reference(companyId, user_id)
+    stored = LocalStorage().latest_face_template(companyId, user_id)
     return {
         "ok": True,
         "exists": stored is not None,
         "companyId": companyId,
         "userId": user_id,
         "referenceKey": stored[0] if stored else None,
+        "template": stored[1] if stored else None,
     }
 
 
 @compat_router.post("/references/enroll", dependencies=[Depends(require_api_auth)])
 def enroll_face_reference(payload: FaceReferenceEnrollRequest) -> dict:
+    settings = get_settings()
     center_frames = _decode_base64_images(payload.centerImages, None)
     left_frames = _decode_optional_base64_images(payload.leftImages, None)
     right_frames = _decode_optional_base64_images(payload.rightImages, None)
@@ -161,7 +165,7 @@ def enroll_face_reference(payload: FaceReferenceEnrollRequest) -> dict:
         ) from exc
 
     result["transactionId"] = payload.transactionId
-    result["threshold"] = payload.threshold
+    result["threshold"] = payload.threshold if payload.threshold is not None else float(settings.identity_pass_threshold)
     result["companyId"] = payload.companyId
     result["userId"] = payload.userId
     result["phase"] = "enrollment"
@@ -169,25 +173,31 @@ def enroll_face_reference(payload: FaceReferenceEnrollRequest) -> dict:
 
     if result["result"] != "enrolled":
         result.pop("referenceBytes", None)
+        result.pop("bestReferenceBytes", None)
+        result.pop("template", None)
         return result
 
-    reference_bytes = result.pop("referenceBytes")
+    reference_bytes = result.pop("bestReferenceBytes", None) or result.pop("referenceBytes", None)
+    template = result.pop("template", None)
     storage = LocalStorage()
     storage.delete_face_reference(payload.companyId, payload.userId)
-    reference_id, reference_key = storage.save_face_reference(
+    reference_id, reference_key, best_reference_key = storage.save_face_template(
         payload.companyId,
         payload.userId,
+        template or {},
         reference_bytes,
     )
     result["referenceId"] = reference_id
     result["referenceKey"] = reference_key
+    result["bestReferenceKey"] = best_reference_key
     result["referenceSaved"] = True
     return result
 
 
 @compat_router.post("/references/verify", dependencies=[Depends(require_api_auth)])
 def verify_face_reference(payload: FaceReferenceVerifyRequest) -> dict:
-    stored = LocalStorage().latest_face_reference(payload.companyId, payload.userId)
+    settings = get_settings()
+    stored = LocalStorage().latest_face_template(payload.companyId, payload.userId)
     if stored is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -197,13 +207,11 @@ def verify_face_reference(payload: FaceReferenceVerifyRequest) -> dict:
     center_frames = _decode_base64_images(payload.centerImages, None)
     left_frames = _decode_optional_base64_images(payload.leftImages, None)
     right_frames = _decode_optional_base64_images(payload.rightImages, None)
-    reference_key, reference_bytes = stored
+    reference_key, template = stored
     try:
-        result = get_face_matcher().verify_sequence_challenge(
+        result = get_face_matcher().verify_against_template(
             center_frames,
-            left_frames,
-            right_frames,
-            reference_bytes,
+            template,
             payload.threshold,
         )
     except ValueError as exc:
@@ -213,10 +221,11 @@ def verify_face_reference(payload: FaceReferenceVerifyRequest) -> dict:
         ) from exc
 
     result["transactionId"] = payload.transactionId
-    result["threshold"] = payload.threshold
+    result["threshold"] = payload.threshold if payload.threshold is not None else float(settings.identity_pass_threshold)
     result["companyId"] = payload.companyId
     result["userId"] = payload.userId
     result["referenceKey"] = reference_key
+    result["template"] = template
     return result
 
 

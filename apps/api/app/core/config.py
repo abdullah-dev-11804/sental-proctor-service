@@ -18,8 +18,8 @@ class Settings(BaseSettings):
 
     local_storage_root: Path = Path("./storage")
 
-    identity_pass_threshold: float = 0.72
-    identity_review_threshold: float = 0.52
+    identity_pass_threshold: float = 0.42
+    identity_review_threshold: float = 0.34
     identity_min_brightness: float = 35.0
     identity_min_blur: float = 35.0
     identity_engine: str = "opencv_sface"
@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     identity_center_tolerance_y: float = 0.28
     identity_require_active_liveness: bool = False
     identity_require_enrollment_liveness: bool = False
+    identity_min_enrollment_frames: int = 3
+    identity_max_enrollment_frames: int = 12
+    identity_min_template_consistency: float = 0.35
+    identity_min_live_frames: int = 2
+    identity_enable_debug_capture: bool = False
+    identity_debug_root: Path = Path("./storage/debug")
     identity_min_liveness_yaw_delta: float = 0.16
     identity_min_liveness_embedding_delta: float = 0.012
     identity_min_liveness_samples: int = 2

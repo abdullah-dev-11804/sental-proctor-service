@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -159,19 +160,9 @@ class FaceMatcher:
         pass_threshold: float | None = None,
     ) -> dict:
         """Verifies identity from a burst of straight-face frames only."""
-        center_bytes, _center_face, center_quality = self._best_frame(center_frames, prefer_frontal=True)
-        match = self.verify(center_bytes, reference_bytes, pass_threshold)
-        passed = match.status == "passed"
-        result = self._challenge_response(
-            match,
-            passed,
-            "ok" if passed else "identity_" + match.reason,
-            0.0,
-            None,
-            None,
-        )
+        template = self._template_from_reference_bytes(reference_bytes)
+        result = self.verify_against_template(center_frames, template, pass_threshold)
         result["quality"].update({
-            "center": center_quality.__dict__,
             "mode": "face_match_only",
         })
         return result
@@ -182,64 +173,46 @@ class FaceMatcher:
         left_frames: list[bytes] | None = None,
         right_frames: list[bytes] | None = None,
     ) -> dict:
-        """Selects and validates the best first-exam enrollment reference."""
-        reference_bytes, reference_face, quality = self._best_frame(center_frames, prefer_frontal=True)
-        retry_reason = self._enrollment_retry_reason(quality)
-        if retry_reason:
-            return {
-                "ok": True,
-                "result": retry_reason,
-                "accessAllowed": False,
-                "similarityScore": None,
-                "referenceBytes": None,
-                "referenceFaceCount": quality.face_count,
-                "liveFaceCount": quality.face_count,
-                "quality": {"reference": quality.__dict__, "mode": "enroll_reference"},
-                "reason": retry_reason,
-                "engine": self.engine + "-enrollment",
-            }
-        if self.settings.identity_require_enrollment_liveness:
-            liveness = self._active_liveness(reference_face, quality, left_frames or [], right_frames or [])
-        else:
-            liveness = {
-                "passed": True,
-                "reason": "ok",
-                "movementScore": 0.0,
-                "quality": {"mode": "disabled_for_enrollment"},
-            }
-        if not liveness["passed"]:
-            return {
-                "ok": True,
-                "result": liveness["reason"],
-                "accessAllowed": False,
-                "similarityScore": None,
-                "referenceBytes": None,
-                "referenceFaceCount": quality.face_count,
-                "liveFaceCount": quality.face_count,
-                "livenessPassed": False,
-                "movementScore": liveness["movementScore"],
-                "quality": {
-                    "reference": quality.__dict__,
-                    "mode": "enroll_reference",
-                    "liveness": liveness["quality"],
-                },
-                "reason": liveness["reason"],
-                "engine": self.engine + "-enrollment",
-            }
+        """Builds a reusable enrollment template from multiple good frames."""
+        samples = self._collect_embedding_samples(
+            center_frames,
+            retry_reason_fn=self._enrollment_retry_reason,
+            prefer_frontal=True,
+        )
+        if len(samples) < int(self.settings.identity_min_enrollment_frames):
+            reason = "not_enough_good_frames"
+            return self._enrollment_failure(
+                reason,
+                samples,
+                reference_quality=samples[0]["quality"] if samples else None,
+            )
+
+        consistency = self._embedding_consistency([sample["embedding"] for sample in samples])
+        if consistency < float(self.settings.identity_min_template_consistency):
+            return self._enrollment_failure(
+                "unstable_reference_capture",
+                samples,
+                template_consistency=consistency,
+            )
+
+        template = self._build_template(samples, consistency)
+        best_sample = max(samples, key=lambda sample: sample["score"])
         return {
             "ok": True,
             "result": "enrolled",
             "accessAllowed": True,
             "similarityScore": 1.0,
-            "referenceBytes": reference_bytes,
-            "referenceFaceCount": quality.face_count,
-            "liveFaceCount": quality.face_count,
+            "referenceBytes": best_sample["bytes"],
+            "bestReferenceBytes": best_sample["bytes"],
+            "template": template,
+            "referenceFaceCount": template["quality"]["validFrameCount"],
+            "liveFaceCount": template["quality"]["validFrameCount"],
             "livenessPassed": True,
-            "movementScore": liveness["movementScore"],
+            "movementScore": 0.0,
             "quality": {
-                "reference": quality.__dict__,
-                "mode": "enroll_reference",
-                "liveness": liveness["quality"],
+                "reference": best_sample["quality"].__dict__,
+                "mode": "enroll_template",
+                "template": template["quality"],
             },
             "reason": "ok",
             "engine": self.engine + "-enrollment",
@@ -253,30 +226,343 @@ class FaceMatcher:
         reference_bytes: bytes,
         pass_threshold: float | None = None,
     ) -> dict:
-        """Verifies identity plus left/right active-liveness from frame bursts."""
-        center_bytes, center_face, center_quality = self._best_frame(center_frames, prefer_frontal=True)
-        match = self.verify(center_bytes, reference_bytes, pass_threshold)
-        if match.status != "passed":
-            return self._challenge_response(match, False, "identity_" + match.reason, 0.0, None, None)
-
-        retry_reason = self._retry_reason(center_quality)
-        if retry_reason:
-            return self._challenge_response(match, False, retry_reason, 0.0, None, None)
-
-        liveness = self._active_liveness(center_face, center_quality, left_frames, right_frames)
-        response = self._challenge_response(
-            match,
-            bool(liveness["passed"]),
-            "ok" if liveness["passed"] else str(liveness["reason"]),
-            float(liveness["movementScore"]),
-            liveness["leftYaw"],
-            liveness["rightYaw"],
-        )
-        response["quality"].update({
-            "center": center_quality.__dict__,
-            "liveness": liveness["quality"],
-        })
+        """Verifies identity against the stored template from multiple frames."""
+        template = self._template_from_reference_bytes(reference_bytes)
+        response = self.verify_against_template(center_frames, template, pass_threshold)
+        if self.settings.identity_require_active_liveness and left_frames and right_frames:
+            center_frame, center_face, center_quality = self._best_frame(center_frames, prefer_frontal=True)
+            match = self.verify(center_frame, reference_bytes, pass_threshold)
+            if match.status == "passed":
+                liveness = self._active_liveness(center_face, center_quality, left_frames, right_frames)
+                response["livenessPassed"] = bool(liveness["passed"])
+                response["movementScore"] = float(liveness["movementScore"])
+                response["result"] = "matched" if liveness["passed"] else str(liveness["reason"])
+                response["identityStatus"] = "passed" if liveness["passed"] else "failed"
+                response["accessDecision"] = "allow" if liveness["passed"] else "retry"
+                response["accessAllowed"] = bool(liveness["passed"])
+                response["quality"]["liveness"] = liveness["quality"]
+                response["leftYaw"] = liveness["leftYaw"]
+                response["rightYaw"] = liveness["rightYaw"]
         return response
+
+    def verify_against_template(
+        self,
+        center_frames: list[bytes],
+        template: dict,
+        pass_threshold: float | None = None,
+    ) -> dict:
+        samples = self._collect_embedding_samples(
+            center_frames,
+            retry_reason_fn=self._enrollment_retry_reason,
+            prefer_frontal=True,
+        )
+        if len(samples) < int(self.settings.identity_min_live_frames):
+            return self._template_verification_failure(
+                "not_enough_good_live_frames",
+                samples,
+                template,
+                pass_threshold,
+            )
+
+        live_embeddings = [sample["embedding"] for sample in samples]
+        reference_embeddings = self._template_embeddings(template)
+        if not reference_embeddings:
+            return self._template_verification_failure(
+                "template_missing_embeddings",
+                samples,
+                template,
+                pass_threshold,
+            )
+
+        scores: list[float] = []
+        mean_embedding = self._normalize_embedding(np.asarray(template.get("meanEmbedding") or [], dtype=np.float32))
+        if mean_embedding is not None:
+            scores.extend(self._cosine_scores(live_embeddings, [mean_embedding]))
+        scores.extend(self._cosine_scores(live_embeddings, reference_embeddings))
+
+        final_score = self._median_top_scores(scores, 3)
+        threshold = pass_threshold if pass_threshold is not None else self.settings.identity_pass_threshold
+        review_threshold = float(self.settings.identity_review_threshold)
+        if final_score >= threshold:
+            status = "passed"
+            decision = "allow"
+            allowed = True
+            reason = "ok"
+        elif final_score >= review_threshold:
+            status = "needs_review"
+            decision = "review"
+            allowed = False
+            reason = "low_confidence"
+        else:
+            status = "failed"
+            decision = "deny"
+            allowed = False
+            reason = "mismatch"
+
+        result = {
+            "ok": True,
+            "result": "matched" if status == "passed" else reason,
+            "identityStatus": status,
+            "accessDecision": decision,
+            "accessAllowed": allowed,
+            "similarityScore": float(round(final_score, 4)),
+            "threshold": float(threshold),
+            "reviewThreshold": review_threshold,
+            "livenessPassed": True,
+            "movementScore": 0.0,
+            "referenceFaceCount": len(reference_embeddings),
+            "liveFaceCount": len(samples),
+            "quality": {
+                "live": [quality.__dict__ for _embedding, quality in samples],
+                "reference": template.get("quality", {}),
+                "template": {
+                    "version": template.get("version"),
+                    "templateConsistency": template.get("quality", {}).get("templateConsistency"),
+                    "validFrameCount": template.get("quality", {}).get("validFrameCount"),
+                },
+            },
+            "engine": self.engine + "-challenge",
+            "reason": reason,
+        }
+        if status != "passed":
+            result["debug"] = {
+                "scores": [float(round(score, 4)) for score in scores],
+                "adafaceInputShape": self._runtime_shape("adaface_input_shape"),
+                "adafaceOutputShape": self._runtime_shape("adaface_output_shape"),
+                "colorOrder": self.settings.identity_adaface_color_order,
+            }
+        return result
+
+    def _collect_embedding_samples(
+        self,
+        frames: list[bytes],
+        retry_reason_fn,
+        prefer_frontal: bool,
+    ) -> list[dict]:
+        samples: list[dict] = []
+        for frame in frames[: max(1, int(self.settings.identity_max_enrollment_frames))]:
+            image = self._decode_image(frame)
+            embedding, quality = self._extract_primary_face(image)
+            if quality.face_count < 1:
+                continue
+            retry_reason = retry_reason_fn(quality)
+            if retry_reason:
+                continue
+            sample = {
+                "bytes": frame,
+                "embedding": self._normalize_embedding(embedding),
+                "quality": quality,
+                "score": self._quality_score(quality, prefer_frontal),
+            }
+            if sample["embedding"] is not None:
+                samples.append(sample)
+        return samples
+
+    def _build_template(self, samples: list[dict], consistency: float) -> dict:
+        embeddings = [sample["embedding"] for sample in samples if sample.get("embedding") is not None]
+        mean_embedding = self._normalize_embedding(np.mean(np.stack(embeddings, axis=0), axis=0)) if embeddings else None
+        best_sample = max(samples, key=lambda sample: sample["score"])
+        quality_summary = {
+            "validFrameCount": len(samples),
+            "templateConsistency": float(round(consistency, 4)),
+            "bestFrameScore": float(round(best_sample["score"], 4)),
+            "bestFrameFaceCount": int(best_sample["quality"].face_count),
+            "bestFrameBrightness": float(best_sample["quality"].brightness),
+            "bestFrameBlur": float(best_sample["quality"].blur),
+            "engine": self.engine,
+        }
+        return {
+            "version": 1,
+            "engine": self.engine,
+            "companyId": None,
+            "userId": None,
+            "createdAt": int(time.time()),
+            "passThreshold": float(self.settings.identity_pass_threshold),
+            "reviewThreshold": float(self.settings.identity_review_threshold),
+            "embeddings": [embedding.flatten().tolist() for embedding in embeddings],
+            "meanEmbedding": mean_embedding.flatten().tolist() if mean_embedding is not None else [],
+            "bestReferenceImageKey": None,
+            "quality": quality_summary,
+        }
+
+    def _template_from_reference_bytes(self, reference_bytes: bytes) -> dict:
+        embedding, quality = self._extract_primary_face(self._decode_image(reference_bytes))
+        if quality.face_count < 1:
+            raise ValueError("reference_no_face")
+        normalized = self._normalize_embedding(embedding)
+        if normalized is None:
+            raise ValueError("reference_no_face")
+        return {
+            "version": 1,
+            "engine": self.engine,
+            "companyId": None,
+            "userId": None,
+            "createdAt": 0,
+            "passThreshold": float(self.settings.identity_pass_threshold),
+            "reviewThreshold": float(self.settings.identity_review_threshold),
+            "embeddings": [normalized.flatten().tolist()],
+            "meanEmbedding": normalized.flatten().tolist(),
+            "bestReferenceImageKey": None,
+            "quality": {
+                "validFrameCount": 1,
+                "templateConsistency": 1.0,
+                "bestFrameScore": self._quality_score(quality, True),
+                "bestFrameFaceCount": int(quality.face_count),
+                "bestFrameBrightness": float(quality.brightness),
+                "bestFrameBlur": float(quality.blur),
+                "engine": self.engine,
+            },
+        }
+
+    def _template_embeddings(self, template: dict) -> list[np.ndarray]:
+        embeddings = []
+        for item in template.get("embeddings", []) or []:
+            normalized = self._normalize_embedding(np.asarray(item, dtype=np.float32))
+            if normalized is not None:
+                embeddings.append(normalized)
+        return embeddings
+
+    def _normalize_embedding(self, embedding: np.ndarray | list[float] | None) -> np.ndarray | None:
+        if embedding is None:
+            return None
+        vector = np.asarray(embedding, dtype=np.float32).reshape(1, -1)
+        norm = float(np.linalg.norm(vector))
+        if norm <= 1e-6:
+            return None
+        return vector / norm
+
+    def _cosine_scores(self, left_embeddings: list[np.ndarray], right_embeddings: list[np.ndarray]) -> list[float]:
+        scores: list[float] = []
+        for left in left_embeddings:
+            left_vector = left.reshape(-1)
+            for right in right_embeddings:
+                right_vector = right.reshape(-1)
+                denom = float(np.linalg.norm(left_vector) * np.linalg.norm(right_vector))
+                if denom <= 1e-6:
+                    continue
+                scores.append(float(max(0.0, min(1.0, np.dot(left_vector, right_vector) / denom))))
+        return scores
+
+    def _median_top_scores(self, scores: list[float], top_n: int = 3) -> float:
+        if not scores:
+            return 0.0
+        ordered = sorted(scores, reverse=True)[:max(1, top_n)]
+        return float(np.median(np.asarray(ordered, dtype=np.float32)))
+
+    def _embedding_consistency(self, embeddings: list[np.ndarray]) -> float:
+        if len(embeddings) < 2:
+            return 1.0
+        scores = []
+        for index, left in enumerate(embeddings):
+            for right in embeddings[index + 1:]:
+                scores.extend(self._cosine_scores([left], [right]))
+        return float(np.median(np.asarray(scores, dtype=np.float32))) if scores else 0.0
+
+    def _enrollment_failure(
+        self,
+        reason: str,
+        samples: list[dict],
+        reference_quality: FaceQuality | None = None,
+        template_consistency: float | None = None,
+    ) -> dict:
+        quality = {
+            "reference": (reference_quality.__dict__ if reference_quality is not None else {}),
+            "mode": "enroll_template",
+            "validFrames": [sample["quality"].__dict__ for sample in samples],
+            "template": {
+                "templateConsistency": template_consistency,
+                "validFrameCount": len(samples),
+            },
+        }
+        return {
+            "ok": True,
+            "result": reason,
+            "identityStatus": "needs_retry",
+            "accessDecision": "retry",
+            "accessAllowed": False,
+            "similarityScore": None,
+            "referenceBytes": None,
+            "bestReferenceBytes": None,
+            "template": None,
+            "referenceFaceCount": len(samples),
+            "liveFaceCount": len(samples),
+            "livenessPassed": False,
+            "movementScore": 0.0,
+            "quality": quality,
+            "reason": reason,
+            "engine": self.engine + "-enrollment",
+        }
+
+    def _template_verification_failure(
+        self,
+        reason: str,
+        samples: list[dict],
+        template: dict,
+        pass_threshold: float | None,
+    ) -> dict:
+        threshold = pass_threshold if pass_threshold is not None else self.settings.identity_pass_threshold
+        review_threshold = float(self.settings.identity_review_threshold)
+        retry_reasons = {
+            "not_enough_good_live_frames",
+            "not_enough_good_frames",
+            "unstable_reference_capture",
+            "template_missing_embeddings",
+        }
+        status = "needs_retry" if reason in retry_reasons else "failed"
+        return {
+            "ok": True,
+            "result": reason,
+            "identityStatus": status,
+            "accessDecision": "retry" if status == "needs_retry" else "deny",
+            "accessAllowed": False,
+            "similarityScore": 0.0,
+            "threshold": float(threshold),
+            "reviewThreshold": review_threshold,
+            "livenessPassed": True,
+            "movementScore": 0.0,
+            "referenceFaceCount": len(template.get("embeddings", []) or []),
+            "liveFaceCount": len(samples),
+            "quality": {
+                "live": [quality.__dict__ for _embedding, quality in samples],
+                "reference": template.get("quality", {}),
+                "template": template.get("quality", {}),
+            },
+            "engine": self.engine + "-challenge",
+            "reason": reason,
+        }
+
+    def _runtime_shape(self, key: str) -> list:
+        if not self.advanced_engine:
+            return []
+        value = self.advanced_engine.runtime.get(key, [])
+        if isinstance(value, (list, tuple)):
+            result = []
+            for item in value:
+                if isinstance(item, (int, float)) and float(item).is_integer():
+                    result.append(int(item))
+                else:
+                    result.append(item)
+            return result
+        return [value]
+
+    def describe_runtime(self) -> dict:
+        runtime = {
+            "identity_engine_config": self.settings.identity_engine,
+            "identity_engine_loaded": self.engine,
+            "pass_threshold": float(self.settings.identity_pass_threshold),
+            "review_threshold": float(self.settings.identity_review_threshold),
+        }
+        if self.advanced_engine is not None:
+            runtime.update(self.advanced_engine.describe_runtime())
+        else:
+            runtime.update({
+                "scrfd_model_exists": False,
+                "adaface_model_exists": False,
+                "adaface_input_shape": [],
+                "adaface_output_shape": [],
+                "adaface_color_order": str(self.settings.identity_adaface_color_order).strip().lower(),
+            })
+        return runtime
 
     def _best_frame(self, frames: list[bytes], prefer_frontal: bool) -> tuple[bytes, np.ndarray, FaceQuality]:
         best: tuple[float, bytes, np.ndarray, FaceQuality] | None = None

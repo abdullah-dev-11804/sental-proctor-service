@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.identity import compat_router as identity_compat_router
 from app.api.identity import router as identity_router
+from app.api.identity import get_face_matcher
 from app.api.sessions import compat_router as sessions_compat_router
 from app.api.sessions import router as sessions_router
 from app.api.staging import router as staging_router
@@ -34,17 +35,21 @@ app.include_router(staging_router)
 
 @app.get("/health")
 def health() -> dict:
+    matcher = get_face_matcher()
     identity_models = _identity_models()
+    identity_runtime = matcher.describe_runtime()
     return {
         "ok": True,
         "status": "healthy",
         "service": "sental-proctor-service",
         "environment": settings.app_env,
+        "identity": identity_runtime,
         "features": {
             "identity_verification": True,
             "identity_engine": settings.identity_engine,
             "identity_models_ready": all(model["exists"] for model in identity_models if model["required"]),
             "identity_models": identity_models,
+            "identity_runtime": identity_runtime,
             "sessions": "staged",
             "violations": "staged",
             "clips": "staged",
@@ -58,6 +63,16 @@ def health() -> dict:
 def api_health() -> dict:
     """Compatibility health route for the Moodle local_proctorcore client."""
     return health()
+
+
+@app.on_event("startup")
+def warm_identity_engine() -> None:
+    try:
+        matcher = get_face_matcher()
+        runtime = matcher.describe_runtime()
+        print(f"[startup] identity runtime: {runtime}")
+    except Exception as exc:
+        print(f"[startup] identity engine warmup failed: {exc}")
 
 
 def _identity_models() -> list[dict]:
