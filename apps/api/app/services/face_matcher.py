@@ -315,7 +315,7 @@ class FaceMatcher:
             "referenceFaceCount": len(reference_embeddings),
             "liveFaceCount": len(samples),
             "quality": {
-                "live": [quality.__dict__ for _embedding, quality in samples],
+                "live": [sample["quality"].__dict__ for sample in samples],
                 "reference": template.get("quality", {}),
                 "template": {
                     "version": template.get("version"),
@@ -554,7 +554,7 @@ class FaceMatcher:
             "referenceFaceCount": len(template_embeddings),
             "liveFaceCount": len(samples),
             "quality": {
-                "live": [quality.__dict__ for _embedding, quality in samples],
+                "live": [sample["quality"].__dict__ for sample in samples],
                 "reference": template_quality,
                 "template": template_quality,
             },
