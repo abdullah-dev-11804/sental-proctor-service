@@ -582,6 +582,24 @@ class FaceMatcher:
             "identity_engine_loaded": self.engine,
             "pass_threshold": float(self.settings.identity_pass_threshold),
             "review_threshold": float(self.settings.identity_review_threshold),
+            "verification_quality": {
+                "min_live_frames": int(self.settings.identity_min_live_frames),
+                "min_brightness": float(self.settings.identity_min_brightness),
+                "min_blur": float(self.settings.identity_min_blur),
+                "min_face_confidence": float(self.settings.identity_min_face_confidence),
+            },
+            "enrollment_quality": {
+                "min_enrollment_frames": int(self.settings.identity_min_enrollment_frames),
+                "max_enrollment_frames": int(self.settings.identity_max_enrollment_frames),
+                "min_template_consistency": float(self.settings.identity_min_template_consistency),
+                "min_brightness": float(self.settings.identity_enrollment_min_brightness),
+                "min_blur": float(self.settings.identity_enrollment_min_blur),
+                "min_face_confidence": float(self.settings.identity_enrollment_min_face_confidence),
+                "min_face_width_ratio": float(self.settings.identity_enrollment_min_face_width_ratio),
+                "max_face_width_ratio": float(self.settings.identity_enrollment_max_face_width_ratio),
+                "center_tolerance_x": float(self.settings.identity_enrollment_center_tolerance_x),
+                "center_tolerance_y": float(self.settings.identity_enrollment_center_tolerance_y),
+            },
         }
         if self.advanced_engine is not None:
             runtime.update(self.advanced_engine.describe_runtime())
@@ -908,23 +926,42 @@ class FaceMatcher:
         return float(max(-1.0, min(1.0, raw * 2.4)))
 
     def _retry_reason(self, live_quality: FaceQuality) -> str | None:
-        if live_quality.face_count < 1:
+        return self._quality_retry_reason(
+            live_quality,
+            min_brightness=float(self.settings.identity_min_brightness),
+            min_blur=float(self.settings.identity_min_blur),
+            min_face_confidence=float(self.settings.identity_min_face_confidence),
+        )
+
+    def _quality_retry_reason(
+        self,
+        quality: FaceQuality,
+        min_brightness: float,
+        min_blur: float,
+        min_face_confidence: float,
+    ) -> str | None:
+        if quality.face_count < 1:
             return "no_face"
-        if live_quality.confidence is not None and live_quality.confidence < self.settings.identity_min_face_confidence:
+        if quality.confidence is not None and quality.confidence < min_face_confidence:
             return "low_face_confidence"
         if self.settings.identity_require_passive_antispoof:
-            if live_quality.antispoof_passed is None:
+            if quality.antispoof_passed is None:
                 return "antispoof_unavailable"
-            if not live_quality.antispoof_passed:
+            if not quality.antispoof_passed:
                 return "spoof_detected"
-        if live_quality.brightness < self.settings.identity_min_brightness:
+        if quality.brightness < min_brightness:
             return "low_light"
-        if live_quality.blur < self.settings.identity_min_blur:
+        if quality.blur < min_blur:
             return "blurry"
         return None
 
     def _enrollment_retry_reason(self, quality: FaceQuality) -> str | None:
-        retry_reason = self._retry_reason(quality)
+        retry_reason = self._quality_retry_reason(
+            quality,
+            min_brightness=float(self.settings.identity_enrollment_min_brightness),
+            min_blur=float(self.settings.identity_enrollment_min_blur),
+            min_face_confidence=float(self.settings.identity_enrollment_min_face_confidence),
+        )
         if retry_reason:
             return retry_reason
         if quality.face_count != 1:
@@ -934,14 +971,14 @@ class FaceMatcher:
         if quality.face_center_x is None or quality.face_center_y is None:
             return "face_not_framed"
         face_ratio = quality.face_width / max(1, quality.width)
-        if face_ratio < self.settings.identity_min_face_width_ratio:
+        if face_ratio < self.settings.identity_enrollment_min_face_width_ratio:
             return "face_too_far"
-        if face_ratio > self.settings.identity_max_face_width_ratio:
+        if face_ratio > self.settings.identity_enrollment_max_face_width_ratio:
             return "face_too_close"
-        min_x = 0.5 - self.settings.identity_center_tolerance_x
-        max_x = 0.5 + self.settings.identity_center_tolerance_x
-        min_y = 0.5 - self.settings.identity_center_tolerance_y
-        max_y = 0.5 + self.settings.identity_center_tolerance_y
+        min_x = 0.5 - self.settings.identity_enrollment_center_tolerance_x
+        max_x = 0.5 + self.settings.identity_enrollment_center_tolerance_x
+        min_y = 0.5 - self.settings.identity_enrollment_center_tolerance_y
+        max_y = 0.5 + self.settings.identity_enrollment_center_tolerance_y
         if not (min_x <= quality.face_center_x <= max_x and min_y <= quality.face_center_y <= max_y):
             return "face_not_centered"
         return None

@@ -18,8 +18,8 @@ class Settings(BaseSettings):
 
     local_storage_root: Path = Path("./storage")
 
-    identity_pass_threshold: float = 0.42
-    identity_review_threshold: float = 0.34
+    identity_pass_threshold: float = 0.85
+    identity_review_threshold: float = 0.70
     identity_min_brightness: float = 35.0
     identity_min_blur: float = 35.0
     identity_engine: str = "opencv_sface"
@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     identity_scrfd_model: str = "scrfd_2.5g_kps.onnx"
     identity_adaface_model: str = "adaface_ir50_ms1mv2.onnx"
     identity_scrfd_input_size: int = 640
-    identity_adaface_input_size: int = 112
+    identity_adaface_input_size: int = 160
     identity_adaface_color_order: str = "bgr"
     identity_min_face_confidence: float = 0.65
     identity_min_face_width_ratio: float = 0.16
@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     identity_min_enrollment_frames: int = 3
     identity_max_enrollment_frames: int = 12
     identity_min_template_consistency: float = 0.35
+    identity_enrollment_min_brightness: float = 45.0
+    identity_enrollment_min_blur: float = 45.0
+    identity_enrollment_min_face_confidence: float = 0.75
+    identity_enrollment_min_face_width_ratio: float = 0.18
+    identity_enrollment_max_face_width_ratio: float = 0.58
+    identity_enrollment_center_tolerance_x: float = 0.18
+    identity_enrollment_center_tolerance_y: float = 0.23
     identity_min_live_frames: int = 1
     identity_enable_debug_capture: bool = False
     identity_debug_root: Path = Path("./storage/debug")
