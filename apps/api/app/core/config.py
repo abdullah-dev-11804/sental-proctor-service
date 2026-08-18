@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     identity_min_enrollment_frames: int = 3
     identity_max_enrollment_frames: int = 12
     identity_min_template_consistency: float = 0.35
-    identity_min_live_frames: int = 2
+    identity_min_live_frames: int = 1
     identity_enable_debug_capture: bool = False
     identity_debug_root: Path = Path("./storage/debug")
     identity_min_liveness_yaw_delta: float = 0.16

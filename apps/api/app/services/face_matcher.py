@@ -255,7 +255,7 @@ class FaceMatcher:
 
         samples = self._collect_embedding_samples(
             center_frames,
-            retry_reason_fn=self._enrollment_retry_reason,
+            retry_reason_fn=self._verification_retry_reason,
             prefer_frontal=True,
         )
         if len(samples) < int(self.settings.identity_min_live_frames):
@@ -944,6 +944,16 @@ class FaceMatcher:
         max_y = 0.5 + self.settings.identity_center_tolerance_y
         if not (min_x <= quality.face_center_x <= max_x and min_y <= quality.face_center_y <= max_y):
             return "face_not_centered"
+        return None
+
+    def _verification_retry_reason(self, quality: FaceQuality) -> str | None:
+        retry_reason = self._retry_reason(quality)
+        if retry_reason:
+            return retry_reason
+        if quality.face_count < 1:
+            return "no_face"
+        if quality.face_count > 1:
+            return "multiple_faces"
         return None
 
     def _similarity(self, live_face: np.ndarray, reference_face: np.ndarray) -> float:
