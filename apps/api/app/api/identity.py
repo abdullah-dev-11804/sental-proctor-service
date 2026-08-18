@@ -280,7 +280,14 @@ def _decode_base64_image(value: str) -> bytes:
 
 def _decode_base64_images(values: list[str] | None, fallback: str | None) -> list[bytes]:
     source = values if values else ([fallback] if fallback else [])
-    frames = [_decode_base64_image(value) for value in source if value]
+    frames = []
+    for value in source:
+        if not value:
+            continue
+        try:
+            frames.append(_decode_base64_image(value))
+        except HTTPException:
+            continue
     if not frames:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -291,4 +298,12 @@ def _decode_base64_images(values: list[str] | None, fallback: str | None) -> lis
 
 def _decode_optional_base64_images(values: list[str] | None, fallback: str | None) -> list[bytes]:
     source = values if values else ([fallback] if fallback else [])
-    return [_decode_base64_image(value) for value in source if value]
+    frames = []
+    for value in source:
+        if not value:
+            continue
+        try:
+            frames.append(_decode_base64_image(value))
+        except HTTPException:
+            continue
+    return frames
