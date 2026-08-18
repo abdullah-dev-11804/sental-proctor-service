@@ -202,7 +202,6 @@ class FaceMatcher:
             "result": "enrolled",
             "accessAllowed": True,
             "similarityScore": 1.0,
-            "referenceBytes": best_sample["bytes"],
             "bestReferenceBytes": best_sample["bytes"],
             "template": template,
             "referenceFaceCount": template["quality"]["validFrameCount"],

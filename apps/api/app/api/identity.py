@@ -177,7 +177,7 @@ def enroll_face_reference(payload: FaceReferenceEnrollRequest) -> dict:
         result.pop("template", None)
         return result
 
-    reference_bytes = result.pop("bestReferenceBytes", None) or result.pop("referenceBytes", None)
+    reference_bytes = result.pop("bestReferenceBytes", None)
     template = result.pop("template", None)
     storage = LocalStorage()
     storage.delete_face_reference(payload.companyId, payload.userId)

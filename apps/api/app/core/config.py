@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     identity_scrfd_input_size: int = 640
     identity_adaface_input_size: int = 112
     identity_adaface_color_order: str = "bgr"
-    identity_min_face_confidence: float = 0.88
+    identity_min_face_confidence: float = 0.65
     identity_min_face_width_ratio: float = 0.16
     identity_max_face_width_ratio: float = 0.62
     identity_center_tolerance_x: float = 0.22
