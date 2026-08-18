@@ -36,6 +36,9 @@ class FaceReferenceEnrollRequest(BaseModel):
     fullName: str = Field(min_length=1, max_length=255)
     confirmedAt: int = Field(ge=1)
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    centerImage: str | None = None
+    leftImage: str | None = None
+    rightImage: str | None = None
     centerImages: list[str] = Field(min_length=1, max_length=12)
     leftImages: list[str] = Field(default_factory=list, max_length=16)
     rightImages: list[str] = Field(default_factory=list, max_length=16)
@@ -46,6 +49,9 @@ class FaceReferenceVerifyRequest(BaseModel):
     companyId: int = Field(default=0, ge=0)
     userId: int = Field(ge=1)
     threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    centerImage: str | None = None
+    leftImage: str | None = None
+    rightImage: str | None = None
     centerImages: list[str] = Field(min_length=1, max_length=12)
     leftImages: list[str] = Field(default_factory=list, max_length=16)
     rightImages: list[str] = Field(default_factory=list, max_length=16)
@@ -153,9 +159,9 @@ def get_face_reference(user_id: int, companyId: int = 0) -> dict:
 @compat_router.post("/references/enroll", dependencies=[Depends(require_api_auth)])
 def enroll_face_reference(payload: FaceReferenceEnrollRequest) -> dict:
     settings = get_settings()
-    center_frames = _decode_base64_images(payload.centerImages, None)
-    left_frames = _decode_optional_base64_images(payload.leftImages, None)
-    right_frames = _decode_optional_base64_images(payload.rightImages, None)
+    center_frames = _decode_base64_images(payload.centerImages, payload.centerImage)
+    left_frames = _decode_optional_base64_images(payload.leftImages, payload.leftImage)
+    right_frames = _decode_optional_base64_images(payload.rightImages, payload.rightImage)
     try:
         result = get_face_matcher().select_enrollment_reference(center_frames, left_frames, right_frames)
     except ValueError as exc:
@@ -204,9 +210,9 @@ def verify_face_reference(payload: FaceReferenceVerifyRequest) -> dict:
             detail={"code": "reference_not_found", "message": "No face reference is enrolled for this user."},
         )
 
-    center_frames = _decode_base64_images(payload.centerImages, None)
-    left_frames = _decode_optional_base64_images(payload.leftImages, None)
-    right_frames = _decode_optional_base64_images(payload.rightImages, None)
+    center_frames = _decode_base64_images(payload.centerImages, payload.centerImage)
+    left_frames = _decode_optional_base64_images(payload.leftImages, payload.leftImage)
+    right_frames = _decode_optional_base64_images(payload.rightImages, payload.rightImage)
     reference_key, template = stored
     try:
         result = get_face_matcher().verify_against_template(
