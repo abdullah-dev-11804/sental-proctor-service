@@ -404,10 +404,18 @@ class AdvancedFaceEngine:
         crop = self._crop_bbox(image, bbox, margin_ratio=0.25)
         tensor = self._generic_image_tensor(crop, 224, mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225], bgr=False)
         input_name = self.headpose.get_inputs()[0].name
-        output = np.asarray(self.headpose.run(None, {input_name: tensor})[0]).reshape(-1)
+        output = np.asarray(self.headpose.run(None, {input_name: tensor})[0], dtype=np.float32)
+        if output.shape[-2:] == (3, 3):
+            return self._rotation_matrix_yaw_degrees(output.reshape(-1, 3, 3)[0])
+        output = output.reshape(-1)
         if output.size >= 3:
             return float(output[1])
         return None
+
+    def _rotation_matrix_yaw_degrees(self, rotation: np.ndarray) -> float:
+        sy = float(np.sqrt((rotation[0, 0] * rotation[0, 0]) + (rotation[1, 0] * rotation[1, 0])))
+        yaw = float(np.arctan2(-rotation[2, 0], sy))
+        return float(np.degrees(yaw))
 
     def _crop_bbox_scaled(self, image: np.ndarray, bbox: np.ndarray, scale: float) -> np.ndarray:
         x1, y1, x2, y2 = [float(value) for value in bbox[:4]]
