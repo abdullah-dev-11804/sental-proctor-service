@@ -19,39 +19,62 @@ Next hardening:
 
 ## Phase 2 - Session And Storage Foundations
 
-Status: staged.
+Status: first working slice implemented.
 
-- Replace staged session response with Redis-backed session state.
+- File-backed session state under `storage/media/sessions`.
+- Moodle-compatible session create/start/get/heartbeat/interruption/fail endpoints.
+- Signed Moodle webhooks for asset and final session events.
+- Protected Server B asset content endpoint for Moodle-side report views.
+
+Next hardening:
+
+- Replace file-backed session state with Redis/database state.
 - Add MinIO bucket bootstrap.
-- Generate server-side object keys.
-- Generate short-lived single-purpose upload URLs.
+- Store evidence objects in MinIO/S3 instead of local disk.
+- Add durable webhook retry queue.
 
 ## Phase 3 - LiveKit And Rolling Buffer
 
-Status: staged.
+Status: browser rolling-chunk prototype implemented.
 
-- Create LiveKit room per session.
 - Generate student LiveKit token.
-- Start LiveKit egress HLS segments.
-- Track segment timestamps in Redis.
-- Cleanup temporary HLS segments.
+- Browser uploads short WebM chunks to Server B with a scoped upload token.
+- Old temporary chunks are pruned by rolling retention.
+- Finalization deletes temporary chunks after key clips are materialized.
+
+Next hardening:
+
+- Create LiveKit room lifecycle explicitly.
+- Replace browser chunk upload with LiveKit egress HLS/WebM segments.
+- Track segment timestamps in Redis/database.
+- Normalize generated clips with ffmpeg.
 
 ## Phase 4 - Violations And Clip Worker
 
-Status: staged.
+Status: first working slice implemented.
 
-- Add authenticated WebSocket hub.
-- Validate violation event tokens.
-- Persist violation spans.
-- Queue delayed clip creation job.
-- Merge HLS segments with ffmpeg.
+- Moodle browser-event violations trigger snapshot requests.
+- Server B snapshots can queue key-moment clips from the rolling buffer.
+- External `/v1/violations` workers can queue key-moment clips.
+- Clips are generated as WebM chunk windows around the violation/submission.
+
+Next hardening:
+
+- Add authenticated WebSocket/data-channel hub.
+- Persist violation spans in database.
+- Add delayed worker instead of materializing clips opportunistically.
+- Merge/repair clips with ffmpeg for stronger playback compatibility.
 
 ## Phase 5 - Reports And Moodle Webhooks
 
-Status: staged.
+Status: Moodle report integration implemented.
 
-- Generate report JSON.
-- Generate report PDF.
-- Store report in private reports bucket.
-- Send signed final webhook to Moodle.
-- Retry with same event id.
+- Server B sends `asset.captured` webhooks for snapshots and clips.
+- Server B sends `session.completed` / `session.failed` final webhooks.
+- Moodle stores assets, retention dates, and generates PDF reports.
+
+Next hardening:
+
+- Add optional Server B report JSON/PDF generation.
+- Store report artifacts in private reports bucket.
+- Retry webhook delivery with durable backoff.

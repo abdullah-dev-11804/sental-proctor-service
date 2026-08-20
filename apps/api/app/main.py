@@ -1,9 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.assets import router as assets_router
 from app.api.identity import compat_router as identity_compat_router
 from app.api.identity import router as identity_router
 from app.api.identity import get_face_matcher
+from app.api.monitor import router as monitor_router
 from app.api.sessions import compat_router as sessions_compat_router
 from app.api.sessions import router as sessions_router
 from app.api.staging import router as staging_router
@@ -22,14 +24,16 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-ProctorCore-Upload-Token"],
 )
 
 app.include_router(identity_router)
 app.include_router(identity_compat_router)
+app.include_router(monitor_router)
 app.include_router(sessions_router)
 app.include_router(sessions_compat_router)
+app.include_router(assets_router)
 app.include_router(staging_router)
 
 
@@ -50,11 +54,11 @@ def health() -> dict:
             "identity_models_ready": all(model["exists"] for model in identity_models if model["required"]),
             "identity_models": identity_models,
             "identity_runtime": identity_runtime,
-            "sessions": "staged",
-            "violations": "staged",
-            "clips": "staged",
-            "reports": "staged",
-            "moodle_webhooks": "staged",
+            "sessions": "file_backed",
+            "violations": "realtime_moodle_events",
+            "clips": "rolling_browser_chunks",
+            "reports": "moodle_pdf",
+            "moodle_webhooks": "signed_direct",
         },
     }
 

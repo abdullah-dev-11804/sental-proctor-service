@@ -29,6 +29,7 @@ class MoodleIdentityVerifyRequest(BaseModel):
     centerImages: list[str] | None = None
     leftImages: list[str] | None = None
     rightImages: list[str] | None = None
+    qualityPolicy: dict | None = None
 
 
 class FaceReferenceEnrollRequest(BaseModel):
@@ -44,6 +45,7 @@ class FaceReferenceEnrollRequest(BaseModel):
     centerImages: list[str] = Field(min_length=1, max_length=12)
     leftImages: list[str] = Field(default_factory=list, max_length=16)
     rightImages: list[str] = Field(default_factory=list, max_length=16)
+    qualityPolicy: dict | None = None
 
 
 class FaceReferenceVerifyRequest(BaseModel):
@@ -57,6 +59,7 @@ class FaceReferenceVerifyRequest(BaseModel):
     centerImages: list[str] = Field(min_length=1, max_length=12)
     leftImages: list[str] = Field(default_factory=list, max_length=16)
     rightImages: list[str] = Field(default_factory=list, max_length=16)
+    qualityPolicy: dict | None = None
 
 
 class FaceReferenceResetRequest(BaseModel):
@@ -130,9 +133,10 @@ def verify_moodle_identity(payload: MoodleIdentityVerifyRequest) -> dict:
                 right_frames,
                 reference_bytes,
                 payload.threshold,
+                payload.qualityPolicy,
             )
         else:
-            result = matcher.verify_center_sequence(center_frames, reference_bytes, payload.threshold)
+            result = matcher.verify_center_sequence(center_frames, reference_bytes, payload.threshold, payload.qualityPolicy)
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -166,7 +170,12 @@ def enroll_face_reference(payload: FaceReferenceEnrollRequest) -> dict:
         center_frames = _decode_base64_images(payload.centerImages, payload.centerImage)
         left_frames = _decode_optional_base64_images(payload.leftImages, payload.leftImage)
         right_frames = _decode_optional_base64_images(payload.rightImages, payload.rightImage)
-        result = get_face_matcher().select_enrollment_reference(center_frames, left_frames, right_frames)
+        result = get_face_matcher().select_enrollment_reference(
+            center_frames,
+            left_frames,
+            right_frames,
+            payload.qualityPolicy,
+        )
     except (HTTPException, ValueError) as exc:
         logger.warning(
             "identity enrollment capture rejected: transaction=%s company=%s user=%s detail=%s",
@@ -235,6 +244,7 @@ def verify_face_reference(payload: FaceReferenceVerifyRequest) -> dict:
             center_frames,
             template,
             payload.threshold,
+            payload.qualityPolicy,
         )
     except (HTTPException, ValueError) as exc:
         logger.warning(

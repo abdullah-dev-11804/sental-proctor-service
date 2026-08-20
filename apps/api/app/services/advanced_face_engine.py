@@ -199,7 +199,6 @@ class AdvancedFaceEngine:
         self.recognizer = self._load_onnx(self._model_path(settings.identity_adaface_model), "AdaFace")
         self.antispoof = None
         self.headpose = None
-        self.runtime = self._build_runtime()
 
         antispoof_model = str(settings.identity_antispoof_model).strip()
         if antispoof_model:
@@ -212,6 +211,8 @@ class AdvancedFaceEngine:
             self.headpose = self._load_onnx(self._model_path(headpose_model), "6DRepNet head-pose")
         elif settings.identity_require_headpose_liveness:
             raise RuntimeError("Head-pose liveness is required but IDENTITY_HEADPOSE_MODEL is empty.")
+
+        self.runtime = self._build_runtime()
 
     def _model_path(self, value: str) -> Path:
         path = Path(value)
@@ -245,6 +246,14 @@ class AdvancedFaceEngine:
             "adaface_color_order": str(self.settings.identity_adaface_color_order).strip().lower(),
             "pass_threshold": float(self.settings.identity_pass_threshold),
             "review_threshold": float(self.settings.identity_review_threshold),
+            "antispoof_model_exists": self._model_path(self.settings.identity_antispoof_model).is_file() if str(self.settings.identity_antispoof_model).strip() else False,
+            "antispoof_input_shape": self._session_shape(self.antispoof, "input"),
+            "antispoof_output_shape": self._session_shape(self.antispoof, "output"),
+            "antispoof_live_class_index": int(self.settings.identity_antispoof_live_class_index),
+            "antispoof_crop_scale": float(self.settings.identity_antispoof_crop_scale),
+            "headpose_model_exists": self._model_path(self.settings.identity_headpose_model).is_file() if str(self.settings.identity_headpose_model).strip() else False,
+            "headpose_input_shape": self._session_shape(self.headpose, "input"),
+            "headpose_output_shape": self._session_shape(self.headpose, "output"),
         }
 
     def describe_runtime(self) -> dict[str, Any]:
@@ -260,6 +269,17 @@ class AdvancedFaceEngine:
                     result.append(value)
             return result
         return [shape]
+
+    def _session_shape(self, session: Any, kind: str) -> list[Any]:
+        if session is None:
+            return []
+        try:
+            infos = session.get_inputs() if kind == "input" else session.get_outputs()
+        except Exception:
+            return []
+        if not infos:
+            return []
+        return self._shape_list(infos[0].shape)
 
     def extract(self, image: np.ndarray) -> tuple[np.ndarray, AdvancedFaceQuality]:
         height, width = image.shape[:2]
@@ -360,12 +380,12 @@ class AdvancedFaceEngine:
     def _antispoof_score(self, image: np.ndarray, bbox: np.ndarray) -> float | None:
         if self.antispoof is None:
             return None
-        crop = self._crop_bbox(image, bbox, margin_ratio=0.35)
+        crop = self._crop_bbox_scaled(image, bbox, scale=float(self.settings.identity_antispoof_crop_scale))
         input_tensor = self._generic_image_tensor(
             crop,
             int(self.settings.identity_antispoof_input_size),
-            mean=0.5,
-            std=0.5,
+            mean=0.0,
+            std=1.0,
             bgr=True,
         )
         input_name = self.antispoof.get_inputs()[0].name
@@ -388,6 +408,34 @@ class AdvancedFaceEngine:
         if output.size >= 3:
             return float(output[1])
         return None
+
+    def _crop_bbox_scaled(self, image: np.ndarray, bbox: np.ndarray, scale: float) -> np.ndarray:
+        x1, y1, x2, y2 = [float(value) for value in bbox[:4]]
+        width = max(1.0, x2 - x1)
+        height = max(1.0, y2 - y1)
+        side = max(width, height) * max(1.0, float(scale))
+        side_int = max(1, int(round(side)))
+        center_x = (x1 + x2) / 2.0
+        center_y = (y1 + y2) / 2.0
+        left = int(round(center_x - (side / 2.0)))
+        top = int(round(center_y - (side / 2.0)))
+        right = left + side_int
+        bottom = top + side_int
+
+        crop = np.zeros((side_int, side_int, 3), dtype=image.dtype)
+        source_left = max(0, left)
+        source_top = max(0, top)
+        source_right = min(image.shape[1], right)
+        source_bottom = min(image.shape[0], bottom)
+        if source_right <= source_left or source_bottom <= source_top:
+            return crop
+
+        dest_left = source_left - left
+        dest_top = source_top - top
+        dest_right = dest_left + (source_right - source_left)
+        dest_bottom = dest_top + (source_bottom - source_top)
+        crop[dest_top:dest_bottom, dest_left:dest_right] = image[source_top:source_bottom, source_left:source_right]
+        return crop
 
     def _crop_bbox(self, image: np.ndarray, bbox: np.ndarray, margin_ratio: float) -> np.ndarray:
         x1, y1, x2, y2 = [int(round(value)) for value in bbox[:4]]

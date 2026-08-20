@@ -58,7 +58,8 @@ class Settings(BaseSettings):
     identity_require_passive_antispoof: bool = False
     identity_antispoof_model: str = ""
     identity_antispoof_input_size: int = 80
-    identity_antispoof_live_class_index: int = 1
+    identity_antispoof_live_class_index: int = 0
+    identity_antispoof_crop_scale: float = 2.7
     identity_antispoof_threshold: float = 0.78
     identity_headpose_model: str = ""
     identity_require_headpose_liveness: bool = False
@@ -75,6 +76,14 @@ class Settings(BaseSettings):
     livekit_url: str = "wss://livekit.example.kz"
     livekit_api_key: str = "dev-livekit-key"
     livekit_api_secret: str = "dev-livekit-secret"
+    livekit_client_script_url: str = "https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"
+
+    clip_pre_seconds: int = 15
+    clip_post_seconds: int = 15
+    media_chunk_retention_seconds: int = 900
+    media_upload_token_ttl_seconds: int = 14400
+    media_chunk_max_bytes: int = 26214400
+    monitor_lookaway_yaw_threshold: float = 0.42
 
     moodle_webhook_url: str = ""
     moodle_webhook_secret: str = ""

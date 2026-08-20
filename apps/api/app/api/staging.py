@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from app.core.security import require_api_auth
+from app.services.media_store import MediaStore
 
 
 router = APIRouter(prefix="/v1", tags=["staging"])
@@ -18,20 +19,19 @@ class ViolationEventRequest(BaseModel):
 
 @router.post("/violations", dependencies=[Depends(require_api_auth)])
 def record_violation(payload: ViolationEventRequest) -> dict:
-    return {
-        "ok": True,
-        "status": "staged",
-        "violation": payload.model_dump(),
-        "next": "Persist to Redis/database, publish over WebSocket, and queue clip generation.",
-    }
+    data = payload.model_dump()
+    data["sessionId"] = data.pop("session_id")
+    data["companyId"] = data.pop("company_id")
+    data["violationType"] = data.pop("violation_type")
+    return MediaStore().record_violation(data)
 
 
 @router.get("/clips/staging", dependencies=[Depends(require_api_auth)])
 def clip_worker_status() -> dict:
     return {
         "ok": True,
-        "status": "staged",
-        "next": "Add delayed ffmpeg worker for T-15/T+15 violation clips.",
+        "status": "rolling_browser_chunks",
+        "next": "Replace browser chunk concatenation with LiveKit egress plus ffmpeg-normalized clips.",
     }
 
 
@@ -39,6 +39,6 @@ def clip_worker_status() -> dict:
 def report_worker_status() -> dict:
     return {
         "ok": True,
-        "status": "staged",
-        "next": "Add final report JSON/PDF generation and Moodle webhook retries.",
+        "status": "moodle_pdf",
+        "next": "Add optional Server B generated PDF if Moodle-side PDF generation is not enough.",
     }
