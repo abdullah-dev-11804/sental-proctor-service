@@ -19,4 +19,5 @@ tools/
 *.log
 node_modules/
 dist/
-infra/
+infra
+docs
