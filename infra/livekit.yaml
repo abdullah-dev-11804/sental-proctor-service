@@ -5,7 +5,5 @@ rtc:
   port_range_end: 50100
 redis:
   address: redis:6379
-keys:
-  dev-livekit-key: dev-livekit-secret
 room:
-  auto_create: false
+  auto_create: true

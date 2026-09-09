@@ -4,15 +4,16 @@ import base64
 import hashlib
 import hmac
 import json
-import mimetypes
 import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-import httpx
-
 from app.core.config import get_settings
+from app.services.job_queue import JobQueue
+from app.services.livekit_egress import LiveKitEgress
+from app.services.object_store import ObjectStore
+from app.services.state_store import StateStore
 
 
 def _now() -> int:
@@ -39,14 +40,23 @@ class MediaStore:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.root = self.settings.local_storage_root / "media"
-        self.sessions_root = self.root / "sessions"
         self.assets_root = self.root / "assets"
-        self.sessions_root.mkdir(parents=True, exist_ok=True)
         self.assets_root.mkdir(parents=True, exist_ok=True)
+        self.state = StateStore(self.settings)
+        self.objects = ObjectStore(self.settings)
+        self.jobs = JobQueue(self.settings)
+        self.egress = LiveKitEgress(self.settings)
 
     def create_session(self, payload: dict[str, Any]) -> dict[str, Any]:
         session_id = str(uuid4())
         now = _now()
+        requested_retention = payload.get("retention") if isinstance(payload.get("retention"), dict) else {}
+        appeal_days = max(1, int(requested_retention.get("appealDays") or self.settings.default_appeal_period_days))
+        video_days = max(
+            appeal_days,
+            int(requested_retention.get("videoDays") or self.settings.default_video_retention_days),
+        )
+        report_days = max(183, int(requested_retention.get("reportDays") or self.settings.default_report_retention_days))
         session = {
             "id": session_id,
             "sessionId": session_id,
@@ -58,7 +68,9 @@ class MediaStore:
             "quizId": payload.get("quizId") or payload.get("quiz_id"),
             "courseId": payload.get("courseId") or payload.get("course_id"),
             "userId": self._payload_user_id(payload),
-            "callbackUrl": payload.get("callbackUrl") or self.settings.moodle_webhook_url,
+            # Production uses the configured trusted target. A request-provided
+            # callback is only a development fallback when no target is set.
+            "callbackUrl": self.settings.moodle_webhook_url or payload.get("callbackUrl"),
             "returnUrl": payload.get("returnUrl"),
             "createdAt": now,
             "startedAt": None,
@@ -67,8 +79,20 @@ class MediaStore:
             "uploadTokenHash": None,
             "recording": {
                 "state": "not_started",
+                "provider": "livekit_egress" if self.settings.livekit_egress_enabled else "browser_fallback",
                 "currentSegment": 0,
                 "segments": {},
+            },
+            "processing": {"state": "idle", "jobId": None, "error": None},
+            "retention": {
+                "held": False,
+                "holdReason": None,
+                "videoDays": video_days,
+                "reportDays": report_days,
+                "appealDays": appeal_days,
+                "appealUntil": None,
+                "videoExpiresAt": None,
+                "reportExpiresAt": None,
             },
             "chunks": [],
             "pendingClips": [],
@@ -80,13 +104,11 @@ class MediaStore:
         return session
 
     def get_session(self, session_id: str) -> dict[str, Any]:
-        path = self._session_path(session_id)
-        if not path.exists():
-            raise KeyError("session_not_found")
-        return json.loads(path.read_text(encoding="utf-8"))
+        return self.state.get_session(session_id)
 
     def start_session(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
+        self._require_scope(session, payload)
         now = _now()
         session["status"] = "active"
         session["startedAt"] = session.get("startedAt") or now
@@ -97,6 +119,7 @@ class MediaStore:
 
     def heartbeat(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
+        self._require_scope(session, payload)
         session["lastHeartbeatAt"] = _now()
         session["lastHeartbeatPayload"] = payload
         self._save_session(session)
@@ -104,12 +127,16 @@ class MediaStore:
 
     def create_media_token(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
+        self._require_scope(session, payload)
         token = self._livekit_token(
             room=str(session.get("roomId") or f"room-{session_id}"),
             identity=str(payload.get("participantIdentity") or f"user-{session.get('userId') or 'unknown'}"),
             name=str(payload.get("participantName") or ""),
         )
         upload_token = uuid4().hex + uuid4().hex
+        session["participantIdentity"] = str(
+            payload.get("participantIdentity") or f"user-{session.get('userId') or 'unknown'}"
+        )
         session["uploadTokenHash"] = hashlib.sha256(upload_token.encode("utf-8")).hexdigest()
         session["uploadTokenExpiresAt"] = _now() + int(self.settings.media_upload_token_ttl_seconds)
         self._save_session(session)
@@ -127,6 +154,7 @@ class MediaStore:
 
     def start_recording(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
+        self._require_scope(session, payload)
         recording = self._recording(session)
         if recording.get("state") == "active":
             return {
@@ -139,7 +167,25 @@ class MediaStore:
         segment = int(payload.get("segment") or recording.get("currentSegment") or 0) or 1
         recording_id = f"rec-{session_id}-{segment}"
         now = _now()
+        provider = "browser_fallback"
+        egress_result: dict[str, Any] = {}
+        if self.settings.livekit_egress_enabled:
+            prefix = (
+                f"temp/{int(session.get('companyId') or 0)}/{_safe(session_id)}"
+                f"/recording/segment_{segment:03d}"
+            )
+            try:
+                egress_result = self.egress.start_participant(
+                    str(session.get("roomId") or f"room-{session_id}"),
+                    str(session.get("participantIdentity") or f"user-{session.get('userId') or 'unknown'}"),
+                    prefix,
+                )
+                provider = "livekit_egress" if egress_result.get("egressId") else "browser_fallback"
+                recording_id = str(egress_result.get("egressId") or recording_id)
+            except Exception as exc:
+                egress_result = {"state": "failed", "error": str(exc)[:500]}
         recording["state"] = "active"
+        recording["provider"] = provider
         recording["currentSegment"] = segment
         recording["recordingId"] = recording_id
         recording.setdefault("segments", {})[str(segment)] = {
@@ -148,54 +194,88 @@ class MediaStore:
             "startedAt": now,
             "stoppedAt": None,
             "reason": payload.get("reason") or "attempt_page_connected",
+            "egress": egress_result,
         }
         session["recording"] = recording
         session["status"] = "active"
         session["startedAt"] = session.get("startedAt") or now
         self._save_session(session)
-        return {"ok": True, "status": "active", "recordingId": recording_id, "segment": segment}
+        return {
+            "ok": True,
+            "status": "active",
+            "recordingId": recording_id,
+            "segment": segment,
+            "provider": provider,
+            "fallback": provider != "livekit_egress",
+        }
 
     def stop_recording(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
+        self._require_scope(session, payload)
         recording = self._recording(session)
         segment = int(payload.get("segment") or recording.get("currentSegment") or 1)
         now = _now()
-        recording["state"] = "stopped"
+        reason = str(payload.get("reason") or "submitted")
+        interrupted = reason in {
+            "connection_lost",
+            "media_track_ended",
+            "browser_offline",
+            "media_device_error",
+            "media_connection_disconnected",
+        }
+        if recording.get("state") != "active" and interrupted:
+            return {"ok": True, "status": str(recording.get("state") or "interrupted"), "duplicate": True}
+        if recording.get("state") in {"stopping", "completed"} and not interrupted:
+            return {"ok": True, "status": str(recording.get("state")), "duplicate": True}
+
+        recording["state"] = "interrupted" if interrupted else "stopping"
         segment_entry = recording.setdefault("segments", {}).setdefault(str(segment), {"segment": segment})
         segment_entry["stoppedAt"] = now
-        segment_entry["stopReason"] = payload.get("reason") or "submitted"
+        segment_entry["stopReason"] = reason
+        egress_id = str((segment_entry.get("egress") or {}).get("egressId") or "")
+        if egress_id:
+            try:
+                segment_entry["egressStop"] = self.egress.stop(egress_id)
+            except Exception as exc:
+                segment_entry["egressStop"] = {"state": "failed", "error": str(exc)[:500]}
         session["recording"] = recording
+        if interrupted:
+            session["status"] = "interrupted"
+            session["interruptedAt"] = now
+            self._save_session(session)
+            return {
+                "ok": True,
+                "status": "interrupted",
+                "segment": segment,
+                "partialMediaPreserved": True,
+            }
 
-        for clip in list(session.get("pendingClips") or []):
-            if not clip.get("assetId"):
-                asset = self._materialize_clip(
-                    session,
-                    reason=str(clip.get("reason") or "violation"),
-                    occurred_at=int(clip.get("occurredAt") or now),
-                    violation_id=clip.get("violationId"),
-                    segment=int(clip.get("segment") or segment),
-                    force=True,
-                )
-                if asset:
-                    clip["assetId"] = asset["assetId"]
-
-        submission_asset = self._materialize_clip(
-            session,
-            reason=str(payload.get("reason") or "submitted"),
-            occurred_at=now,
-            violation_id=None,
-            segment=segment,
-            force=True,
-        )
-        self._delete_temporary_chunks(session)
-        self._finalize_session(session, result="passed", reason=str(payload.get("reason") or "submitted"))
-        response = {"ok": True, "status": "stopped", "segment": segment}
-        if submission_asset:
-            response["assetId"] = submission_asset["assetId"]
-        return response
+        session["status"] = "processing"
+        session["finalResult"] = "failed" if str(payload.get("result") or "").lower() == "failed" else "passed"
+        session["processing"] = {"state": "queued", "jobId": None, "error": None}
+        self._save_session(session)
+        try:
+            job = self.jobs.enqueue(
+                "app.workers.jobs.finalize_session_media",
+                session_id,
+                reason,
+                str(session["finalResult"]),
+                job_id=f"finalize-{_safe(session_id)}-{segment}",
+                retry=True,
+            )
+            session = self.get_session(session_id)
+            session["processing"] = {"state": "queued", "jobId": job["jobId"], "error": None}
+            self._save_session(session)
+        except Exception as exc:
+            session["processing"] = {"state": "queue_failed", "jobId": None, "error": str(exc)[:500]}
+            self._save_session(session)
+            if self.settings.storage_require_ready:
+                raise
+        return {"ok": True, "status": "processing", "segment": segment, "processing": session["processing"]}
 
     def interrupt_session(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
+        self._require_scope(session, payload)
         session["status"] = "interrupted"
         session["interruptedAt"] = _now()
         session["interruptPayload"] = payload
@@ -204,6 +284,9 @@ class MediaStore:
 
     def resume_session(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
+        self._require_scope(session, payload)
+        if session.get("completedAt") or session.get("status") in {"completed", "failed"}:
+            raise KeyError("session_closed")
         session["status"] = "active"
         session["resumedAt"] = _now()
         session["resumePayload"] = payload
@@ -212,14 +295,21 @@ class MediaStore:
 
     def fail_session(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
-        self._finalize_session(session, result="failed", reason=str(payload.get("reason") or "server_failed"))
-        return {"ok": True, "session": self.get_session(session_id)}
+        self._require_scope(session, payload)
+        return self._queue_session_finalization(
+            session,
+            reason=str(payload.get("reason") or "server_failed"),
+            result="failed",
+        )
 
     def finish_session(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
         result = "failed" if str(payload.get("result") or payload.get("reason") or "").lower() == "failed" else "passed"
-        self._finalize_session(session, result=result, reason=str(payload.get("reason") or "completed"))
-        return {"ok": True, "session": self.get_session(session_id)}
+        return self._queue_session_finalization(
+            session,
+            reason=str(payload.get("reason") or "completed"),
+            result=result,
+        )
 
     def save_media_chunk(
         self,
@@ -239,17 +329,24 @@ class MediaStore:
 
         now = _now()
         extension = ".webm" if "webm" in mime_type else ".bin"
-        relative = Path(_safe(session_id)) / "chunks" / f"segment_{int(segment):03d}" / f"chunk_{int(sequence):06d}{extension}"
-        path = self.assets_root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
+        relative = (
+            f"temp/{int(session.get('companyId') or 0)}/{_safe(session_id)}/browser/"
+            f"segment_{int(segment):03d}/chunk_{int(sequence):06d}{extension}"
+        )
+        stored = self.objects.put_bytes(
+            self.settings.s3_bucket_temp,
+            relative,
+            content,
+            mime_type or "video/webm",
+        )
 
         entry = {
             "segment": int(segment),
             "sequence": int(sequence),
             "receivedAt": now,
             "durationMs": int(duration_ms or 0),
-            "path": relative.as_posix(),
+            "bucket": stored.bucket,
+            "objectKey": stored.key,
             "mimeType": mime_type or "video/webm",
             "sizeBytes": len(content),
         }
@@ -258,11 +355,11 @@ class MediaStore:
         session["chunks"] = chunks
         self._prune_old_chunks(session, now)
         self._save_session(session)
-        self._materialize_due_clips(session_id)
         return {"ok": True, "chunk": entry}
 
     def capture_snapshot(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
+        self._require_scope(session, payload)
         reason = str(payload.get("reason") or "manual_proctor")
         content = self._decode_optional_image(payload.get("snapshotImage") or payload.get("image"))
         if content is None:
@@ -280,18 +377,35 @@ class MediaStore:
         )
         self._send_asset_webhook(session, asset)
         if reason == "violation":
+            # The asset webhook appends delivery state. Reload before adding the
+            # violation so that neither update can overwrite the other.
+            session = self.get_session(session_id)
+            occurred_at = self._timestamp(payload.get("occurredAt")) or _now()
+            violation_id = str(payload.get("violationId") or uuid4().hex)
+            violation_type = _safe(str(payload.get("violationType") or "violation"), 64)
+            violations = list(session.get("violations") or [])
+            if not any(str(item.get("id")) == violation_id for item in violations):
+                violations.append({
+                    "id": violation_id,
+                    "type": violation_type,
+                    "severity": payload.get("severity") or "warning",
+                    "occurredAt": occurred_at,
+                    "metadata": {"source": "moodle_violation_snapshot"},
+                })
+                session["violations"] = violations
             self._queue_clip(
                 session,
-                reason="violation",
-                occurred_at=_now(),
-                violation_id=payload.get("violationId"),
+                reason=violation_type,
+                occurred_at=occurred_at,
+                violation_id=violation_id,
                 segment=int(self._recording(session).get("currentSegment") or 1),
             )
         return {"ok": True, "status": "captured", "reason": reason, "assetId": asset["assetId"]}
 
     def record_violation(self, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(str(payload.get("sessionId") or payload.get("session_id")))
-        now = _now()
+        self._require_scope(session, payload)
+        now = self._timestamp(payload.get("occurredAt") or payload.get("occurred_at")) or _now()
         violation = {
             "id": str(payload.get("violationId") or uuid4().hex),
             "type": str(payload.get("violationType") or payload.get("violation_type") or "unknown"),
@@ -310,23 +424,33 @@ class MediaStore:
         )
         return {"ok": True, "status": "recorded", "violation": violation}
 
-    def get_asset_content(self, asset_id: str) -> tuple[Path, str]:
+    def get_asset_content(self, asset_id: str) -> tuple[bytes, str]:
         asset = self._find_asset(asset_id)
         if asset is None:
             raise KeyError("asset_not_found")
-        path = self.assets_root / asset["path"]
-        if not path.is_file():
+        if asset.get("status") == "deleted":
             raise KeyError("asset_content_not_found")
-        return path, str(asset.get("mimeType") or mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+        try:
+            content = self.objects.get_bytes(str(asset["bucket"]), str(asset["objectKey"]))
+        except Exception as exc:
+            raise KeyError("asset_content_not_found") from exc
+        return content, str(asset.get("mimeType") or "application/octet-stream")
 
     def delete_asset(self, asset_id: str) -> bool:
         asset = self._find_asset(asset_id)
         if asset is None:
-            return False
-        path = self.assets_root / asset["path"]
-        if path.exists():
-            path.unlink()
-        return True
+            raise KeyError("asset_not_found")
+        deleted = self.objects.delete(str(asset["bucket"]), str(asset["objectKey"]))
+        asset["status"] = "deleted"
+        asset["deletedAt"] = _now()
+        self.state.index_asset(asset)
+        session = self.get_session(str(asset["sessionId"]))
+        for item in session.get("assets") or []:
+            if str(item.get("assetId")) == asset_id:
+                item.update({"status": "deleted", "deletedAt": asset["deletedAt"]})
+                break
+        self._save_session(session)
+        return deleted
 
     def _materialize_due_clips(self, session_id: str) -> None:
         session = self.get_session(session_id)
@@ -400,7 +524,13 @@ class MediaStore:
         if not chunks:
             return None
         chunks.sort(key=lambda item: (int(item.get("sequence") or 0), int(item.get("receivedAt") or 0)))
-        content = b"".join((self.assets_root / chunk["path"]).read_bytes() for chunk in chunks if (self.assets_root / chunk["path"]).is_file())
+        parts = []
+        for chunk in chunks:
+            try:
+                parts.append(self.objects.get_bytes(str(chunk["bucket"]), str(chunk["objectKey"])))
+            except Exception:
+                continue
+        content = b"".join(parts)
         if not content:
             return None
         asset = self._save_asset_file(
@@ -432,18 +562,21 @@ class MediaStore:
             if int(chunk.get("receivedAt") or 0) >= cutoff:
                 kept.append(chunk)
                 continue
-            path = self.assets_root / chunk["path"]
-            if path.exists():
-                path.unlink()
+            self.objects.delete(str(chunk["bucket"]), str(chunk["objectKey"]))
         session["chunks"] = kept
 
     def _delete_temporary_chunks(self, session: dict[str, Any]) -> None:
         for chunk in session.get("chunks") or []:
-            path = self.assets_root / chunk["path"]
-            if path.exists():
-                path.unlink()
+            self.objects.delete(str(chunk["bucket"]), str(chunk["objectKey"]))
         session["chunks"] = []
         self._save_session(session)
+
+    def _delete_temporary_media(self, session: dict[str, Any]) -> None:
+        self._delete_temporary_chunks(session)
+        for entry in (session.get("recording") or {}).get("segments", {}).values():
+            prefix = str((entry.get("egress") or {}).get("objectPrefix") or "")
+            if prefix:
+                self.objects.delete_prefix(self.settings.s3_bucket_temp, prefix)
 
     def _save_asset_file(
         self,
@@ -458,25 +591,42 @@ class MediaStore:
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         asset_id = f"{asset_type}-{uuid4().hex}"
-        relative = Path(_safe(str(session["id"]))) / "assets" / f"{asset_id}{suffix}"
-        path = self.assets_root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(content)
+        company_id = int(session.get("companyId") or 0)
+        object_key = (
+            f"evidence/{company_id}/{_safe(str(session['id']))}/"
+            f"{self._asset_directory(asset_type)}/{asset_id}{suffix}"
+        )
+        stored = self.objects.put_bytes(
+            self.settings.s3_bucket_evidence,
+            object_key,
+            content,
+            mime_type,
+            {"session-id": str(session["id"]), "company-id": str(company_id)},
+        )
         asset = {
             "assetId": asset_id,
             "type": asset_type,
             "reason": reason,
             "violationId": violation_id,
-            "path": relative.as_posix(),
+            "bucket": stored.bucket,
+            "objectKey": stored.key,
             "mimeType": mime_type,
             "sizeBytes": len(content),
             "checksum": hashlib.sha256(content).hexdigest(),
             "capturedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "availableAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "metadata": metadata or {},
+            "status": "active",
+            "held": bool((session.get("retention") or {}).get("held")),
+            "expiresAt": (session.get("retention") or {}).get(
+                "videoExpiresAt" if asset_type in {"video_clip", "full_recording"} else "reportExpiresAt"
+            ),
+            "sessionId": session["id"],
+            "companyId": company_id,
         }
         session.setdefault("assets", []).append(asset)
         self._save_session(session)
+        self.state.index_asset(asset)
         return asset
 
     def _send_asset_webhook(self, session: dict[str, Any], asset: dict[str, Any]) -> None:
@@ -495,6 +645,22 @@ class MediaStore:
         if session.get("completedAt"):
             return
         now = _now()
+        retention = dict(session.get("retention") or {})
+        appeal_days = max(1, int(retention.get("appealDays") or self.settings.default_appeal_period_days))
+        video_days = max(appeal_days, int(retention.get("videoDays") or self.settings.default_video_retention_days))
+        report_days = max(183, int(retention.get("reportDays") or self.settings.default_report_retention_days))
+        retention.update({
+            "appealUntil": now + (appeal_days * 86400),
+            "videoExpiresAt": now + (video_days * 86400),
+            "reportExpiresAt": now + (report_days * 86400),
+        })
+        session["retention"] = retention
+        for asset in session.get("assets") or []:
+            asset["expiresAt"] = retention[
+                "videoExpiresAt" if asset.get("type") in {"video_clip", "full_recording"} else "reportExpiresAt"
+            ]
+            asset["held"] = bool(retention.get("held"))
+            self.state.index_asset(asset)
         session["status"] = "completed" if result == "passed" else "failed"
         session["completedAt"] = now
         session["result"] = result
@@ -510,6 +676,8 @@ class MediaStore:
             "userId": session.get("userId"),
             "result": result,
             "reasonCode": reason,
+            "mediaStatus": (session.get("processing") or {}).get("state"),
+            "assetCount": len(session.get("assets") or []),
             "completedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
         })
 
@@ -519,18 +687,21 @@ class MediaStore:
         if not url or not secret:
             self._append_delivery(session, event, "skipped", "webhook_not_configured")
             return
-        body = json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        signature = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
         try:
-            with httpx.Client(timeout=10.0) as client:
-                response = client.post(url, content=body, headers={
-                    "Content-Type": "application/json",
-                    "X-ProctorCore-Signature": f"sha256={signature}",
-                })
-            status = "delivered" if 200 <= response.status_code < 300 else "failed"
-            self._append_delivery(session, event, status, f"{response.status_code}: {response.text[:300]}")
+            self.jobs.enqueue(
+                "app.workers.jobs.deliver_webhook",
+                str(session["id"]),
+                event,
+                # The event id is deterministic for receiver deduplication. The
+                # queue id is unique so reconciliation can deliberately resend it.
+                job_id=f"webhook-{_safe(str(event.get('eventId') or 'event'))}-{uuid4().hex[:12]}",
+                retry=True,
+            )
+            self._append_delivery(session, event, "queued", "durable_delivery_queued")
         except Exception as exc:
-            self._append_delivery(session, event, "failed", str(exc))
+            self._append_delivery(session, event, "queue_failed", str(exc))
+            if self.settings.storage_require_ready:
+                raise
 
     def _append_delivery(self, session: dict[str, Any], event: dict[str, Any], status: str, message: str) -> None:
         try:
@@ -547,15 +718,10 @@ class MediaStore:
         self._save_session(current)
 
     def _find_asset(self, asset_id: str) -> dict[str, Any] | None:
-        for path in self.sessions_root.glob("*.json"):
-            try:
-                session = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            for asset in session.get("assets") or []:
-                if str(asset.get("assetId")) == str(asset_id):
-                    return asset
-        return None
+        try:
+            return self.state.get_asset(asset_id)
+        except KeyError:
+            return None
 
     def _decode_optional_image(self, value: Any) -> bytes | None:
         if not isinstance(value, str) or not value.strip():
@@ -568,17 +734,122 @@ class MediaStore:
         except Exception:
             return None
 
+    @staticmethod
+    def _timestamp(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        if isinstance(value, (int, float)) or str(value).isdigit():
+            timestamp = int(value)
+            return timestamp // 1000 if timestamp > 100000000000 else timestamp
+        try:
+            from datetime import datetime
+
+            return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
+        except (TypeError, ValueError):
+            return None
+
+    def _queue_session_finalization(
+        self,
+        session: dict[str, Any],
+        *,
+        reason: str,
+        result: str,
+    ) -> dict[str, Any]:
+        if session.get("completedAt"):
+            return {"ok": True, "status": session.get("status"), "duplicate": True}
+        recording = self._recording(session)
+        recording["state"] = "stopping"
+        session["recording"] = recording
+        session["status"] = "processing"
+        session["finalResult"] = result
+        session["processing"] = {"state": "queued", "jobId": None, "error": None}
+        self._save_session(session)
+        job = self.jobs.enqueue(
+            "app.workers.jobs.finalize_session_media",
+            str(session["id"]),
+            reason,
+            result,
+            job_id=f"finalize-{_safe(str(session['id']))}-terminal",
+            retry=True,
+        )
+        session = self.get_session(str(session["id"]))
+        session["processing"] = {"state": "queued", "jobId": job["jobId"], "error": None}
+        self._save_session(session)
+        return {"ok": True, "status": "processing", "processing": session["processing"]}
+
     def _recording(self, session: dict[str, Any]) -> dict[str, Any]:
         recording = session.get("recording")
         return recording if isinstance(recording, dict) else {"state": "not_started", "currentSegment": 0, "segments": {}}
 
-    def _session_path(self, session_id: str) -> Path:
-        return self.sessions_root / f"{_safe(session_id)}.json"
-
     def _save_session(self, session: dict[str, Any]) -> None:
-        path = self._session_path(str(session["id"]))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(session, indent=2, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+        self.state.save_session(session)
+
+    @staticmethod
+    def _asset_directory(asset_type: str) -> str:
+        if asset_type == "video_clip":
+            return "clips"
+        if asset_type == "full_recording":
+            return "recording"
+        if asset_type == "report_pdf":
+            return "reports"
+        return "snapshots"
+
+    def register_asset_bytes(
+        self,
+        session_id: str,
+        asset_type: str,
+        content: bytes,
+        suffix: str,
+        mime_type: str,
+        reason: str,
+        violation_id: Any = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        session = self.get_session(session_id)
+        asset = self._save_asset_file(
+            session,
+            asset_type=asset_type,
+            content=content,
+            suffix=suffix,
+            mime_type=mime_type,
+            reason=reason,
+            violation_id=violation_id,
+            metadata=metadata,
+        )
+        self._send_asset_webhook(session, asset)
+        return asset
+
+    def set_evidence_hold(self, session_id: str, held: bool, reason: str) -> dict[str, Any]:
+        session = self.get_session(session_id)
+        retention = dict(session.get("retention") or {})
+        retention["held"] = bool(held)
+        retention["holdReason"] = reason if held else None
+        retention["changedAt"] = _now()
+        session["retention"] = retention
+        for asset in session.get("assets") or []:
+            asset["held"] = bool(held)
+            self.state.index_asset(asset)
+        self._save_session(session)
+        return retention
+
+    def reconcile_session(self, session_id: str, resend_webhooks: bool = False) -> dict[str, Any]:
+        session = self.get_session(session_id)
+        missing = []
+        available = []
+        for asset in session.get("assets") or []:
+            exists = self.objects.exists(str(asset["bucket"]), str(asset["objectKey"]))
+            asset["status"] = "active" if exists else "missing"
+            self.state.index_asset(asset)
+            (available if exists else missing).append(asset["assetId"])
+            if exists and resend_webhooks:
+                self._send_asset_webhook(session, asset)
+        session["reconciliation"] = {
+            "checkedAt": _now(),
+            "available": len(available),
+            "missing": len(missing),
+        }
+        self._save_session(session)
+        return {"available": available, "missing": missing, **session["reconciliation"]}
 
     def _payload_user_id(self, payload: dict[str, Any]) -> int | None:
         user = payload.get("user")
@@ -592,6 +863,22 @@ class MediaStore:
         expires = int(session.get("uploadTokenExpiresAt") or 0)
         if not session.get("uploadTokenHash") or expires < _now() or not hmac.compare_digest(digest, session["uploadTokenHash"]):
             raise PermissionError("invalid_upload_token")
+
+    @staticmethod
+    def _require_scope(session: dict[str, Any], payload: dict[str, Any]) -> None:
+        checks = (
+            ("companyId", "company_id", "companyId"),
+            ("userId", "user_id", "userId"),
+            ("attemptId", "quiz_attempt_id", "attemptId"),
+            ("moodleSessionId", "moodle_session_id", "moodleSessionId"),
+        )
+        for camel, snake, session_key in checks:
+            supplied = payload.get(camel)
+            if supplied is None:
+                supplied = payload.get(snake)
+            expected = session.get(session_key)
+            if supplied is not None and expected is not None and int(supplied) != int(expected):
+                raise PermissionError("tenant_scope_mismatch")
 
     def _livekit_token(self, *, room: str, identity: str, name: str) -> str:
         now = _now()

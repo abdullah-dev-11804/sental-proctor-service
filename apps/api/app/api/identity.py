@@ -158,7 +158,7 @@ def get_face_reference(user_id: int, companyId: int = 0) -> dict:
         "companyId": companyId,
         "userId": user_id,
         "referenceKey": stored[0] if stored else None,
-        "template": stored[1] if stored else None,
+        "templateVersion": int(stored[1].get("version") or 1) if stored else None,
     }
 
 
@@ -270,7 +270,6 @@ def verify_face_reference(payload: FaceReferenceVerifyRequest) -> dict:
     result["companyId"] = payload.companyId
     result["userId"] = payload.userId
     result["referenceKey"] = reference_key
-    result["template"] = template
     return result
 
 
@@ -280,13 +279,17 @@ def reset_face_reference(
     payload: FaceReferenceResetRequest | None = None,
     companyId: int = 0,
 ) -> dict:
-    deleted = LocalStorage().delete_face_reference(companyId, user_id)
+    storage = LocalStorage()
+    reason = payload.reason if payload and payload.reason else "administrator_reset"
+    deleted = storage.delete_face_reference(companyId, user_id)
+    receipt = storage.save_deletion_receipt(companyId, user_id, reason, deleted)
     return {
         "ok": True,
         "deleted": deleted,
         "companyId": companyId,
         "userId": user_id,
-        "reason": payload.reason if payload else None,
+        "reason": reason,
+        "receipt": receipt,
     }
 
 

@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 from app.api.identity import get_face_matcher
 from app.core.config import get_settings
 from app.core.security import require_api_auth
+from app.services.media_store import MediaStore
 
 
 router = APIRouter(prefix="/api/v1/monitor", tags=["monitor"])
@@ -21,6 +22,13 @@ class FrameAnalysisRequest(BaseModel):
 
 @router.post("/analyse", dependencies=[Depends(require_api_auth)])
 def analyse_frame(payload: FrameAnalysisRequest) -> dict:
+    try:
+        session = MediaStore().get_session(payload.sessionId)
+        if int(session.get("companyId") or 0) != payload.companyId:
+            raise KeyError("session_not_found")
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="session_not_found") from exc
+
     matcher = get_face_matcher()
     settings = get_settings()
     try:
@@ -32,6 +40,7 @@ def analyse_frame(payload: FrameAnalysisRequest) -> dict:
 
     yaw = matcher._estimate_yaw(quality)
     looking_away = yaw is not None and abs(float(yaw)) >= float(settings.monitor_lookaway_yaw_threshold)
+    spoof_detected = quality.face_count == 1 and quality.antispoof_passed is False
     identity_result = "not_checked"
     similarity_score = None
 
@@ -55,6 +64,8 @@ def analyse_frame(payload: FrameAnalysisRequest) -> dict:
         "companyId": payload.companyId,
         "faceCount": int(quality.face_count),
         "lookingAway": bool(looking_away),
+        "spoofDetected": bool(spoof_detected),
+        "antispoofScore": float(quality.antispoof_score) if quality.antispoof_score is not None else None,
         "yaw": float(yaw) if yaw is not None else None,
         "identityResult": identity_result,
         "similarityScore": float(round(similarity_score, 4)) if similarity_score is not None else None,

@@ -8,3 +8,8 @@ onnxruntime==1.22.1
 Pillow==11.3.0
 pytest==8.4.1
 httpx==0.28.1
+boto3==1.40.11
+cryptography==45.0.6
+livekit-api==1.2.1
+redis==6.4.0
+rq==2.5.0

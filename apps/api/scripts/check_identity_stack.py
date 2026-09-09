@@ -25,19 +25,14 @@ def main() -> None:
 
 
 def required_models(settings, engine: str) -> list[dict]:
-    engine = engine.strip().lower()
-    if engine in ("scrfd_adaface", "production_face"):
-        values = [
-            ("scrfd_detector", settings.identity_scrfd_model, True),
-            ("adaface_recognizer", settings.identity_adaface_model, True),
-            ("passive_antispoof", settings.identity_antispoof_model, settings.identity_require_passive_antispoof),
-            ("head_pose", settings.identity_headpose_model, settings.identity_require_headpose_liveness),
-        ]
-    else:
-        values = [
-            ("yunet_detector", settings.identity_yunet_model, engine == "opencv_sface"),
-            ("sface_recognizer", settings.identity_sface_model, engine == "opencv_sface"),
-        ]
+    if engine.strip().lower() != "scrfd_adaface":
+        raise RuntimeError("Only the SCRFD + AdaFace identity engine is supported.")
+    values = [
+        ("scrfd_detector", settings.identity_scrfd_model, True),
+        ("adaface_recognizer", settings.identity_adaface_model, True),
+        ("passive_antispoof", settings.identity_antispoof_model, settings.identity_require_passive_antispoof),
+        ("head_pose", settings.identity_headpose_model, settings.identity_require_headpose_liveness),
+    ]
     models = []
     for role, value, required in values:
         if not required and not str(value).strip():

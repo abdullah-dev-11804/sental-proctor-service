@@ -17,16 +17,16 @@ class Settings(BaseSettings):
     cors_origins_raw: str = Field(default="*", alias="CORS_ORIGINS")
 
     local_storage_root: Path = Path("./storage")
+    storage_backend: str = "local"
+    storage_require_ready: bool = False
+    reference_encryption_key_file: str = ""
 
     identity_pass_threshold: float = 0.85
     identity_review_threshold: float = 0.70
     identity_min_brightness: float = 35.0
     identity_min_blur: float = 35.0
-    identity_engine: str = "opencv_sface"
-    identity_allow_legacy_matcher: bool = False
+    identity_engine: str = "scrfd_adaface"
     identity_model_root: Path = Path("./models")
-    identity_yunet_model: str = "face_detection_yunet_2023mar.onnx"
-    identity_sface_model: str = "face_recognition_sface_2021dec.onnx"
     identity_scrfd_model: str = "scrfd_2.5g_kps.onnx"
     identity_adaface_model: str = "adaface_ir50_ms1mv2.onnx"
     identity_scrfd_input_size: int = 640
@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     identity_require_headpose_liveness: bool = False
 
     redis_url: str = "redis://localhost:6379/0"
+    queue_name: str = "proctorcore"
+    webhook_max_attempts: int = 7
+    webhook_retry_intervals: str = "10,30,120,600,1800,7200"
 
     s3_endpoint: str = "http://localhost:9000"
     s3_access_key: str = "sental-minio"
@@ -72,10 +75,16 @@ class Settings(BaseSettings):
     s3_bucket_temp: str = "proctoring-temp"
     s3_bucket_evidence: str = "proctoring-evidence"
     s3_bucket_reports: str = "proctoring-reports"
+    s3_region: str = "us-east-1"
+    s3_secure: bool = False
 
     livekit_url: str = "wss://livekit.example.kz"
     livekit_api_key: str = "dev-livekit-key"
     livekit_api_secret: str = "dev-livekit-secret"
+    livekit_internal_url: str = "http://livekit:7880"
+    livekit_egress_enabled: bool = False
+    livekit_egress_segment_seconds: int = 6
+    livekit_egress_health_url: str = "http://livekit-egress:9090/metrics"
     livekit_client_script_url: str = "https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"
 
     clip_pre_seconds: int = 15
@@ -84,9 +93,18 @@ class Settings(BaseSettings):
     media_upload_token_ttl_seconds: int = 14400
     media_chunk_max_bytes: int = 26214400
     monitor_lookaway_yaw_threshold: float = 0.42
+    monitor_request_timeout_seconds: float = 8.0
+
+    default_video_retention_days: int = 30
+    default_report_retention_days: int = 183
+    default_appeal_period_days: int = 14
 
     moodle_webhook_url: str = ""
     moodle_webhook_secret: str = ""
+
+    @property
+    def production_readiness_required(self) -> bool:
+        return bool(self.storage_require_ready)
 
     @property
     def cors_origins(self) -> list[str]:
@@ -94,6 +112,16 @@ class Settings(BaseSettings):
         if value == "*":
             return ["*"]
         return [item.strip() for item in value.split(",") if item.strip()]
+
+    @property
+    def webhook_retry_schedule(self) -> list[int]:
+        values = []
+        for item in self.webhook_retry_intervals.split(","):
+            try:
+                values.append(max(1, int(item.strip())))
+            except ValueError:
+                continue
+        return values or [10, 30, 120, 600, 1800, 7200]
 
 
 @lru_cache

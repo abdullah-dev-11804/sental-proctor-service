@@ -40,7 +40,7 @@ apps/api/scripts/create_venv.sh
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r apps/api/requirements.txt
-apps/api/scripts/download_face_models.sh
+# Place the approved SCRFD, AdaFace, MiniFASNet and SixDRepNet ONNX files in models/.
 uvicorn app.main:app --app-dir apps/api --reload --host 127.0.0.1 --port 8091
 ```
 
@@ -67,15 +67,15 @@ curl -X POST http://127.0.0.1:8091/v1/identity/verify \
 ```bash
 cd sental-proctor-service
 cp .env.example .env
-apps/api/scripts/download_face_models.sh
+# Place the approved SCRFD, AdaFace, MiniFASNet and SixDRepNet ONNX files in models/.
 docker compose up --build
 ```
 
 The Docker setup is a staging scaffold. For the first identity-verification slice, the API can run by itself without Redis, MinIO, or LiveKit.
 
 Health output includes `identity_engine` and `identity_models_ready`. For staging/production,
-`identity_models_ready` must be `true`; do not enable final identity decisions while the
-service is using the development-only legacy matcher fallback.
+`identity_models_ready` must be `true`. The service fails closed if the configured engine is
+not SCRFD + AdaFace; YuNet, SFace and Haar fallbacks are not supported.
 
 For the stronger face stack, set `IDENTITY_ENGINE=scrfd_adaface` and place the
 required SCRFD/AdaFace ONNX files under `models/`. Details are in
