@@ -145,12 +145,14 @@ even though the streamed gzip file will normally be smaller. Create and verify t
 
 ```bash
 cd /www/wwwroot/sental.kz
-umask 077
-set -o pipefail
-mysqldump --single-transaction --quick --skip-lock-tables --hex-blob \
-  --default-character-set=utf8mb4 \
-  -h DB_HOST -u DB_USER -p DB_NAME \
-  | gzip -1 > /root/moodle-full-before-proctor-minio.sql.gz
+(
+  umask 077
+  set -o pipefail
+  mysqldump --single-transaction --quick --skip-lock-tables --hex-blob \
+    --default-character-set=utf8mb4 \
+    -h DB_HOST -u DB_USER -p DB_NAME \
+    | gzip -1 > /root/moodle-full-before-proctor-minio.sql.gz
+)
 gzip -t /root/moodle-full-before-proctor-minio.sql.gz
 ls -lh /root/moodle-full-before-proctor-minio.sql.gz
 sha256sum /root/moodle-full-before-proctor-minio.sql.gz \
@@ -167,21 +169,24 @@ confirmed `mdl_` prefix; change every prefix if `config.php` reports something e
 
 ```bash
 cd /www/wwwroot/sental.kz
-set -o pipefail
-mysqldump --single-transaction --quick --default-character-set=utf8mb4 \
-  --no-create-info --skip-triggers --complete-insert \
-  -h DB_HOST -u DB_USER -p DB_NAME \
-  mdl_local_proctorcore_appeals \
-  mdl_local_proctorcore_assets \
-  mdl_local_proctorcore_audit \
-  mdl_local_proctorcore_checks \
-  mdl_local_proctorcore_faceenrol \
-  mdl_local_proctorcore_fieldvals \
-  mdl_local_proctorcore_rulesack \
-  mdl_local_proctorcore_sessions \
-  mdl_local_proctorcore_violations \
-  mdl_local_proctorcore_webhooks \
-  | gzip > /root/proctorcore-transactional-before-minio.sql.gz
+(
+  umask 077
+  set -o pipefail
+  mysqldump --single-transaction --quick --default-character-set=utf8mb4 \
+    --no-create-info --skip-triggers --complete-insert \
+    -h DB_HOST -u DB_USER -p DB_NAME \
+    mdl_local_proctorcore_appeals \
+    mdl_local_proctorcore_assets \
+    mdl_local_proctorcore_audit \
+    mdl_local_proctorcore_checks \
+    mdl_local_proctorcore_faceenrol \
+    mdl_local_proctorcore_fieldvals \
+    mdl_local_proctorcore_rulesack \
+    mdl_local_proctorcore_sessions \
+    mdl_local_proctorcore_violations \
+    mdl_local_proctorcore_webhooks \
+    | gzip > /root/proctorcore-transactional-before-minio.sql.gz
+)
 gzip -t /root/proctorcore-transactional-before-minio.sql.gz
 ls -lh /root/proctorcore-transactional-before-minio.sql.gz
 ```
@@ -261,13 +266,24 @@ REFERENCE_ENCRYPTION_KEY_FILE=/run/secrets/reference_encryption_key
 CORS_ORIGINS=https://sental.kz
 S3_ENDPOINT=http://minio:9000
 S3_SECURE=false
+IDENTITY_PASS_THRESHOLD=0.85
+IDENTITY_REVIEW_THRESHOLD=0.70
+IDENTITY_REQUIRE_PASSIVE_ANTISPOOF=true
+IDENTITY_ANTISPOOF_MODEL=minifasnet_v2.onnx
+IDENTITY_HEADPOSE_MODEL=SixDRepNet.onnx
+IDENTITY_REQUIRE_HEADPOSE_LIVENESS=false
+LIVEKIT_EGRESS_ENABLED=true
+LIVEKIT_EGRESS_HEALTH_URL=http://livekit-egress:9090/metrics
+MOODLE_WEBHOOK_URL=https://sental.kz/local/proctorcore/webhook.php
 ```
 
 Keep the existing `S3_ACCESS_KEY`, `S3_SECRET_KEY`, bucket names, API secret, LiveKit secret, Moodle webhook
-secret, and encryption key unchanged. Check non-secret resolved values:
+secret, and encryption key unchanged. `IDENTITY_REQUIRE_HEADPOSE_LIVENESS=false` prevents an admission-time head
+turn challenge; SixDRepNet is still loaded and used for sustained look-away monitoring. Check non-secret resolved
+values:
 
 ```bash
-grep -E '^(APP_ENV|STORAGE_BACKEND|STORAGE_REQUIRE_READY|REFERENCE_ENCRYPTION_KEY_FILE|CORS_ORIGINS|S3_ENDPOINT|S3_SECURE)=' .env
+grep -E '^(APP_ENV|STORAGE_BACKEND|STORAGE_REQUIRE_READY|REFERENCE_ENCRYPTION_KEY_FILE|CORS_ORIGINS|S3_ENDPOINT|S3_SECURE|IDENTITY_PASS_THRESHOLD|IDENTITY_REVIEW_THRESHOLD|IDENTITY_REQUIRE_PASSIVE_ANTISPOOF|IDENTITY_ANTISPOOF_MODEL|IDENTITY_HEADPOSE_MODEL|IDENTITY_REQUIRE_HEADPOSE_LIVENESS|LIVEKIT_EGRESS_ENABLED|LIVEKIT_EGRESS_HEALTH_URL|MOODLE_WEBHOOK_URL)=' .env
 test -s secrets/reference_encryption_key && echo "Encryption key present"
 docker compose config --quiet
 docker compose config --images

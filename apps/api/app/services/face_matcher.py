@@ -128,6 +128,7 @@ class FaceMatcher:
                 reason,
                 samples,
                 reference_quality=samples[0]["quality"] if samples else None,
+                quality_policy=quality_policy,
             )
 
         consistency = self._embedding_consistency([sample["embedding"] for sample in samples])
@@ -141,6 +142,7 @@ class FaceMatcher:
                 "unstable_reference_capture",
                 samples,
                 template_consistency=consistency,
+                quality_policy=quality_policy,
             )
 
         template = self._build_template(samples, consistency)
@@ -215,6 +217,7 @@ class FaceMatcher:
                 samples,
                 template,
                 pass_threshold,
+                quality_policy,
             )
 
         live_embeddings = [sample["embedding"] for sample in samples]
@@ -225,6 +228,7 @@ class FaceMatcher:
                 samples,
                 template,
                 pass_threshold,
+                quality_policy,
             )
 
         scores: list[float] = []
@@ -294,19 +298,23 @@ class FaceMatcher:
     ) -> list[dict]:
         samples: list[dict] = []
         self._last_rejection_reasons = []
+        self._last_rejected_qualities = []
         for frame in frames[: max(1, int(self.settings.identity_max_enrollment_frames))]:
             try:
                 image = self._decode_image(frame)
                 embedding, quality = self._extract_primary_face(image)
             except (ValueError, cv2.error):
                 self._last_rejection_reasons.append("invalid_image")
+                self._last_rejected_qualities.append({"reason": "invalid_image"})
                 continue
             if quality.face_count < 1:
                 self._last_rejection_reasons.append("no_face")
+                self._last_rejected_qualities.append({"reason": "no_face", **quality.__dict__})
                 continue
             retry_reason = retry_reason_fn(quality)
             if retry_reason:
                 self._last_rejection_reasons.append(retry_reason)
+                self._last_rejected_qualities.append({"reason": retry_reason, **quality.__dict__})
                 continue
             sample = {
                 "bytes": frame,
@@ -446,11 +454,15 @@ class FaceMatcher:
         samples: list[dict],
         reference_quality: FaceQuality | None = None,
         template_consistency: float | None = None,
+        quality_policy: dict | None = None,
     ) -> dict:
         quality = {
             "reference": (reference_quality.__dict__ if reference_quality is not None else {}),
             "mode": "enroll_template",
             "validFrames": [sample["quality"].__dict__ for sample in samples],
+            "rejectedFrames": list(getattr(self, "_last_rejected_qualities", [])),
+            "rejectionSummary": self._rejection_summary(),
+            "requirements": self._quality_requirements(quality_policy, enrollment=True),
             "template": {
                 "templateConsistency": template_consistency,
                 "validFrameCount": len(samples),
@@ -481,6 +493,7 @@ class FaceMatcher:
         samples: list[dict],
         template: dict,
         pass_threshold: float | None,
+        quality_policy: dict | None = None,
     ) -> dict:
         threshold = pass_threshold if pass_threshold is not None else self.settings.identity_pass_threshold
         review_threshold = float(self.settings.identity_review_threshold)
@@ -520,6 +533,9 @@ class FaceMatcher:
             "liveFaceCount": len(samples),
             "quality": {
                 "live": [sample["quality"].__dict__ for sample in samples],
+                "rejectedFrames": list(getattr(self, "_last_rejected_qualities", [])),
+                "rejectionSummary": self._rejection_summary(),
+                "requirements": self._quality_requirements(quality_policy, enrollment=False),
                 "reference": template_quality,
                 "template": template_quality,
             },
@@ -785,6 +801,12 @@ class FaceMatcher:
     ) -> str | None:
         if quality.face_count < 1:
             return "no_face"
+        if quality.face_count > 1:
+            return "multiple_faces"
+        if quality.brightness < min_brightness:
+            return "low_light"
+        if quality.blur < min_blur:
+            return "blurry"
         if quality.confidence is not None and quality.confidence < min_face_confidence:
             return "low_face_confidence"
         if self.settings.identity_require_passive_antispoof:
@@ -792,10 +814,6 @@ class FaceMatcher:
                 return "antispoof_unavailable"
             if not quality.antispoof_passed:
                 return "spoof_detected"
-        if quality.brightness < min_brightness:
-            return "low_light"
-        if quality.blur < min_blur:
-            return "blurry"
         return None
 
     def _enrollment_retry_reason(self, quality: FaceQuality, quality_policy: dict | None = None) -> str | None:
@@ -903,6 +921,39 @@ class FaceMatcher:
             if reason in reasons:
                 return reason
         return reasons[0] if reasons else fallback
+
+    def _rejection_summary(self) -> dict[str, int]:
+        summary: dict[str, int] = {}
+        for reason in getattr(self, "_last_rejection_reasons", []):
+            summary[reason] = summary.get(reason, 0) + 1
+        return summary
+
+    def _quality_requirements(self, quality_policy: dict | None, enrollment: bool) -> dict[str, float]:
+        if enrollment:
+            return {
+                "minBrightness": float(self._policy_value(
+                    quality_policy, "enrollmentMinBrightness", self.settings.identity_enrollment_min_brightness,
+                )),
+                "minBlur": float(self._policy_value(
+                    quality_policy, "enrollmentMinBlur", self.settings.identity_enrollment_min_blur,
+                )),
+                "minFaceConfidence": float(self._policy_value(
+                    quality_policy,
+                    "enrollmentMinFaceConfidence",
+                    self.settings.identity_enrollment_min_face_confidence,
+                )),
+            }
+        return {
+            "minBrightness": float(self._policy_value(
+                quality_policy, "minBrightness", self.settings.identity_min_brightness,
+            )),
+            "minBlur": float(self._policy_value(
+                quality_policy, "minBlur", self.settings.identity_min_blur,
+            )),
+            "minFaceConfidence": float(self._policy_value(
+                quality_policy, "minFaceConfidence", self.settings.identity_min_face_confidence,
+            )),
+        }
 
     def _similarity(self, live_face: np.ndarray, reference_face: np.ndarray) -> float:
         left_vector = live_face.astype(np.float32).reshape(-1)
