@@ -104,7 +104,7 @@ class Settings(BaseSettings):
 
     @property
     def production_readiness_required(self) -> bool:
-        return bool(self.storage_require_ready)
+        return bool(self.storage_require_ready or self.app_env.strip().lower() == "production")
 
     @property
     def cors_origins(self) -> list[str]:

@@ -30,7 +30,10 @@ async def main() -> None:
         parser.error("The frame is empty or too small.")
 
     base = args.url.rstrip("/")
-    headers = {"Authorization": f"Bearer {args.token}"}
+    headers = {
+        "Authorization": f"Bearer {args.token}",
+        "X-ProctorCore-Company": str(args.company_id),
+    }
     encoded = base64.b64encode(image).decode("ascii")
     latencies: list[float] = []
     errors: list[str] = []

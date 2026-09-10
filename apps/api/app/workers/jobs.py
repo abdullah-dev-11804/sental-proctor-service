@@ -24,7 +24,7 @@ def deliver_webhook(session_id: str, event: dict[str, Any]) -> dict[str, Any]:
     url = str(session.get("callbackUrl") or settings.moodle_webhook_url or "").strip()
     secret = str(settings.moodle_webhook_secret or "").strip()
     if not url or not secret:
-        store._append_delivery(session, event, "skipped", "webhook_not_configured")
+        _record_delivery(store, session_id, event, "skipped", "webhook_not_configured")
         return {"status": "skipped"}
 
     body = json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -41,18 +41,29 @@ def deliver_webhook(session_id: str, event: dict[str, Any]) -> dict[str, Any]:
             timeout=httpx.Timeout(15.0, connect=5.0),
         )
     except (httpx.TimeoutException, httpx.NetworkError) as exc:
-        store._append_delivery(session, event, "retrying", str(exc))
+        _record_delivery(store, session_id, event, "retrying", str(exc))
         raise
 
     message = f"{response.status_code}: {response.text[:300]}"
     if 200 <= response.status_code < 300:
-        store._append_delivery(session, event, "delivered", message)
+        _record_delivery(store, session_id, event, "delivered", message)
         return {"status": "delivered", "httpCode": response.status_code}
     if response.status_code in {408, 429} or response.status_code >= 500:
-        store._append_delivery(session, event, "retrying", message)
+        _record_delivery(store, session_id, event, "retrying", message)
         response.raise_for_status()
-    store._append_delivery(session, event, "dead_letter", message)
+    _record_delivery(store, session_id, event, "dead_letter", message)
     return {"status": "dead_letter", "httpCode": response.status_code}
+
+
+def _record_delivery(
+    store: MediaStore,
+    session_id: str,
+    event: dict[str, Any],
+    status: str,
+    message: str,
+) -> None:
+    with store.state.session_lock(session_id):
+        store._append_delivery(store.get_session(session_id), event, status, message)
 
 
 def finalize_session_media(session_id: str, reason: str = "submitted", result: str = "passed") -> dict[str, Any]:
@@ -60,9 +71,10 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
     settings = get_settings()
     store = MediaStore()
     objects = ObjectStore(settings)
-    session = store.get_session(session_id)
-    session["processing"] = {"state": "running", "jobId": _current_job_id(), "error": None}
-    store._save_session(session)
+    with store.state.session_lock(session_id):
+        session = store.get_session(session_id)
+        session["processing"] = {"state": "running", "jobId": _current_job_id(), "error": None}
+        store._save_session(session)
 
     try:
         with tempfile.TemporaryDirectory(prefix=f"proctor-{session_id[:12]}-") as temporary:
@@ -89,35 +101,37 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
                 segment_media,
             )
 
-        session = store.get_session(session_id)
-        session["processing"] = {"state": "completed", "jobId": _current_job_id(), "error": None}
-        recording = dict(session.get("recording") or {})
-        recording["state"] = "completed"
-        session["recording"] = recording
-        store._save_session(session)
-        store._delete_temporary_media(session)
-        store._finalize_session(
-            session,
-            result="failed" if result == "failed" else "passed",
-            reason=reason,
-        )
+        with store.state.session_lock(session_id):
+            session = store.get_session(session_id)
+            session["processing"] = {"state": "completed", "jobId": _current_job_id(), "error": None}
+            recording = dict(session.get("recording") or {})
+            recording["state"] = "completed"
+            session["recording"] = recording
+            store._save_session(session)
+            store._delete_temporary_media(session)
+            store._finalize_session(
+                session,
+                result="failed" if result == "failed" else "passed",
+                reason=reason,
+            )
         return {"status": "completed", "sessionId": session_id}
     except Exception as exc:
-        session = store.get_session(session_id)
-        retries_left = _current_retries_left()
-        state = "retrying" if retries_left > 0 else "dead_letter"
-        session["processing"] = {
-            "state": state,
-            "jobId": _current_job_id(),
-            "error": str(exc)[:1000],
-            "retriesLeft": retries_left,
-        }
-        recording = dict(session.get("recording") or {})
-        recording["state"] = state
-        session["recording"] = recording
-        store._save_session(session)
-        if retries_left <= 0:
-            store._finalize_session(session, result="failed", reason="media_processing_failed")
+        with store.state.session_lock(session_id):
+            session = store.get_session(session_id)
+            retries_left = _current_retries_left()
+            state = "retrying" if retries_left > 0 else "dead_letter"
+            session["processing"] = {
+                "state": state,
+                "jobId": _current_job_id(),
+                "error": str(exc)[:1000],
+                "retriesLeft": retries_left,
+            }
+            recording = dict(session.get("recording") or {})
+            recording["state"] = state
+            session["recording"] = recording
+            store._save_session(session)
+            if retries_left <= 0:
+                store._finalize_session(session, result="failed", reason="media_processing_failed")
         raise
 
 

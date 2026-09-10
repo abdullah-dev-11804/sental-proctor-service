@@ -56,6 +56,7 @@ curl http://127.0.0.1:8091/health
 ```bash
 curl -X POST http://127.0.0.1:8091/v1/identity/verify \
   -H "Authorization: Bearer dev-secret-change-me" \
+  -H "X-ProctorCore-Company: 7" \
   -F "company_id=7" \
   -F "user_id=123" \
   -F "session_id=session-demo-1" \

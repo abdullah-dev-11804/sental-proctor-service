@@ -3,10 +3,10 @@ import binascii
 import logging
 from functools import lru_cache
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
 
-from app.core.security import require_api_auth
+from app.core.security import require_api_auth, require_company_scope
 from app.core.config import get_settings
 from app.models.identity import IdentityVerifyResponse
 from app.services.face_matcher import FaceMatcher
@@ -77,7 +77,9 @@ async def verify_identity(
     session_id: str = Form(..., min_length=3, max_length=128),
     live_image: UploadFile = File(...),
     reference_image: UploadFile = File(...),
+    x_proctorcore_company: int | None = Header(None),
 ) -> IdentityVerifyResponse:
+    require_company_scope(company_id, x_proctorcore_company)
     live_bytes = await live_image.read()
     reference_bytes = await reference_image.read()
 
@@ -116,8 +118,12 @@ async def verify_identity(
 
 
 @compat_router.post("/verify", dependencies=[Depends(require_api_auth)])
-def verify_moodle_identity(payload: MoodleIdentityVerifyRequest) -> dict:
+def verify_moodle_identity(
+    payload: MoodleIdentityVerifyRequest,
+    x_proctorcore_company: int | None = Header(None),
+) -> dict:
     """Legacy JSON/base64 route retained for older Moodle builds."""
+    require_company_scope(payload.companyId, x_proctorcore_company)
     settings = get_settings()
     reference_bytes = _decode_base64_image(payload.referenceImage)
     center_frames = _decode_base64_images(payload.centerImages, payload.centerImage)
@@ -150,7 +156,12 @@ def verify_moodle_identity(payload: MoodleIdentityVerifyRequest) -> dict:
 
 
 @compat_router.get("/references/{user_id}", dependencies=[Depends(require_api_auth)])
-def get_face_reference(user_id: int, companyId: int = 0) -> dict:
+def get_face_reference(
+    user_id: int,
+    companyId: int = 0,
+    x_proctorcore_company: int | None = Header(None),
+) -> dict:
+    require_company_scope(companyId, x_proctorcore_company)
     stored = LocalStorage().latest_face_template(companyId, user_id)
     return {
         "ok": True,
@@ -163,7 +174,11 @@ def get_face_reference(user_id: int, companyId: int = 0) -> dict:
 
 
 @compat_router.post("/references/enroll", dependencies=[Depends(require_api_auth)])
-def enroll_face_reference(payload: FaceReferenceEnrollRequest) -> dict:
+def enroll_face_reference(
+    payload: FaceReferenceEnrollRequest,
+    x_proctorcore_company: int | None = Header(None),
+) -> dict:
+    require_company_scope(payload.companyId, x_proctorcore_company)
     settings = get_settings()
     threshold = payload.threshold if payload.threshold is not None else float(settings.identity_pass_threshold)
     try:
@@ -225,7 +240,11 @@ def enroll_face_reference(payload: FaceReferenceEnrollRequest) -> dict:
 
 
 @compat_router.post("/references/verify", dependencies=[Depends(require_api_auth)])
-def verify_face_reference(payload: FaceReferenceVerifyRequest) -> dict:
+def verify_face_reference(
+    payload: FaceReferenceVerifyRequest,
+    x_proctorcore_company: int | None = Header(None),
+) -> dict:
+    require_company_scope(payload.companyId, x_proctorcore_company)
     settings = get_settings()
     stored = LocalStorage().latest_face_template(payload.companyId, payload.userId)
     if stored is None:
@@ -278,7 +297,9 @@ def reset_face_reference(
     user_id: int,
     payload: FaceReferenceResetRequest | None = None,
     companyId: int = 0,
+    x_proctorcore_company: int | None = Header(None),
 ) -> dict:
+    require_company_scope(companyId, x_proctorcore_company)
     storage = LocalStorage()
     reason = payload.reason if payload and payload.reason else "administrator_reset"
     deleted = storage.delete_face_reference(companyId, user_id)

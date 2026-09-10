@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
-from app.core.security import require_api_auth
+from app.core.security import require_api_auth, require_company_scope
 from app.services.media_store import MediaStore
 
 
@@ -19,13 +19,8 @@ class SessionStartRequest(BaseModel):
 
 
 class FinishSessionRequest(BaseModel):
+    company_id: int = Field(ge=0)
     reason: str = "completed"
-
-
-class SnapshotUploadUrlRequest(BaseModel):
-    purpose: str = "identity"
-    violation_id: str | None = None
-    content_type: str = "image/jpeg"
 
 
 class MoodleSessionCreateRequest(BaseModel):
@@ -117,7 +112,11 @@ class ReconcileRequest(BaseModel):
 
 
 @router.post("/start", dependencies=[Depends(require_api_auth)])
-def start_session(payload: SessionStartRequest) -> dict:
+def start_session(
+    payload: SessionStartRequest,
+    x_proctorcore_company: int | None = Header(None),
+) -> dict:
+    require_company_scope(payload.company_id, x_proctorcore_company)
     session = MediaStore().create_session(payload.model_dump())
     return {
         "status": "pending_preflight",
@@ -129,8 +128,12 @@ def start_session(payload: SessionStartRequest) -> dict:
 
 
 @compat_router.post("", dependencies=[Depends(require_api_auth)])
-def create_moodle_session(payload: MoodleSessionCreateRequest) -> dict:
+def create_moodle_session(
+    payload: MoodleSessionCreateRequest,
+    x_proctorcore_company: int | None = Header(None),
+) -> dict:
     """Moodle local_proctorcore compatibility route."""
+    require_company_scope(payload.companyId, x_proctorcore_company)
     store = MediaStore()
     session = store.create_session(payload.model_dump())
     session = {
@@ -291,17 +294,6 @@ async def upload_moodle_media_chunk(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/{session_id}/snapshot-upload-url", dependencies=[Depends(require_api_auth)])
-def snapshot_upload_url(session_id: str, payload: SnapshotUploadUrlRequest) -> dict:
-    object_key = f"evidence/{session_id}/snapshots/{payload.violation_id or 'manual'}.jpg"
-    return {
-        "upload_url": "staged-local-upload-url",
-        "object_key": object_key,
-        "expires_in_seconds": 60,
-        "next": "Replace with a single-purpose MinIO/S3 pre-signed PUT URL.",
-    }
-
-
 @compat_router.post("/{session_id}/evidence/hold", dependencies=[Depends(require_api_auth)])
 def hold_session_evidence(session_id: str, payload: EvidenceHoldRequest) -> dict:
     store = MediaStore()
@@ -339,10 +331,18 @@ def reconcile_moodle_session(session_id: str, payload: ReconcileRequest) -> dict
 
 
 @router.post("/{session_id}/finish", dependencies=[Depends(require_api_auth)])
-def finish_session(session_id: str, payload: FinishSessionRequest) -> dict:
+def finish_session(
+    session_id: str,
+    payload: FinishSessionRequest,
+    x_proctorcore_company: int | None = Header(None),
+) -> dict:
+    require_company_scope(payload.company_id, x_proctorcore_company)
     try:
-        MediaStore().finish_session(session_id, payload.model_dump())
-    except KeyError as exc:
+        store = MediaStore()
+        session = store.get_session(session_id)
+        store._require_scope(session, payload.model_dump())
+        store.finish_session(session_id, payload.model_dump())
+    except (KeyError, PermissionError) as exc:
         raise HTTPException(status_code=404, detail="session_not_found") from exc
     return {
         "ok": True,

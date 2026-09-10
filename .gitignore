@@ -20,4 +20,3 @@ tools/
 node_modules/
 dist/
 secrets/
-docs

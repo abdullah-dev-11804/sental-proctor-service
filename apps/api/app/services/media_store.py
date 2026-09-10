@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import time
+from functools import wraps
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -29,12 +30,20 @@ def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
-class MediaStore:
-    """File-backed media/session coordinator.
+def _session_locked(function):
+    @wraps(function)
+    def wrapped(self, session_id: str, *args, **kwargs):
+        with self.state.session_lock(session_id):
+            return function(self, session_id, *args, **kwargs)
+    return wrapped
 
-    This is the first production-shaped media backend. It keeps temporary
-    browser chunks while the session is active, materializes key-moment clips,
-    and notifies Moodle through the signed webhook contract.
+
+class MediaStore:
+    """Indexed media/session coordinator backed by private object storage.
+
+    It keeps temporary browser chunks while the session is active, finalizes
+    LiveKit Egress output, materializes key-moment clips, and notifies Moodle
+    through the signed webhook contract.
     """
 
     def __init__(self) -> None:
@@ -106,6 +115,7 @@ class MediaStore:
     def get_session(self, session_id: str) -> dict[str, Any]:
         return self.state.get_session(session_id)
 
+    @_session_locked
     def start_session(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
         self._require_scope(session, payload)
@@ -117,6 +127,7 @@ class MediaStore:
         self._save_session(session)
         return session
 
+    @_session_locked
     def heartbeat(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
         self._require_scope(session, payload)
@@ -125,6 +136,7 @@ class MediaStore:
         self._save_session(session)
         return session
 
+    @_session_locked
     def create_media_token(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
         self._require_scope(session, payload)
@@ -152,6 +164,7 @@ class MediaStore:
             "chunkMilliseconds": 5000,
         }
 
+    @_session_locked
     def start_recording(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
         self._require_scope(session, payload)
@@ -209,6 +222,7 @@ class MediaStore:
             "fallback": provider != "livekit_egress",
         }
 
+    @_session_locked
     def stop_recording(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
         self._require_scope(session, payload)
@@ -273,6 +287,7 @@ class MediaStore:
                 raise
         return {"ok": True, "status": "processing", "segment": segment, "processing": session["processing"]}
 
+    @_session_locked
     def interrupt_session(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
         self._require_scope(session, payload)
@@ -282,6 +297,7 @@ class MediaStore:
         self._save_session(session)
         return {"ok": True, "session": session}
 
+    @_session_locked
     def resume_session(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
         self._require_scope(session, payload)
@@ -293,6 +309,7 @@ class MediaStore:
         self._save_session(session)
         return {"ok": True, "session": session}
 
+    @_session_locked
     def fail_session(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
         self._require_scope(session, payload)
@@ -302,6 +319,7 @@ class MediaStore:
             result="failed",
         )
 
+    @_session_locked
     def finish_session(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
         result = "failed" if str(payload.get("result") or payload.get("reason") or "").lower() == "failed" else "passed"
@@ -311,6 +329,7 @@ class MediaStore:
             result=result,
         )
 
+    @_session_locked
     def save_media_chunk(
         self,
         session_id: str,
@@ -357,6 +376,7 @@ class MediaStore:
         self._save_session(session)
         return {"ok": True, "chunk": entry}
 
+    @_session_locked
     def capture_snapshot(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
         self._require_scope(session, payload)
@@ -794,6 +814,7 @@ class MediaStore:
             return "reports"
         return "snapshots"
 
+    @_session_locked
     def register_asset_bytes(
         self,
         session_id: str,
@@ -819,6 +840,7 @@ class MediaStore:
         self._send_asset_webhook(session, asset)
         return asset
 
+    @_session_locked
     def set_evidence_hold(self, session_id: str, held: bool, reason: str) -> dict[str, Any]:
         session = self.get_session(session_id)
         retention = dict(session.get("retention") or {})
@@ -832,6 +854,7 @@ class MediaStore:
         self._save_session(session)
         return retention
 
+    @_session_locked
     def reconcile_session(self, session_id: str, resend_webhooks: bool = False) -> dict[str, Any]:
         session = self.get_session(session_id)
         missing = []
@@ -845,8 +868,8 @@ class MediaStore:
                 self._send_asset_webhook(session, asset)
         session["reconciliation"] = {
             "checkedAt": _now(),
-            "available": len(available),
-            "missing": len(missing),
+            "availableCount": len(available),
+            "missingCount": len(missing),
         }
         self._save_session(session)
         return {"available": available, "missing": missing, **session["reconciliation"]}

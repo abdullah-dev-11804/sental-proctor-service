@@ -1,11 +1,11 @@
 import base64
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.api.identity import get_face_matcher
 from app.core.config import get_settings
-from app.core.security import require_api_auth
+from app.core.security import require_api_auth, require_company_scope
 from app.services.media_store import MediaStore
 
 
@@ -21,7 +21,11 @@ class FrameAnalysisRequest(BaseModel):
 
 
 @router.post("/analyse", dependencies=[Depends(require_api_auth)])
-def analyse_frame(payload: FrameAnalysisRequest) -> dict:
+def analyse_frame(
+    payload: FrameAnalysisRequest,
+    x_proctorcore_company: int | None = Header(None),
+) -> dict:
+    require_company_scope(payload.companyId, x_proctorcore_company)
     try:
         session = MediaStore().get_session(payload.sessionId)
         if int(session.get("companyId") or 0) != payload.companyId:
@@ -33,8 +37,7 @@ def analyse_frame(payload: FrameAnalysisRequest) -> dict:
     settings = get_settings()
     try:
         frame = _decode_base64(payload.frameImage)
-        image = matcher._decode_image(frame)
-        face, quality = matcher._extract_primary_face(image)
+        face, quality = matcher.analyse_frame(frame, include_embedding=bool(payload.referenceImage))
     except Exception as exc:
         raise HTTPException(status_code=400, detail="invalid_frame") from exc
 
@@ -47,9 +50,9 @@ def analyse_frame(payload: FrameAnalysisRequest) -> dict:
     if payload.referenceImage:
         try:
             reference = _decode_base64(payload.referenceImage)
-            reference_image = matcher._decode_image(reference)
-            reference_face, reference_quality = matcher._extract_primary_face(reference_image)
-            if quality.face_count == 1 and reference_quality.face_count == 1:
+            reference_face, reference_quality = matcher.analyse_frame(reference, include_embedding=True)
+            if face is not None and reference_face is not None \
+                    and quality.face_count == 1 and reference_quality.face_count == 1:
                 similarity_score = matcher._similarity(face, reference_face)
                 threshold = payload.threshold if payload.threshold is not None else settings.identity_pass_threshold
                 identity_result = "matched" if similarity_score >= threshold else "not_matched"

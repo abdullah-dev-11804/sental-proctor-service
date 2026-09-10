@@ -124,3 +124,40 @@ def test_deleting_one_asset_does_not_hide_other_assets(store: MediaStore) -> Non
 
     assert assets[first["assetId"]]["status"] == "deleted"
     assert assets[second["assetId"]]["status"] == "active"
+
+
+def test_evidence_hold_updates_every_indexed_asset(store: MediaStore) -> None:
+    session = store.create_session(_payload())
+    first = store.register_asset_bytes(session["id"], "snapshot", b"first", ".jpg", "image/jpeg", "one")
+    second = store.register_asset_bytes(session["id"], "video_clip", b"second", ".mp4", "video/mp4", "two")
+
+    retention = store.set_evidence_hold(session["id"], True, "appeal_open")
+
+    assert retention["held"] is True
+    assert store.state.get_asset(first["assetId"])["held"] is True
+    assert store.state.get_asset(second["assetId"])["held"] is True
+
+
+def test_reconciliation_marks_only_the_missing_physical_object(store: MediaStore) -> None:
+    session = store.create_session(_payload())
+    missing = store.register_asset_bytes(session["id"], "snapshot", b"first", ".jpg", "image/jpeg", "one")
+    available = store.register_asset_bytes(session["id"], "snapshot", b"second", ".jpg", "image/jpeg", "two")
+    store.objects.delete(missing["bucket"], missing["objectKey"])
+
+    result = store.reconcile_session(session["id"])
+
+    assert result["missing"] == [missing["assetId"]]
+    assert result["available"] == [available["assetId"]]
+    assert store.state.get_asset(missing["assetId"])["status"] == "missing"
+    assert store.state.get_asset(available["assetId"])["status"] == "active"
+
+
+def test_asset_webhook_uses_a_deterministic_receiver_event_id(store: MediaStore) -> None:
+    store.settings.moodle_webhook_url = "https://moodle.example/webhook"
+    store.settings.moodle_webhook_secret = "secret"
+    session = store.create_session(_payload())
+
+    asset = store.register_asset_bytes(session["id"], "snapshot", b"first", ".jpg", "image/jpeg", "one")
+
+    _function, args, _kwargs = store.jobs.calls[-1]
+    assert args[1]["eventId"] == f"asset-{asset['assetId']}"

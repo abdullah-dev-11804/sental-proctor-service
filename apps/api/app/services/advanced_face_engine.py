@@ -281,7 +281,27 @@ class AdvancedFaceEngine:
             return []
         return self._shape_list(infos[0].shape)
 
+    def analyse(self, image: np.ndarray) -> AdvancedFaceQuality:
+        """Runs detection, anti-spoofing, and head pose without AdaFace."""
+        _bbox, _keypoints, quality = self._detect_and_measure(image)
+        return quality
+
     def extract(self, image: np.ndarray) -> tuple[np.ndarray, AdvancedFaceQuality]:
+        """Returns an AdaFace embedding and the complete quality result."""
+        bbox, keypoints, quality = self._detect_and_measure(image)
+        if bbox is None:
+            output_shape = self.recognizer.get_outputs()[0].shape
+            dimensions = output_shape[-1] if output_shape and isinstance(output_shape[-1], int) else 512
+            return np.zeros((1, int(dimensions)), dtype=np.float32), quality
+
+        aligned = self._align_face(image, keypoints, bbox)
+        embedding = self._adaface_embedding(aligned)
+        return embedding, quality
+
+    def _detect_and_measure(
+        self,
+        image: np.ndarray,
+    ) -> tuple[np.ndarray | None, np.ndarray | None, AdvancedFaceQuality]:
         height, width = image.shape[:2]
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         brightness = float(np.mean(gray))
@@ -302,7 +322,7 @@ class AdvancedFaceEngine:
             height=int(height),
         )
         if bboxes is None or len(bboxes) == 0:
-            return np.zeros((1, 512), dtype=np.float32), base_quality
+            return None, None, base_quality
 
         index = int(np.argmax((bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])))
         bbox = bboxes[index].astype(np.float32)
@@ -338,9 +358,7 @@ class AdvancedFaceEngine:
             antispoof_passed=antispoof_passed,
             headpose_yaw_degrees=headpose_yaw,
         )
-        aligned = self._align_face(image, kps, bbox)
-        embedding = self._adaface_embedding(aligned)
-        return embedding, quality
+        return bbox, kps, quality
 
     def _align_face(self, image: np.ndarray, keypoints: np.ndarray | None, bbox: np.ndarray) -> np.ndarray:
         size = int(self.settings.identity_adaface_input_size)

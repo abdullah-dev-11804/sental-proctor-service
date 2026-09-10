@@ -1,5 +1,8 @@
-from fastapi import FastAPI
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api.assets import router as assets_router
 from app.api.identity import compat_router as identity_compat_router
@@ -18,10 +21,18 @@ from app.services.state_store import StateStore
 
 settings = get_settings()
 
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    warm_identity_engine()
+    yield
+
+
 app = FastAPI(
     title="SENTAL Proctor Service",
     version="0.1.0",
-    description="Server B / AI-media service for hybrid Moodle proctoring.",
+    description="AI and media service for hybrid Moodle proctoring.",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -29,7 +40,13 @@ app.add_middleware(
     allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-ProctorCore-Upload-Token"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-API-Key",
+        "X-ProctorCore-Company",
+        "X-ProctorCore-Upload-Token",
+    ],
 )
 
 app.include_router(identity_router)
@@ -39,6 +56,15 @@ app.include_router(sessions_router)
 app.include_router(sessions_compat_router)
 app.include_router(assets_router)
 app.include_router(staging_router)
+
+
+@app.exception_handler(TimeoutError)
+async def session_lock_timeout(_request: Request, _exception: TimeoutError) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"detail": {"code": "session_busy", "message": "The session is busy; retry shortly."}},
+        headers={"Retry-After": "2"},
+    )
 
 
 @app.get("/health")
@@ -52,6 +78,7 @@ def health() -> dict:
     models_ready = all(model["exists"] for model in identity_models if model["required"])
     egress = LiveKitEgress(settings).status()
     webhook_ready = bool(settings.moodle_webhook_url.strip() and settings.moodle_webhook_secret.strip())
+    production = _production_checks(storage, egress)
     required_ready = bool(
         storage.get("ready")
         and redis_ready
@@ -60,9 +87,10 @@ def health() -> dict:
         and int(queue.get("workers") or 0) > 0
         and egress.get("ready")
         and webhook_ready
+        and all(production.values())
     )
     return {
-        "ok": required_ready or not settings.storage_require_ready,
+        "ok": required_ready or not settings.production_readiness_required,
         "status": "healthy" if required_ready else "degraded",
         "service": "sental-proctor-service",
         "environment": settings.app_env,
@@ -83,6 +111,10 @@ def health() -> dict:
             "worker": queue,
             "egress": egress,
             "webhook": {"ready": webhook_ready, "urlConfigured": bool(settings.moodle_webhook_url.strip())},
+            "productionConfiguration": {
+                "ready": all(production.values()),
+                "checks": production,
+            },
         },
     }
 
@@ -93,7 +125,6 @@ def api_health() -> dict:
     return health()
 
 
-@app.on_event("startup")
 def warm_identity_engine() -> None:
     try:
         storage = ObjectStore(settings)
@@ -129,4 +160,29 @@ def _model_status(value: str, required: bool, role: str) -> dict:
         "path": str(path),
         "required": required,
         "exists": path.is_file() if value.strip() else False,
+    }
+
+
+def _production_checks(storage: dict, egress: dict) -> dict[str, bool]:
+    if not settings.production_readiness_required:
+        return {"enforced": True}
+    return {
+        "private_object_storage": bool(
+            storage.get("ready")
+            and storage.get("private")
+            and str(storage.get("backend") or "").lower() in {"minio", "s3"}
+        ),
+        "livekit_egress_enabled": bool(egress.get("enabled") and egress.get("ready")),
+        "biometric_encryption_key": bool(str(settings.reference_encryption_key_file).strip()),
+        "api_secret_changed": bool(
+            len(settings.api_shared_secret) >= 32
+            and settings.api_shared_secret != "dev-secret-change-me"
+        ),
+        "livekit_secret_changed": bool(
+            len(settings.livekit_api_secret) >= 32
+            and settings.livekit_api_secret != "dev-livekit-secret"
+        ),
+        "livekit_uses_wss": settings.livekit_url.lower().startswith("wss://"),
+        "moodle_webhook_uses_https": settings.moodle_webhook_url.lower().startswith("https://"),
+        "cors_is_explicit": settings.cors_origins != ["*"],
     }

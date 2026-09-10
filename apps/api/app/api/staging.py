@@ -1,7 +1,7 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from pydantic import BaseModel, Field
 
-from app.core.security import require_api_auth
+from app.core.security import require_api_auth, require_company_scope
 from app.services.media_store import MediaStore
 
 
@@ -18,27 +18,13 @@ class ViolationEventRequest(BaseModel):
 
 
 @router.post("/violations", dependencies=[Depends(require_api_auth)])
-def record_violation(payload: ViolationEventRequest) -> dict:
+def record_violation(
+    payload: ViolationEventRequest,
+    x_proctorcore_company: int | None = Header(None),
+) -> dict:
+    require_company_scope(payload.company_id, x_proctorcore_company)
     data = payload.model_dump()
     data["sessionId"] = data.pop("session_id")
     data["companyId"] = data.pop("company_id")
     data["violationType"] = data.pop("violation_type")
     return MediaStore().record_violation(data)
-
-
-@router.get("/clips/staging", dependencies=[Depends(require_api_auth)])
-def clip_worker_status() -> dict:
-    return {
-        "ok": True,
-        "status": "rolling_browser_chunks",
-        "next": "Replace browser chunk concatenation with LiveKit egress plus ffmpeg-normalized clips.",
-    }
-
-
-@router.get("/reports/staging", dependencies=[Depends(require_api_auth)])
-def report_worker_status() -> dict:
-    return {
-        "ok": True,
-        "status": "moodle_pdf",
-        "next": "Add optional Server B generated PDF if Moodle-side PDF generation is not enough.",
-    }

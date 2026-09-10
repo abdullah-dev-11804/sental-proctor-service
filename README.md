@@ -1,33 +1,28 @@
 # SENTAL Proctor Service
 
-Server B / AI-media service for the SENTAL Moodle proctoring system.
+Kazakhstan-hosted AI and media service for the SENTAL Moodle proctoring system.
 
 This service is intentionally separate from Moodle:
 
 - Moodle stores the official exam/proctoring record.
 - This service owns identity verification, media/evidence storage, rolling buffers, violation clips, report generation, and final Moodle webhooks.
 
-## Current Slice
+## Implemented Runtime
 
-Implemented now:
+- SCRFD detection, AdaFace 1:1 verification, encrypted multi-frame templates,
+  MiniFASNet passive anti-spoofing, and SixDRepNet head pose.
+- Authenticated, company-scoped Moodle integration endpoints.
+- LiveKit participant Egress to private MinIO HLS segments.
+- Browser MediaRecorder chunk fallback when Egress cannot start.
+- Redis/RQ media finalization and signed webhook jobs with retries and dead-letter visibility.
+- FFmpeg full-recording assembly and timestamped violation clips.
+- Indexed, company-scoped recordings, clips, snapshots, identity evidence, and retention state.
+- Session interruption/resume, partial-media preservation, evidence hold/release, and reconciliation.
+- Detailed health and per-session diagnostics for deployment validation.
+- Moodle-side PDF reports; the Proctoring Server supplies indexed evidence and final status.
 
-- FastAPI service skeleton.
-- Authenticated health and staging APIs.
-- Face-recognition access endpoint with OpenCV Zoo YuNet + SFace fallback and a stricter SCRFD + AdaFace engine for staging/production.
-- First-exam face enrollment, reusable face reference verification, and admin reset support.
-- Local evidence/reference storage for development.
-- Staging routes for sessions, snapshot upload URLs, violations, finish-session, clips, reports, and webhooks.
-- Docker Compose scaffold for Redis, MinIO, LiveKit, and the API.
-
-Not implemented yet:
-
-- LiveKit room creation and egress.
-- Real S3/MinIO signed upload URLs.
-- WebSocket violation hub.
-- HLS rolling buffer and clip worker.
-- PDF report worker.
-- Signed final webhook delivery to Moodle.
-- Audio/VAD monitoring.
+Audio content analysis is outside the current production-hardening slice. Camera and microphone
+tracks are recorded, but VAD, noise classification, and speaker analysis are not enabled yet.
 
 ## Quick Start
 
@@ -55,6 +50,7 @@ Identity check with two images:
 ```bash
 curl -X POST http://127.0.0.1:8091/v1/identity/verify \
   -H "Authorization: Bearer dev-secret-change-me" \
+  -H "X-ProctorCore-Company: 7" \
   -F "company_id=7" \
   -F "user_id=123" \
   -F "session_id=session-demo-1" \
@@ -71,7 +67,9 @@ cp .env.example .env
 docker compose up --build
 ```
 
-The Docker setup is a staging scaffold. For the first identity-verification slice, the API can run by itself without Redis, MinIO, or LiveKit.
+The local configuration can use file storage and browser recording fallback. The Kazakhstan
+production configuration requires Redis, MinIO, LiveKit Egress, the worker, identity models,
+biometric encryption secret, and the signed Moodle webhook target to pass `/api/health`.
 
 Health output includes `identity_engine` and `identity_models_ready`. For staging/production,
 `identity_models_ready` must be `true`. The service fails closed if the configured engine is

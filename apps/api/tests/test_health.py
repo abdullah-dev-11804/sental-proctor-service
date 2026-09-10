@@ -1,10 +1,57 @@
-from fastapi.testclient import TestClient
+import app.main as main
+from app.core.config import Settings
 
-from app.main import app
+
+class _ReadyService:
+    def status(self):
+        return {"ready": True, "workers": 1, "private": True}
 
 
-def test_health() -> None:
-    client = TestClient(app)
-    response = client.get("/health")
-    assert response.status_code == 200
-    assert response.json()["ok"] is True
+class _ReadyState:
+    def redis_ready(self):
+        return True
+
+
+class _Matcher:
+    def describe_runtime(self):
+        return {"identity_engine_loaded": "scrfd_adaface"}
+
+
+def test_health_reports_required_dependencies(monkeypatch) -> None:
+    monkeypatch.setattr(main, "get_face_matcher", lambda: _Matcher())
+    monkeypatch.setattr(main, "_identity_models", lambda: [{"required": True, "exists": True}])
+    monkeypatch.setattr(main, "ObjectStore", lambda _settings: _ReadyService())
+    monkeypatch.setattr(main, "JobQueue", lambda _settings: _ReadyService())
+    monkeypatch.setattr(main, "StateStore", lambda _settings: _ReadyState())
+    monkeypatch.setattr(main, "LiveKitEgress", lambda _settings: _ReadyService())
+    monkeypatch.setattr(main.settings, "moodle_webhook_url", "https://moodle.example/webhook")
+    monkeypatch.setattr(main.settings, "moodle_webhook_secret", "test-secret")
+    monkeypatch.setattr(main, "_production_checks", lambda _storage, _egress: {"configured": True})
+
+    body = main.health()
+
+    assert body["ok"] is True
+    assert body["features"]["worker"]["workers"] == 1
+
+
+def test_production_checks_reject_local_storage(monkeypatch) -> None:
+    monkeypatch.setattr(main.settings, "storage_require_ready", True)
+    monkeypatch.setattr(main.settings, "reference_encryption_key_file", "/run/secrets/reference_encryption_key")
+    monkeypatch.setattr(main.settings, "api_shared_secret", "a" * 32)
+    monkeypatch.setattr(main.settings, "livekit_api_secret", "b" * 32)
+    monkeypatch.setattr(main.settings, "livekit_url", "wss://proctoring.example")
+    monkeypatch.setattr(main.settings, "moodle_webhook_url", "https://moodle.example/webhook")
+    monkeypatch.setattr(main.settings, "cors_origins_raw", "https://moodle.example")
+
+    checks = main._production_checks(
+        {"ready": True, "private": True, "backend": "local"},
+        {"ready": True, "enabled": True},
+    )
+
+    assert checks["private_object_storage"] is False
+    assert all(value for key, value in checks.items() if key != "private_object_storage")
+
+
+def test_production_environment_always_enforces_readiness() -> None:
+    settings = Settings(_env_file=None, app_env="production", storage_require_ready=False)
+    assert settings.production_readiness_required is True

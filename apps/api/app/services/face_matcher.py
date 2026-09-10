@@ -730,7 +730,21 @@ class FaceMatcher:
         if self.advanced_engine is None:
             raise RuntimeError("Advanced face engine is not loaded.")
         embedding, advanced_quality = self.advanced_engine.extract(image)
-        quality = FaceQuality(
+        return embedding, self._face_quality(advanced_quality)
+
+    def analyse_frame(self, content: bytes, include_embedding: bool = False) -> tuple[np.ndarray | None, FaceQuality]:
+        """Analyses one monitoring frame without recognition unless requested."""
+        if self.advanced_engine is None:
+            raise RuntimeError("Advanced face engine is not loaded.")
+        image = self._decode_image(content)
+        if include_embedding:
+            embedding, quality = self.advanced_engine.extract(image)
+            return embedding, self._face_quality(quality)
+        return None, self._face_quality(self.advanced_engine.analyse(image))
+
+    @staticmethod
+    def _face_quality(advanced_quality) -> FaceQuality:
+        return FaceQuality(
             brightness=advanced_quality.brightness,
             blur=advanced_quality.blur,
             face_count=advanced_quality.face_count,
@@ -746,7 +760,6 @@ class FaceMatcher:
             antispoof_passed=advanced_quality.antispoof_passed,
             headpose_yaw_degrees=advanced_quality.headpose_yaw_degrees,
         )
-        return embedding, quality
 
     def _estimate_yaw(self, quality: FaceQuality) -> float | None:
         if quality.yaw is not None:

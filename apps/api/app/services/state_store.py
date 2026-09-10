@@ -91,20 +91,25 @@ class StateStore:
     @contextmanager
     def session_lock(self, session_id: str, timeout: int = 15) -> Iterator[None]:
         lock = None
+        acquired = False
         try:
             lock = self.redis.lock(f"proctorcore:lock:session:{self._safe(session_id)}", timeout=timeout, blocking_timeout=5)
-            if lock.acquire(blocking=True):
-                yield
-                return
+            acquired = bool(lock.acquire(blocking=True))
         except Exception:
-            pass
+            if self.settings.storage_require_ready:
+                raise
+
+        if not acquired:
+            if self.settings.storage_require_ready:
+                raise TimeoutError("session_lock_timeout")
+            yield
+            return
+
+        try:
+            yield
         finally:
-            try:
-                if lock is not None and lock.owned():
-                    lock.release()
-            except Exception:
-                pass
-        yield
+            if lock is not None and lock.owned():
+                lock.release()
 
     @staticmethod
     def _safe(value: str) -> str:
