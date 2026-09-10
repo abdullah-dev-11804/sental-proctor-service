@@ -409,12 +409,24 @@ class AdvancedFaceEngine:
         input_name = self.antispoof.get_inputs()[0].name
         output = np.asarray(self.antispoof.run(None, {input_name: input_tensor})[0]).reshape(-1)
         if output.size == 1:
-            return float(1.0 / (1.0 + np.exp(-float(output[0]))))
-        probabilities = self._softmax(output)
+            value = float(output[0])
+            if 0.0 <= value <= 1.0:
+                return value
+            return float(1.0 / (1.0 + np.exp(-value)))
+        probabilities = self._class_probabilities(output)
         index = int(self.settings.identity_antispoof_live_class_index)
         if index < 0 or index >= probabilities.size:
             index = int(np.argmax(probabilities))
         return float(probabilities[index])
+
+    def _class_probabilities(self, output: np.ndarray) -> np.ndarray:
+        """Accepts either model probabilities or raw logits without double-softmax."""
+        values = np.asarray(output, dtype=np.float32).reshape(-1)
+        total = float(np.sum(values))
+        if (np.all(np.isfinite(values)) and np.all(values >= 0.0) and np.all(values <= 1.0)
+                and abs(total - 1.0) <= 1e-3):
+            return values / max(total, 1e-12)
+        return self._softmax(values)
 
     def _headpose_yaw(self, image: np.ndarray, bbox: np.ndarray) -> float | None:
         if self.headpose is None:

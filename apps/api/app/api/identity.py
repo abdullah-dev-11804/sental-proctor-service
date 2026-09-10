@@ -217,6 +217,14 @@ def enroll_face_reference(
     result["referenceSaved"] = False
 
     if result["result"] != "enrolled":
+        logger.info(
+            "identity enrollment rejected: transaction=%s company=%s user=%s reason=%s diagnostics=%s",
+            payload.transactionId,
+            payload.companyId,
+            payload.userId,
+            result.get("reason") or result.get("result"),
+            _quality_log_summary(result),
+        )
         result.pop("referenceBytes", None)
         result.pop("bestReferenceBytes", None)
         result.pop("template", None)
@@ -289,6 +297,15 @@ def verify_face_reference(
     result["companyId"] = payload.companyId
     result["userId"] = payload.userId
     result["referenceKey"] = reference_key
+    if not result.get("accessAllowed"):
+        logger.info(
+            "identity verification rejected: transaction=%s company=%s user=%s reason=%s diagnostics=%s",
+            payload.transactionId,
+            payload.companyId,
+            payload.userId,
+            result.get("reason") or result.get("result"),
+            _quality_log_summary(result),
+        )
     return result
 
 
@@ -372,6 +389,28 @@ def _exception_detail(exc) -> str | dict:
     if isinstance(exc, HTTPException):
         return exc.detail
     return str(exc)
+
+
+def _quality_log_summary(result: dict) -> dict:
+    """Returns numeric capture diagnostics safe for operational logs."""
+    quality = result.get("quality") if isinstance(result.get("quality"), dict) else {}
+    rejected = quality.get("rejectedFrames") if isinstance(quality.get("rejectedFrames"), list) else []
+    frames = []
+    for frame in rejected[:12]:
+        if not isinstance(frame, dict):
+            continue
+        frames.append({
+            "reason": frame.get("reason"),
+            "brightness": frame.get("brightness"),
+            "blur": frame.get("blur"),
+            "faceConfidence": frame.get("confidence"),
+            "antiSpoofScore": frame.get("antispoof_score"),
+        })
+    return {
+        "rejectionSummary": quality.get("rejectionSummary", {}),
+        "requirements": quality.get("requirements", {}),
+        "frames": frames,
+    }
 
 
 def _decode_base64_image(value: str) -> bytes:
