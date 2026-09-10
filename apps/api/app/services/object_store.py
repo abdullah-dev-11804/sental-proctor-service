@@ -56,15 +56,30 @@ class ObjectStore:
         for bucket in self.buckets:
             if bucket not in existing:
                 self.client.create_bucket(Bucket=bucket)
-            self.client.put_public_access_block(
-                Bucket=bucket,
-                PublicAccessBlockConfiguration={
-                    "BlockPublicAcls": True,
-                    "IgnorePublicAcls": True,
-                    "BlockPublicPolicy": True,
-                    "RestrictPublicBuckets": True,
-                },
-            )
+            self._make_bucket_private(bucket)
+
+    def _make_bucket_private(self, bucket: str) -> None:
+        if self.backend == "minio":
+            # MinIO buckets are private without an anonymous bucket policy. Some
+            # CPU-compatible releases do not implement AWS PublicAccessBlock.
+            try:
+                self.client.delete_bucket_policy(Bucket=bucket)
+            except ClientError as exc:
+                code = str(exc.response.get("Error", {}).get("Code", ""))
+                status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0))
+                if code not in {"NoSuchBucketPolicy", "NoSuchPolicy"} and status != 404:
+                    raise
+            return
+
+        self.client.put_public_access_block(
+            Bucket=bucket,
+            PublicAccessBlockConfiguration={
+                "BlockPublicAcls": True,
+                "IgnorePublicAcls": True,
+                "BlockPublicPolicy": True,
+                "RestrictPublicBuckets": True,
+            },
+        )
 
     @property
     def buckets(self) -> tuple[str, str, str]:
