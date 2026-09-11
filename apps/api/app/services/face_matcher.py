@@ -121,6 +121,7 @@ class FaceMatcher:
             center_frames,
             retry_reason_fn=lambda quality: self._enrollment_retry_reason(quality, quality_policy),
             prefer_frontal=True,
+            include_liveness_signals=not bool(self._policy_value(quality_policy, "skipPassivePad", False)),
         )
         min_frames = int(self._policy_value(quality_policy, "minEnrollmentFrames", self.settings.identity_min_enrollment_frames))
         if len(samples) < min_frames:
@@ -210,6 +211,7 @@ class FaceMatcher:
             center_frames,
             retry_reason_fn=lambda quality: self._verification_retry_reason(quality, quality_policy),
             prefer_frontal=True,
+            include_liveness_signals=not bool(self._policy_value(quality_policy, "skipPassivePad", False)),
         )
         min_live_frames = int(self._policy_value(quality_policy, "minLiveFrames", self.settings.identity_min_live_frames))
         if len(samples) < min_live_frames:
@@ -296,6 +298,7 @@ class FaceMatcher:
         frames: list[bytes],
         retry_reason_fn,
         prefer_frontal: bool,
+        include_liveness_signals: bool = True,
     ) -> list[dict]:
         samples: list[dict] = []
         self._last_rejection_reasons = []
@@ -303,7 +306,10 @@ class FaceMatcher:
         for frame in frames[: max(1, int(self.settings.identity_max_enrollment_frames))]:
             try:
                 image = self._decode_image(frame)
-                embedding, quality = self._extract_primary_face(image)
+                embedding, quality = self._extract_primary_face_advanced(
+                    image,
+                    include_liveness_signals=include_liveness_signals,
+                )
             except (ValueError, cv2.error):
                 self._last_rejection_reasons.append("invalid_image")
                 self._last_rejected_qualities.append({"reason": "invalid_image"})
@@ -752,10 +758,17 @@ class FaceMatcher:
     def _extract_primary_face(self, image: np.ndarray) -> tuple[np.ndarray, FaceQuality]:
         return self._extract_primary_face_advanced(image)
 
-    def _extract_primary_face_advanced(self, image: np.ndarray) -> tuple[np.ndarray, FaceQuality]:
+    def _extract_primary_face_advanced(
+        self,
+        image: np.ndarray,
+        include_liveness_signals: bool = True,
+    ) -> tuple[np.ndarray, FaceQuality]:
         if self.advanced_engine is None:
             raise RuntimeError("Advanced face engine is not loaded.")
-        embedding, advanced_quality = self.advanced_engine.extract(image)
+        embedding, advanced_quality = self.advanced_engine.extract(
+            image,
+            include_liveness_signals=include_liveness_signals,
+        )
         return embedding, self._face_quality(advanced_quality)
 
     def analyse_frame(self, content: bytes, include_embedding: bool = False) -> tuple[np.ndarray | None, FaceQuality]:

@@ -20,6 +20,11 @@ class FakeLiveness:
             "overall": self.result,
             "reason": "print_attack" if self.result == "fail" else "ok",
             "challengeId": "challenge-123",
+            "passivePad": {
+                "result": self.result,
+                "aggregate": {"live": 0.03, "print": 0.94, "replay": 0.03},
+            },
+            "illumination": {"result": self.result},
         }
 
 
@@ -98,3 +103,20 @@ def test_successful_liveness_preserves_template_enrollment(monkeypatch):
     assert matcher.enrollment_calls == 1
     assert FakeStorage.saved_template[0]["meanEmbedding"] == [0.1, 0.2]
     assert FakeStorage.saved_template[1] == b"jpeg" * 100
+
+
+def test_uncorroborated_passive_failure_is_not_reported_as_proven_spoof(monkeypatch):
+    monkeypatch.setattr(identity_api, "get_face_matcher", lambda: FakeMatcher())
+    liveness = {
+        "overall": "fail",
+        "reason": "headpose_sequence_failed",
+        "passivePad": {
+            "result": "fail",
+            "aggregate": {"live": 0.03, "print": 0.94, "replay": 0.03},
+        },
+        "illumination": {"result": "pass"},
+    }
+
+    result = identity_api._liveness_retry_response(payload(), 0.85, "enrollment", liveness)
+
+    assert result["result"] == "liveness_failed"

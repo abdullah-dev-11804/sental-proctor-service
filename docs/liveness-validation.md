@@ -9,6 +9,12 @@ The pre-quiz identity gate uses independent liveness and identity decisions:
 5. The illumination validator compares facial chromaticity changes with the randomized server-issued colour sequence.
 6. AdaFace runs only after all configured liveness components pass.
 
+The deployed MiniFASNet-V2 file is derived from upstream
+`minivision-ai/Silent-Face-Anti-Spoofing` weights. Upstream inference treats
+class index `1` as the genuine/live class, so production must use
+`IDENTITY_ANTISPOOF_LIVE_CLASS_INDEX=1`. Validate the class order before using
+a differently exported model.
+
 Challenges are tenant/user/quiz/transaction bound, stored in Redis, short-lived, and consumed once. Raw images and embeddings are not written by the liveness validator. Numeric component diagnostics are returned to trusted Moodle code and logged in summarized form.
 
 ## API contract

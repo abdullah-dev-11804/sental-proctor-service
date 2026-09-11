@@ -19,12 +19,12 @@ class _AntiSpoofSession:
         return [self.output]
 
 
-def _antispoof_engine(output) -> AdvancedFaceEngine:
+def _antispoof_engine(output, live_class_index=0) -> AdvancedFaceEngine:
     engine = AdvancedFaceEngine.__new__(AdvancedFaceEngine)
     engine.settings = SimpleNamespace(
         identity_antispoof_crop_scale=2.7,
         identity_antispoof_input_size=80,
-        identity_antispoof_live_class_index=0,
+        identity_antispoof_live_class_index=live_class_index,
     )
     engine.antispoof = _AntiSpoofSession(output)
     return engine
@@ -74,6 +74,18 @@ def test_antispoof_applies_softmax_to_logits() -> None:
 
     expected = np.exp(4.0) / (np.exp(4.0) + np.exp(1.0) + np.exp(-1.0))
     assert np.isclose(engine._antispoof_score(image, bbox), expected)
+
+
+def test_upstream_minifasnet_uses_class_one_for_live_face() -> None:
+    engine = _antispoof_engine([[0.03, 0.94, 0.03]], live_class_index=1)
+    image = np.full((120, 120, 3), 127, dtype=np.uint8)
+    bbox = np.asarray([30, 30, 90, 90, 0.99], dtype=np.float32)
+
+    scores = engine._antispoof_scores(image, bbox)
+
+    assert np.isclose(scores["live"], 0.94)
+    assert np.isclose(scores["print"], 0.03)
+    assert np.isclose(scores["replay"], 0.03)
 
 
 def test_antispoof_preserves_single_probability_output() -> None:

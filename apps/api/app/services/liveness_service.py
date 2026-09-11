@@ -164,6 +164,7 @@ class LivenessService:
         enrollment: bool,
         quality_policy: dict | None = None,
     ) -> dict[str, Any]:
+        started = time.perf_counter()
         challenge = self.store.consume(challenge_id)
         self._validate_binding(
             challenge,
@@ -241,13 +242,14 @@ class LivenessService:
                 "medianBlur": self._quality_median(observations, "blur"),
                 "medianFaceConfidence": self._quality_median(observations, "confidence"),
             },
+            "processingMs": int(round((time.perf_counter() - started) * 1000)),
         }
         if overall == "pass" and hasattr(self.store, "clear_failures"):
             self.store.clear_failures(company_id, user_id, context_id)
         elif overall != "pass" and hasattr(self.store, "register_failure"):
             self.store.register_failure(company_id, user_id, context_id)
         logger.info(
-            "liveness_result challenge=%s company=%s user=%s overall=%s reason=%s usable=%s invalid=%s passive=%s:%s head=%s:%s illumination=%s:%s duration_ms=%s",
+            "liveness_result challenge=%s company=%s user=%s overall=%s reason=%s usable=%s invalid=%s passive=%s:%s aggregate=%s head=%s:%s illumination=%s:%s correlation=%s capture_ms=%s processing_ms=%s",
             challenge_id,
             company_id,
             user_id,
@@ -257,11 +259,14 @@ class LivenessService:
             len(invalid),
             passive["result"],
             passive["reason"],
+            passive.get("aggregate"),
             headpose["result"],
             headpose["reason"],
             illumination["result"],
             illumination["reason"],
+            illumination.get("correlation"),
             result["durationMs"],
+            result["processingMs"],
         )
         return result
 

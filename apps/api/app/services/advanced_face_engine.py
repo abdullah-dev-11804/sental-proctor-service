@@ -296,9 +296,16 @@ class AdvancedFaceEngine:
             return quality, None
         return quality, self._facial_chromaticity(image, bbox, keypoints)
 
-    def extract(self, image: np.ndarray) -> tuple[np.ndarray, AdvancedFaceQuality]:
+    def extract(
+        self,
+        image: np.ndarray,
+        include_liveness_signals: bool = True,
+    ) -> tuple[np.ndarray, AdvancedFaceQuality]:
         """Returns an AdaFace embedding and the complete quality result."""
-        bbox, keypoints, quality = self._detect_and_measure(image)
+        bbox, keypoints, quality = self._detect_and_measure(
+            image,
+            include_liveness_signals=include_liveness_signals,
+        )
         if bbox is None:
             output_shape = self.recognizer.get_outputs()[0].shape
             dimensions = output_shape[-1] if output_shape and isinstance(output_shape[-1], int) else 512
@@ -311,6 +318,7 @@ class AdvancedFaceEngine:
     def _detect_and_measure(
         self,
         image: np.ndarray,
+        include_liveness_signals: bool = True,
     ) -> tuple[np.ndarray | None, np.ndarray | None, AdvancedFaceQuality]:
         height, width = image.shape[:2]
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -351,13 +359,13 @@ class AdvancedFaceEngine:
             brightness = float(np.mean(face_gray))
             blur = float(cv2.Laplacian(face_gray, cv2.CV_64F).var())
 
-        antispoof_scores = self._antispoof_scores(image, bbox)
+        antispoof_scores = self._antispoof_scores(image, bbox) if include_liveness_signals else None
         antispoof_score = antispoof_scores.get("live") if antispoof_scores is not None else None
         antispoof_passed = None
         if antispoof_score is not None:
             antispoof_passed = antispoof_score >= float(self.settings.identity_antispoof_threshold)
 
-        headpose_yaw = self._headpose_yaw(image, bbox)
+        headpose_yaw = self._headpose_yaw(image, bbox) if include_liveness_signals else None
         if headpose_yaw is not None:
             yaw = float(max(-1.0, min(1.0, headpose_yaw / 45.0)))
 

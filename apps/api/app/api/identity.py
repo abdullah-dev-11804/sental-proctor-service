@@ -1,6 +1,7 @@
 import base64
 import binascii
 import logging
+import time
 from functools import lru_cache
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
@@ -256,6 +257,7 @@ def enroll_face_reference(
     payload: FaceReferenceEnrollRequest,
     x_proctorcore_company: int | None = Header(None),
 ) -> dict:
+    started = time.perf_counter()
     require_company_scope(payload.companyId, x_proctorcore_company)
     settings = get_settings()
     threshold = payload.threshold if payload.threshold is not None else float(settings.identity_pass_threshold)
@@ -331,6 +333,14 @@ def enroll_face_reference(
     result["referenceKey"] = reference_key
     result["bestReferenceKey"] = best_reference_key
     result["referenceSaved"] = True
+    logger.info(
+        "identity_enrollment_complete transaction=%s company=%s user=%s frames=%s processing_ms=%s",
+        payload.transactionId,
+        payload.companyId,
+        payload.userId,
+        result.get("referenceFaceCount"),
+        int(round((time.perf_counter() - started) * 1000)),
+    )
     return result
 
 
@@ -528,10 +538,16 @@ def _validate_reference_liveness(payload, enrollment: bool) -> dict | None:
 
 def _liveness_retry_response(payload, threshold: float, phase: str, liveness: dict, reference_key: str | None = None) -> dict:
     reason = str(liveness.get("reason") or "liveness_inconclusive")
-    passive_reason = str((liveness.get("passivePad") or {}).get("reason") or "")
-    strong_spoof = liveness.get("overall") == "fail" and (
-        reason in {"print_attack", "replay_attack", "illumination_inconsistent"}
-        or passive_reason in {"print_attack", "replay_attack"}
+    passive = liveness.get("passivePad") if isinstance(liveness.get("passivePad"), dict) else {}
+    illumination = liveness.get("illumination") if isinstance(liveness.get("illumination"), dict) else {}
+    aggregate = passive.get("aggregate") if isinstance(passive.get("aggregate"), dict) else {}
+    attack_confidence = float(aggregate.get("print", 0.0)) + float(aggregate.get("replay", 0.0))
+    strong_spoof = (
+        liveness.get("overall") == "fail"
+        and reason in {"print_attack", "replay_attack"}
+        and passive.get("result") == "fail"
+        and illumination.get("result") == "fail"
+        and attack_confidence >= 0.80
     )
     public_reason = "spoof_detected" if strong_spoof else (
         "liveness_failed" if liveness.get("overall") == "fail" else "liveness_inconclusive"
