@@ -38,6 +38,7 @@ class LivenessEvidenceFrame(BaseModel):
     image: str = Field(min_length=16)
     capturedAtMs: int = Field(ge=0)
     elapsedMs: int = Field(ge=0)
+    illuminationElapsedMs: int | None = Field(default=None, ge=0)
 
 
 class FaceReferenceEnrollRequest(BaseModel):
@@ -544,6 +545,7 @@ def _validate_reference_liveness(payload, enrollment: bool) -> dict | None:
             "bytes": content,
             "capturedAtMs": frame.capturedAtMs,
             "elapsedMs": frame.elapsedMs,
+            "illuminationElapsedMs": frame.illuminationElapsedMs,
         })
     try:
         return service.validate(

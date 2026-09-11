@@ -81,7 +81,8 @@ class Settings(BaseSettings):
     identity_headpose_min_hold_frames: int = 2
     identity_headpose_min_progress_degrees: float = 7.0
     identity_headpose_left_sign: int = 1
-    identity_illumination_phase_ms: int = 850
+    identity_headpose_step_timeout_ms: int = 8000
+    identity_illumination_phase_ms: int = 1000
     identity_illumination_min_frames_per_phase: int = 2
     identity_illumination_min_response: float = 0.008
     identity_illumination_pass_correlation: float = 0.35

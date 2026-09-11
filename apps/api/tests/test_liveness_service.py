@@ -438,3 +438,50 @@ def test_adaptive_headpose_rejects_out_of_order_step():
             challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
             "transaction-123", 1, json.dumps({"yaw": 20.0}).encode(), False,
         )
+
+
+@pytest.mark.parametrize(("direction", "turned_yaw"), [("left", 34.0), ("right", -4.0)])
+def test_adaptive_headpose_uses_the_users_neutral_baseline(monkeypatch, direction, turned_yaw):
+    monkeypatch.setattr("secrets.choice", lambda _items: (direction, "center"))
+    store = AdaptiveStore()
+    service = LivenessService(FakeMatcher(), settings(), store)
+    challenge = issued(service)
+
+    sequence = (15.0, turned_yaw, 15.0)
+    for index, yaw in enumerate(sequence):
+        image = json.dumps({"yaw": yaw}).encode()
+        assert service.check_pose_frame(
+            challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
+            "transaction-123", index, image, False,
+        )["reached"] is False
+        assert service.check_pose_frame(
+            challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
+            "transaction-123", index, image, False,
+        )["reached"] is True
+
+    progress = store.get_pose_progress(challenge["challengeId"])
+    assert progress["expectedStep"] == 3
+    assert progress["baselineYaw"] == pytest.approx(15.0)
+
+
+def test_adaptive_headpose_does_not_advance_for_the_wrong_direction(monkeypatch):
+    monkeypatch.setattr("secrets.choice", lambda _items: ("left", "center"))
+    store = AdaptiveStore()
+    service = LivenessService(FakeMatcher(), settings(), store)
+    challenge = issued(service)
+
+    center = json.dumps({"yaw": 12.0}).encode()
+    for _ in range(2):
+        service.check_pose_frame(
+            challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
+            "transaction-123", 0, center, False,
+        )
+
+    wrong_turn = json.dumps({"yaw": -12.0}).encode()
+    for _ in range(3):
+        result = service.check_pose_frame(
+            challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
+            "transaction-123", 1, wrong_turn, False,
+        )
+        assert result["reached"] is False
+    assert store.get_pose_progress(challenge["challengeId"])["expectedStep"] == 1

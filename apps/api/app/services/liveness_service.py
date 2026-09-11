@@ -35,7 +35,15 @@ class LivenessChallengeStore:
         return self._redis
 
     def save(self, challenge: dict[str, Any]) -> None:
-        ttl = max(10, int(self.settings.identity_liveness_challenge_ttl_seconds))
+        lifetime = max(
+            0,
+            int(challenge.get("expiresAtMs", 0)) - int(challenge.get("issuedAtMs", 0)),
+        )
+        ttl = max(
+            10,
+            int(self.settings.identity_liveness_challenge_ttl_seconds),
+            int(np.ceil(lifetime / 1000)),
+        )
         key = self._key(str(challenge["challengeId"]))
         if not self.redis.set(key, json.dumps(challenge), ex=ttl, nx=True):
             raise RuntimeError("challenge_collision")
@@ -68,7 +76,7 @@ class LivenessChallengeStore:
         self.redis.delete(self._attempt_key(company_id, user_id, context_id))
 
     def save_pose_progress(self, challenge_id: str, progress: dict[str, Any]) -> None:
-        ttl = max(10, int(self.settings.identity_liveness_challenge_ttl_seconds))
+        ttl = max(10, int(self.settings.identity_liveness_challenge_ttl_seconds), 90)
         self.redis.set(self._progress_key(challenge_id), json.dumps(progress), ex=ttl)
 
     def get_pose_progress(self, challenge_id: str) -> dict[str, Any]:
@@ -136,14 +144,27 @@ class LivenessService:
         movement_steps = self._movement_steps(movements)
         illumination = self._illumination_steps() if required["illumination"] else []
         adaptive_headpose = bool(required["headPose"] and hasattr(self.store, "save_pose_progress"))
-        pose_step_timeout_ms = 3000
+        pose_step_timeout_ms = max(5000, int(self.settings.identity_headpose_step_timeout_ms))
+        illumination_duration_ms = illumination[-1]["endMs"] if illumination else 0
+        adaptive_duration_ms = (
+            (len(movement_steps) * (pose_step_timeout_ms + 2000))
+            + illumination_duration_ms
+            + 3000
+            if adaptive_headpose else 0
+        )
         duration_ms = max(
             movement_steps[-1]["endMs"] if movement_steps else 0,
-            illumination[-1]["endMs"] if illumination else 0,
+            illumination_duration_ms,
             min(timeout_ms, int(self.settings.identity_passive_capture_window_ms)),
-            min(timeout_ms, len(movement_steps) * pose_step_timeout_ms) if adaptive_headpose else 0,
+            adaptive_duration_ms,
         )
-        duration_ms = min(duration_ms, timeout_ms)
+        if not adaptive_headpose:
+            duration_ms = min(duration_ms, timeout_ms)
+        ttl_seconds = max(
+            10,
+            int(self.settings.identity_liveness_challenge_ttl_seconds),
+            int(np.ceil(duration_ms / 1000)) + 30,
+        )
         challenge = {
             "challengeId": challenge_id,
             "nonce": nonce,
@@ -153,7 +174,7 @@ class LivenessService:
             "transactionId": str(transaction_id),
             "enrollment": bool(enrollment),
             "issuedAtMs": issued_at,
-            "expiresAtMs": issued_at + (max(10, int(self.settings.identity_liveness_challenge_ttl_seconds)) * 1000),
+            "expiresAtMs": issued_at + (ttl_seconds * 1000),
             "durationMs": duration_ms,
             "required": required,
             "movementSteps": movement_steps,
@@ -170,8 +191,8 @@ class LivenessService:
             self.store.save_pose_progress(challenge_id, {
                 "expectedStep": 0,
                 "holdFrames": 0,
-                "firstDirectedYaw": None,
-                "lastCenterYaw": 0.0,
+                "neutralCandidateYaw": None,
+                "baselineYaw": None,
                 "steps": [],
             })
         return self._public_challenge(challenge)
@@ -370,44 +391,55 @@ class LivenessService:
         if yaw is None:
             return {"reached": False, "reason": "headpose_unavailable", "stepIndex": step_index}
 
+        yaw = float(yaw)
         action = str(steps[step_index]["action"])
+        center_tolerance = float(self.settings.identity_headpose_center_degrees)
         sign = 1 if int(self.settings.identity_headpose_left_sign) >= 0 else -1
-        directed = float(yaw) * sign if action == "left" else -float(yaw) * sign
-        matches = abs(float(yaw)) <= float(self.settings.identity_headpose_center_degrees) if action == "center" else (
-            directed >= float(self.settings.identity_headpose_turn_degrees)
-        )
-        first = progress.get("firstDirectedYaw")
-        if first is None:
-            baseline_yaw = float(progress.get("lastCenterYaw", 0.0))
-            first = (
-                baseline_yaw * sign if action == "left"
-                else -baseline_yaw * sign if action == "right"
-                else 0.0
+        baseline = progress.get("baselineYaw")
+
+        if step_index == 0:
+            candidate = progress.get("neutralCandidateYaw")
+            stable = candidate is None or abs(yaw - float(candidate)) <= center_tolerance
+            hold_frames = int(progress.get("holdFrames", 0)) + 1 if stable else 1
+            progress["neutralCandidateYaw"] = yaw if candidate is None or not stable else (
+                (float(candidate) + yaw) / 2.0
             )
-        progressive = action == "center" or (
-            directed - float(first) >= float(self.settings.identity_headpose_min_progress_degrees)
-        )
-        hold_frames = int(progress.get("holdFrames", 0)) + 1 if matches and progressive else 0
+            matches = True
+            yaw_delta = 0.0
+        else:
+            if baseline is None:
+                raise ValueError("headpose_baseline_missing")
+            yaw_delta = yaw - float(baseline)
+            if action == "center":
+                matches = abs(yaw_delta) <= center_tolerance
+            else:
+                directed_delta = yaw_delta * sign if action == "left" else -yaw_delta * sign
+                required_turn = max(
+                    float(self.settings.identity_headpose_turn_degrees),
+                    float(self.settings.identity_headpose_min_progress_degrees),
+                )
+                matches = directed_delta >= required_turn
+            hold_frames = int(progress.get("holdFrames", 0)) + 1 if matches else 0
         reached = hold_frames >= max(1, int(self.settings.identity_headpose_min_hold_frames))
         if reached:
+            if step_index == 0:
+                progress["baselineYaw"] = float(progress["neutralCandidateYaw"])
             progress.setdefault("steps", []).append({
                 "step": step_index,
                 "action": action,
                 "result": "pass",
-                "observedYaw": round(float(yaw), 2),
+                "observedYaw": round(yaw, 2),
+                "yawDelta": round(yaw_delta, 2),
             })
             progress["expectedStep"] = step_index + 1
             progress["holdFrames"] = 0
-            progress["firstDirectedYaw"] = None
-            if action == "center":
-                progress["lastCenterYaw"] = float(yaw)
         else:
             progress["holdFrames"] = hold_frames
-            progress["firstDirectedYaw"] = first
         self.store.save_pose_progress(challenge_id, progress)
         logger.info(
-            "headpose_progress challenge=%s company=%s user=%s step=%s action=%s yaw=%.2f hold=%s reached=%s",
-            challenge_id, company_id, user_id, step_index, action, float(yaw), hold_frames, reached,
+            "headpose_progress challenge=%s company=%s user=%s step=%s action=%s yaw=%.2f baseline=%s delta=%.2f hold=%s reached=%s",
+            challenge_id, company_id, user_id, step_index, action, yaw,
+            progress.get("baselineYaw"), yaw_delta, hold_frames, reached,
         )
         return {
             "reached": reached,
@@ -447,7 +479,7 @@ class LivenessService:
         names = ["red", "green", "blue"]
         secrets.SystemRandom().shuffle(names)
         names.insert(0, "neutral")
-        phase_ms = max(500, int(self.settings.identity_illumination_phase_ms))
+        phase_ms = max(1000, int(self.settings.identity_illumination_phase_ms))
         return [
             {
                 "step": index,
@@ -472,7 +504,7 @@ class LivenessService:
             "movementSteps": challenge["movementSteps"],
             "illuminationSteps": challenge["illuminationSteps"],
             "adaptiveHeadPose": bool(challenge.get("adaptiveHeadPose")),
-            "poseStepTimeoutMs": int(challenge.get("poseStepTimeoutMs", 3000)),
+            "poseStepTimeoutMs": int(challenge.get("poseStepTimeoutMs", 8000)),
             "minimumCaptureMs": int(challenge.get("minimumCaptureMs", 0)),
         }
 
@@ -547,6 +579,10 @@ class LivenessService:
                 continue
             valid.append({
                 "elapsedMs": elapsed,
+                "illuminationElapsedMs": (
+                    int(item["illuminationElapsedMs"])
+                    if item.get("illuminationElapsedMs") is not None else elapsed
+                ),
                 "capturedAtMs": int(item.get("capturedAtMs", 0)),
                 "quality": quality,
                 "chromaticity": chromaticity,
@@ -742,7 +778,12 @@ class LivenessService:
         phase_values = []
         phase_results = []
         for phase in challenge["illuminationSteps"]:
-            values = [item["chromaticity"] for item in observations if item["chromaticity"] is not None and phase["startMs"] <= item["elapsedMs"] < phase["endMs"]]
+            values = [
+                item["chromaticity"]
+                for item in observations
+                if item["chromaticity"] is not None
+                and phase["startMs"] <= item["illuminationElapsedMs"] < phase["endMs"]
+            ]
             if len(values) < minimum:
                 return {"required": True, "result": "inconclusive", "reason": "illumination_insufficient_frames", "correlation": None}
             phase_values.append(np.median(np.asarray(values, dtype=np.float32), axis=0))
