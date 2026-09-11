@@ -246,7 +246,7 @@ class LivenessService:
         }
         if overall == "pass" and hasattr(self.store, "clear_failures"):
             self.store.clear_failures(company_id, user_id, context_id)
-        elif overall != "pass" and hasattr(self.store, "register_failure"):
+        elif overall == "fail" and hasattr(self.store, "register_failure"):
             self.store.register_failure(company_id, user_id, context_id)
         logger.info(
             "liveness_result challenge=%s company=%s user=%s overall=%s reason=%s usable=%s invalid=%s passive=%s:%s aggregate=%s head=%s:%s illumination=%s:%s correlation=%s capture_ms=%s processing_ms=%s",

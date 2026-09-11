@@ -360,6 +360,18 @@ def test_retry_limit_counts_failures_and_success_clears_them():
     assert store.failures == 0
 
 
+def test_inconclusive_capture_does_not_lock_out_genuine_user():
+    store = TrackingStore()
+    service = LivenessService(FakeMatcher(), settings(identity_liveness_retry_limit=1), store)
+    challenge = issued(service)
+
+    result = validate(service, challenge, evidence_for(challenge, illumination="weak"))
+
+    assert result["overall"] == "inconclusive"
+    assert store.failures == 0
+    assert issued(service)["required"] is True
+
+
 def test_retry_limit_rejects_new_challenge_after_configured_failures():
     store = TrackingStore()
     service = LivenessService(FakeMatcher(), settings(identity_liveness_retry_limit=1), store)
