@@ -42,6 +42,11 @@ def test_production_checks_reject_local_storage(monkeypatch) -> None:
     monkeypatch.setattr(main.settings, "livekit_url", "wss://proctoring.example")
     monkeypatch.setattr(main.settings, "moodle_webhook_url", "https://moodle.example/webhook")
     monkeypatch.setattr(main.settings, "cors_origins_raw", "https://moodle.example")
+    monkeypatch.setattr(main.settings, "identity_temporal_passive_pad_enabled", True)
+    monkeypatch.setattr(main.settings, "identity_require_passive_antispoof", True)
+    monkeypatch.setattr(main.settings, "identity_active_liveness_enabled", True)
+    monkeypatch.setattr(main.settings, "identity_headpose_challenge_enabled", True)
+    monkeypatch.setattr(main.settings, "identity_illumination_challenge_enabled", True)
 
     checks = main._production_checks(
         {"ready": True, "private": True, "backend": "local"},
@@ -50,6 +55,28 @@ def test_production_checks_reject_local_storage(monkeypatch) -> None:
 
     assert checks["private_object_storage"] is False
     assert all(value for key, value in checks.items() if key != "private_object_storage")
+
+
+def test_production_checks_reject_disabled_active_liveness(monkeypatch) -> None:
+    monkeypatch.setattr(main.settings, "storage_require_ready", True)
+    monkeypatch.setattr(main.settings, "reference_encryption_key_file", "/run/secrets/reference_encryption_key")
+    monkeypatch.setattr(main.settings, "api_shared_secret", "a" * 32)
+    monkeypatch.setattr(main.settings, "livekit_api_secret", "b" * 32)
+    monkeypatch.setattr(main.settings, "livekit_url", "wss://proctoring.example")
+    monkeypatch.setattr(main.settings, "moodle_webhook_url", "https://moodle.example/webhook")
+    monkeypatch.setattr(main.settings, "cors_origins_raw", "https://moodle.example")
+    monkeypatch.setattr(main.settings, "identity_temporal_passive_pad_enabled", True)
+    monkeypatch.setattr(main.settings, "identity_require_passive_antispoof", True)
+    monkeypatch.setattr(main.settings, "identity_active_liveness_enabled", False)
+    monkeypatch.setattr(main.settings, "identity_headpose_challenge_enabled", True)
+    monkeypatch.setattr(main.settings, "identity_illumination_challenge_enabled", True)
+
+    checks = main._production_checks(
+        {"ready": True, "private": True, "backend": "minio"},
+        {"ready": True, "enabled": True},
+    )
+
+    assert checks["identity_liveness_enabled"] is False
 
 
 def test_production_environment_always_enforces_readiness() -> None:

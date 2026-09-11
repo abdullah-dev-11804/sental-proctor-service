@@ -193,4 +193,11 @@ def _production_checks(storage: dict, egress: dict) -> dict[str, bool]:
         "livekit_uses_wss": settings.livekit_url.lower().startswith("wss://"),
         "moodle_webhook_uses_https": settings.moodle_webhook_url.lower().startswith("https://"),
         "cors_is_explicit": settings.cors_origins != ["*"],
+        "identity_liveness_enabled": bool(
+            settings.identity_temporal_passive_pad_enabled
+            and settings.identity_require_passive_antispoof
+            and settings.identity_active_liveness_enabled
+            and settings.identity_headpose_challenge_enabled
+            and settings.identity_illumination_challenge_enabled
+        ),
     }

@@ -549,9 +549,19 @@ def _liveness_retry_response(payload, threshold: float, phase: str, liveness: di
         and illumination.get("result") == "fail"
         and attack_confidence >= 0.80
     )
-    public_reason = "spoof_detected" if strong_spoof else (
-        "liveness_failed" if liveness.get("overall") == "fail" else "liveness_inconclusive"
-    )
+    headpose = liveness.get("headPose") if isinstance(liveness.get("headPose"), dict) else {}
+    if strong_spoof:
+        public_reason = "spoof_detected"
+    elif liveness.get("overall") != "fail":
+        public_reason = "liveness_inconclusive"
+    elif headpose.get("required") and headpose.get("result") == "fail":
+        public_reason = "liveness_failed"
+    elif passive.get("required") and passive.get("result") == "fail":
+        public_reason = "passive_liveness_failed"
+    elif illumination.get("required") and illumination.get("result") == "fail":
+        public_reason = "illumination_liveness_failed"
+    else:
+        public_reason = "liveness_failed"
     response = _reference_retry_response(
         payload.transactionId,
         payload.companyId,
