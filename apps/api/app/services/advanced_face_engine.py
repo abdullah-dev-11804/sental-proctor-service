@@ -333,6 +333,14 @@ class AdvancedFaceEngine:
         face_width = max(0.0, x2 - x1)
         yaw = self._landmark_yaw(kps)
 
+        # Enrollment quality must describe the candidate's face, not the room.
+        # Keep whole-frame values only for the no-face case above.
+        face_crop = self._crop_bbox(image, bbox, margin_ratio=0.12)
+        if face_crop.size > 0:
+            face_gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+            brightness = float(np.mean(face_gray))
+            blur = float(cv2.Laplacian(face_gray, cv2.CV_64F).var())
+
         antispoof_score = self._antispoof_score(image, bbox)
         antispoof_passed = None
         if antispoof_score is not None:

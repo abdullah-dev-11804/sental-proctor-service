@@ -30,6 +30,14 @@ def _antispoof_engine(output) -> AdvancedFaceEngine:
     return engine
 
 
+class _Detector:
+    def detect(self, _image, threshold, max_num, metric):
+        assert threshold == 0.65
+        assert max_num == 0
+        assert metric == "default"
+        return np.asarray([[40, 30, 80, 90, 0.96]], dtype=np.float32), None
+
+
 def test_quality_analysis_does_not_run_adaface(monkeypatch) -> None:
     engine = AdvancedFaceEngine.__new__(AdvancedFaceEngine)
     quality = AdvancedFaceQuality(
@@ -74,3 +82,21 @@ def test_antispoof_preserves_single_probability_output() -> None:
     bbox = np.asarray([30, 30, 90, 90, 0.99], dtype=np.float32)
 
     assert np.isclose(engine._antispoof_score(image, bbox), 0.93)
+
+
+def test_detected_face_quality_ignores_dark_background(monkeypatch) -> None:
+    engine = AdvancedFaceEngine.__new__(AdvancedFaceEngine)
+    engine.settings = SimpleNamespace(
+        identity_min_face_confidence=0.65,
+        identity_antispoof_threshold=0.78,
+    )
+    engine.detector = _Detector()
+    image = np.full((120, 120, 3), 5, dtype=np.uint8)
+    image[25:95, 35:85] = 180
+    monkeypatch.setattr(engine, "_antispoof_score", lambda _image, _bbox: None)
+    monkeypatch.setattr(engine, "_headpose_yaw", lambda _image, _bbox: None)
+
+    _bbox, _keypoints, quality = engine._detect_and_measure(image)
+
+    assert quality.brightness > 100
+    assert quality.face_count == 1
