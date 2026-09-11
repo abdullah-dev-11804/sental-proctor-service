@@ -249,7 +249,7 @@ class LivenessService:
         elif overall == "fail" and hasattr(self.store, "register_failure"):
             self.store.register_failure(company_id, user_id, context_id)
         logger.info(
-            "liveness_result challenge=%s company=%s user=%s overall=%s reason=%s usable=%s invalid=%s passive=%s:%s aggregate=%s head=%s:%s illumination=%s:%s correlation=%s capture_ms=%s processing_ms=%s",
+            "liveness_result challenge=%s company=%s user=%s overall=%s reason=%s usable=%s invalid=%s passive=%s:%s aggregate=%s head=%s:%s steps=%s illumination=%s:%s correlation=%s capture_ms=%s processing_ms=%s",
             challenge_id,
             company_id,
             user_id,
@@ -262,6 +262,7 @@ class LivenessService:
             passive.get("aggregate"),
             headpose["result"],
             headpose["reason"],
+            headpose.get("steps"),
             illumination["result"],
             illumination["reason"],
             illumination.get("correlation"),
@@ -315,7 +316,7 @@ class LivenessService:
         cursor = 0
         steps = []
         for index, action in enumerate(["center", *actions]):
-            duration = 700 if index == 0 else (1200 if action != "center" else 900)
+            duration = 1000 if index == 0 else (1800 if action != "center" else 1200)
             steps.append({"step": index, "action": action, "startMs": cursor, "endMs": cursor + duration})
             cursor += duration
         return steps
@@ -568,6 +569,9 @@ class LivenessService:
                 "endMs": step["endMs"],
                 "result": "pass" if reached and progressive else "fail",
                 "reachedAtMs": matching[0][0] if matching else None,
+                "matchingFrames": len(matching),
+                "observedMinYaw": round(min(yaw for _elapsed, yaw in values), 2),
+                "observedMaxYaw": round(max(yaw for _elapsed, yaw in values), 2),
             })
         if any(step["result"] == "fail" for step in steps):
             return {"required": True, "result": "fail", "reason": "headpose_sequence_failed", "steps": steps}
