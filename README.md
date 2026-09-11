@@ -79,6 +79,9 @@ For the stronger face stack, set `IDENTITY_ENGINE=scrfd_adaface` and place the
 required SCRFD/AdaFace ONNX files under `models/`. Details are in
 `docs/identity-production-stack.md`.
 
+The randomized temporal liveness flow, configuration, manual attack matrix, and
+calibration procedure are documented in `docs/liveness-validation.md`.
+
 ## Identity Calibration
 
 Before using `block` or `fail` identity mismatch modes, collect consented webcam-like

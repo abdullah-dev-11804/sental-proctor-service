@@ -23,6 +23,7 @@ class AdvancedFaceQuality:
     yaw: float | None = None
     antispoof_score: float | None = None
     antispoof_passed: bool | None = None
+    antispoof_scores: dict[str, float] | None = None
     headpose_yaw_degrees: float | None = None
 
 
@@ -203,13 +204,15 @@ class AdvancedFaceEngine:
         antispoof_model = str(settings.identity_antispoof_model).strip()
         if antispoof_model:
             self.antispoof = self._load_onnx(self._model_path(antispoof_model), "anti-spoof")
-        elif settings.identity_require_passive_antispoof:
+        elif settings.identity_require_passive_antispoof or settings.identity_temporal_passive_pad_enabled:
             raise RuntimeError("Passive anti-spoofing is required but IDENTITY_ANTISPOOF_MODEL is empty.")
 
         headpose_model = str(settings.identity_headpose_model).strip()
         if headpose_model:
             self.headpose = self._load_onnx(self._model_path(headpose_model), "6DRepNet head-pose")
-        elif settings.identity_require_headpose_liveness:
+        elif settings.identity_require_headpose_liveness or (
+            settings.identity_active_liveness_enabled and settings.identity_headpose_challenge_enabled
+        ):
             raise RuntimeError("Head-pose liveness is required but IDENTITY_HEADPOSE_MODEL is empty.")
 
         self.runtime = self._build_runtime()
@@ -286,6 +289,13 @@ class AdvancedFaceEngine:
         _bbox, _keypoints, quality = self._detect_and_measure(image)
         return quality
 
+    def analyse_liveness(self, image: np.ndarray) -> tuple[AdvancedFaceQuality, list[float] | None]:
+        """Returns non-recognition liveness signals and stable facial RGB chromaticity."""
+        bbox, keypoints, quality = self._detect_and_measure(image)
+        if bbox is None:
+            return quality, None
+        return quality, self._facial_chromaticity(image, bbox, keypoints)
+
     def extract(self, image: np.ndarray) -> tuple[np.ndarray, AdvancedFaceQuality]:
         """Returns an AdaFace embedding and the complete quality result."""
         bbox, keypoints, quality = self._detect_and_measure(image)
@@ -341,7 +351,8 @@ class AdvancedFaceEngine:
             brightness = float(np.mean(face_gray))
             blur = float(cv2.Laplacian(face_gray, cv2.CV_64F).var())
 
-        antispoof_score = self._antispoof_score(image, bbox)
+        antispoof_scores = self._antispoof_scores(image, bbox)
+        antispoof_score = antispoof_scores.get("live") if antispoof_scores is not None else None
         antispoof_passed = None
         if antispoof_score is not None:
             antispoof_passed = antispoof_score >= float(self.settings.identity_antispoof_threshold)
@@ -364,6 +375,7 @@ class AdvancedFaceEngine:
             yaw=yaw,
             antispoof_score=antispoof_score,
             antispoof_passed=antispoof_passed,
+            antispoof_scores=antispoof_scores,
             headpose_yaw_degrees=headpose_yaw,
         )
         return bbox, kps, quality
@@ -404,7 +416,11 @@ class AdvancedFaceEngine:
         return embedding
 
     def _antispoof_score(self, image: np.ndarray, bbox: np.ndarray) -> float | None:
-        if self.antispoof is None:
+        scores = self._antispoof_scores(image, bbox)
+        return scores.get("live") if scores is not None else None
+
+    def _antispoof_scores(self, image: np.ndarray, bbox: np.ndarray) -> dict[str, float] | None:
+        if getattr(self, "antispoof", None) is None:
             return None
         crop = self._crop_bbox_scaled(image, bbox, scale=float(self.settings.identity_antispoof_crop_scale))
         input_tensor = self._generic_image_tensor(
@@ -419,13 +435,51 @@ class AdvancedFaceEngine:
         if output.size == 1:
             value = float(output[0])
             if 0.0 <= value <= 1.0:
-                return value
-            return float(1.0 / (1.0 + np.exp(-value)))
+                live = value
+            else:
+                live = float(1.0 / (1.0 + np.exp(-value)))
+            return {"live": live, "print": 0.0, "replay": 1.0 - live}
         probabilities = self._class_probabilities(output)
         index = int(self.settings.identity_antispoof_live_class_index)
         if index < 0 or index >= probabilities.size:
             index = int(np.argmax(probabilities))
-        return float(probabilities[index])
+        live = float(probabilities[index])
+        remaining = [float(value) for position, value in enumerate(probabilities) if position != index]
+        return {
+            "live": live,
+            "print": remaining[0] if remaining else 0.0,
+            "replay": remaining[1] if len(remaining) > 1 else max(0.0, 1.0 - live - sum(remaining)),
+        }
+
+    def _facial_chromaticity(
+        self,
+        image: np.ndarray,
+        bbox: np.ndarray,
+        keypoints: np.ndarray | None,
+    ) -> list[float] | None:
+        """Measures a cheek/lower-face ROI while excluding eyes, hair, and background."""
+        x1, y1, x2, y2 = [float(value) for value in bbox[:4]]
+        width = max(1.0, x2 - x1)
+        height = max(1.0, y2 - y1)
+        left = int(round(x1 + (width * 0.20)))
+        right = int(round(x2 - (width * 0.20)))
+        top = int(round(y1 + (height * 0.48)))
+        bottom = int(round(y1 + (height * 0.84)))
+        if keypoints is not None and keypoints.shape[0] >= 5:
+            nose_y = float(keypoints[2][1])
+            mouth_y = float((keypoints[3][1] + keypoints[4][1]) / 2.0)
+            top = max(top, int(round(nose_y)))
+            bottom = min(bottom, int(round(mouth_y + (height * 0.12))))
+        left, top = max(0, left), max(0, top)
+        right, bottom = min(image.shape[1], right), min(image.shape[0], bottom)
+        roi = image[top:bottom, left:right]
+        if roi.size < 300:
+            return None
+        rgb = np.median(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB).reshape(-1, 3), axis=0).astype(np.float32)
+        total = float(np.sum(rgb))
+        if total <= 1e-6:
+            return None
+        return [float(value / total) for value in rgb]
 
     def _class_probabilities(self, output: np.ndarray) -> np.ndarray:
         """Accepts either model probabilities or raw logits without double-softmax."""

@@ -55,3 +55,17 @@ def test_production_checks_reject_local_storage(monkeypatch) -> None:
 def test_production_environment_always_enforces_readiness() -> None:
     settings = Settings(_env_file=None, app_env="production", storage_require_ready=False)
     assert settings.production_readiness_required is True
+
+
+def test_liveness_feature_flags_make_pad_and_headpose_models_required(monkeypatch) -> None:
+    monkeypatch.setattr(main.settings, "identity_engine", "scrfd_adaface")
+    monkeypatch.setattr(main.settings, "identity_temporal_passive_pad_enabled", True)
+    monkeypatch.setattr(main.settings, "identity_require_passive_antispoof", False)
+    monkeypatch.setattr(main.settings, "identity_active_liveness_enabled", True)
+    monkeypatch.setattr(main.settings, "identity_headpose_challenge_enabled", True)
+    monkeypatch.setattr(main.settings, "identity_require_headpose_liveness", False)
+
+    models = {model["role"]: model for model in main._identity_models()}
+
+    assert models["passive_antispoof"]["required"] is True
+    assert models["head_pose"]["required"] is True

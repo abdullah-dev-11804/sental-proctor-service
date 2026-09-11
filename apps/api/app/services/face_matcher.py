@@ -22,6 +22,7 @@ class FaceQuality:
     yaw: float | None = None
     antispoof_score: float | None = None
     antispoof_passed: bool | None = None
+    antispoof_scores: dict[str, float] | None = None
     headpose_yaw_degrees: float | None = None
 
 
@@ -581,6 +582,15 @@ class FaceMatcher:
                 "center_tolerance_x": float(self.settings.identity_enrollment_center_tolerance_x),
                 "center_tolerance_y": float(self.settings.identity_enrollment_center_tolerance_y),
             },
+            "liveness": {
+                "temporal_passive_pad": bool(self.settings.identity_temporal_passive_pad_enabled),
+                "passive_required": bool(self.settings.identity_require_passive_antispoof),
+                "passive_min_valid_frames": int(self.settings.identity_passive_min_valid_frames),
+                "active_enabled": bool(self.settings.identity_active_liveness_enabled),
+                "headpose_challenge": bool(self.settings.identity_headpose_challenge_enabled),
+                "illumination_challenge": bool(self.settings.identity_illumination_challenge_enabled),
+                "challenge_timeout_ms": int(self.settings.identity_liveness_challenge_timeout_ms),
+            },
         }
         if self.advanced_engine is not None:
             runtime.update(self.advanced_engine.describe_runtime())
@@ -758,6 +768,14 @@ class FaceMatcher:
             return embedding, self._face_quality(quality)
         return None, self._face_quality(self.advanced_engine.analyse(image))
 
+    def analyse_liveness_frame(self, content: bytes) -> tuple[FaceQuality, list[float] | None]:
+        """Runs only detection/PAD/head-pose/illumination measurements, never AdaFace."""
+        if self.advanced_engine is None:
+            raise RuntimeError("Advanced face engine is not loaded.")
+        image = self._decode_image(content)
+        quality, chromaticity = self.advanced_engine.analyse_liveness(image)
+        return self._face_quality(quality), chromaticity
+
     @staticmethod
     def _face_quality(advanced_quality) -> FaceQuality:
         return FaceQuality(
@@ -774,6 +792,7 @@ class FaceMatcher:
             yaw=advanced_quality.yaw,
             antispoof_score=advanced_quality.antispoof_score,
             antispoof_passed=advanced_quality.antispoof_passed,
+            antispoof_scores=advanced_quality.antispoof_scores,
             headpose_yaw_degrees=advanced_quality.headpose_yaw_degrees,
         )
 
@@ -798,6 +817,7 @@ class FaceMatcher:
         min_brightness: float,
         min_blur: float,
         min_face_confidence: float,
+        enforce_passive_pad: bool = True,
     ) -> str | None:
         if quality.face_count < 1:
             return "no_face"
@@ -809,7 +829,7 @@ class FaceMatcher:
             return "blurry"
         if quality.confidence is not None and quality.confidence < min_face_confidence:
             return "low_face_confidence"
-        if self.settings.identity_require_passive_antispoof:
+        if self.settings.identity_require_passive_antispoof and enforce_passive_pad:
             if quality.antispoof_passed is None:
                 return "antispoof_unavailable"
             if not quality.antispoof_passed:
@@ -834,6 +854,7 @@ class FaceMatcher:
                 "enrollmentMinFaceConfidence",
                 self.settings.identity_enrollment_min_face_confidence,
             )),
+            enforce_passive_pad=not bool(self._policy_value(quality_policy, "skipPassivePad", False)),
         )
         if retry_reason:
             return retry_reason
@@ -884,6 +905,7 @@ class FaceMatcher:
                 "minFaceConfidence",
                 self.settings.identity_min_face_confidence,
             )),
+            enforce_passive_pad=not bool(self._policy_value(quality_policy, "skipPassivePad", False)),
         )
         if retry_reason:
             return retry_reason

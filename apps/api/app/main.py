@@ -145,10 +145,18 @@ def _identity_models() -> list[dict]:
             _model_status(settings.identity_scrfd_model, True, "scrfd_detector"),
             _model_status(settings.identity_adaface_model, True, "adaface_recognizer"),
         ]
-        if settings.identity_antispoof_model.strip() or settings.identity_require_passive_antispoof:
-            models.append(_model_status(settings.identity_antispoof_model, settings.identity_require_passive_antispoof, "passive_antispoof"))
-        if settings.identity_headpose_model.strip() or settings.identity_require_headpose_liveness:
-            models.append(_model_status(settings.identity_headpose_model, settings.identity_require_headpose_liveness, "head_pose"))
+        passive_required = bool(
+            settings.identity_require_passive_antispoof
+            or settings.identity_temporal_passive_pad_enabled
+        )
+        headpose_required = bool(
+            settings.identity_require_headpose_liveness
+            or (settings.identity_active_liveness_enabled and settings.identity_headpose_challenge_enabled)
+        )
+        if settings.identity_antispoof_model.strip() or passive_required:
+            models.append(_model_status(settings.identity_antispoof_model, passive_required, "passive_antispoof"))
+        if settings.identity_headpose_model.strip() or headpose_required:
+            models.append(_model_status(settings.identity_headpose_model, headpose_required, "head_pose"))
         return models
     return []
 

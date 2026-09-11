@@ -10,6 +10,7 @@ from app.core.security import require_api_auth, require_company_scope
 from app.core.config import get_settings
 from app.models.identity import IdentityVerifyResponse
 from app.services.face_matcher import FaceMatcher
+from app.services.liveness_service import LivenessService
 from app.services.storage import LocalStorage
 
 
@@ -32,6 +33,12 @@ class MoodleIdentityVerifyRequest(BaseModel):
     qualityPolicy: dict | None = None
 
 
+class LivenessEvidenceFrame(BaseModel):
+    image: str = Field(min_length=16)
+    capturedAtMs: int = Field(ge=0)
+    elapsedMs: int = Field(ge=0)
+
+
 class FaceReferenceEnrollRequest(BaseModel):
     transactionId: str = Field(min_length=8, max_length=128)
     companyId: int = Field(default=0, ge=0)
@@ -46,6 +53,10 @@ class FaceReferenceEnrollRequest(BaseModel):
     leftImages: list[str] = Field(default_factory=list, max_length=16)
     rightImages: list[str] = Field(default_factory=list, max_length=16)
     qualityPolicy: dict | None = None
+    contextId: str = Field(default="", max_length=128)
+    challengeId: str = Field(default="", max_length=128)
+    challengeNonce: str = Field(default="", max_length=256)
+    livenessEvidence: list[LivenessEvidenceFrame] = Field(default_factory=list, max_length=48)
 
 
 class FaceReferenceVerifyRequest(BaseModel):
@@ -60,10 +71,77 @@ class FaceReferenceVerifyRequest(BaseModel):
     leftImages: list[str] = Field(default_factory=list, max_length=16)
     rightImages: list[str] = Field(default_factory=list, max_length=16)
     qualityPolicy: dict | None = None
+    contextId: str = Field(default="", max_length=128)
+    challengeId: str = Field(default="", max_length=128)
+    challengeNonce: str = Field(default="", max_length=256)
+    livenessEvidence: list[LivenessEvidenceFrame] = Field(default_factory=list, max_length=48)
+
+
+class LivenessChallengeRequest(BaseModel):
+    transactionId: str = Field(min_length=8, max_length=128)
+    companyId: int = Field(default=0, ge=0)
+    userId: int = Field(ge=1)
+    contextId: str = Field(min_length=1, max_length=128)
+    enrollment: bool = False
+
+
+class LivenessQualityRequest(LivenessChallengeRequest):
+    challengeId: str = Field(min_length=8, max_length=128)
+    challengeNonce: str = Field(min_length=8, max_length=256)
+    image: str = Field(min_length=16)
+    qualityPolicy: dict | None = None
 
 
 class FaceReferenceResetRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=1000)
+
+
+@compat_router.post("/liveness/challenges", dependencies=[Depends(require_api_auth)])
+def issue_liveness_challenge(
+    payload: LivenessChallengeRequest,
+    x_proctorcore_company: int | None = Header(None),
+) -> dict:
+    require_company_scope(payload.companyId, x_proctorcore_company)
+    try:
+        return LivenessService(get_face_matcher()).issue(
+            payload.companyId,
+            payload.userId,
+            payload.contextId,
+            payload.transactionId,
+            payload.enrollment,
+        )
+    except ValueError as exc:
+        code = str(exc)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"code": code, "message": "The live-camera retry limit was reached. Try again later."},
+        ) from exc
+
+
+@compat_router.post("/liveness/challenges/quality", dependencies=[Depends(require_api_auth)])
+def check_liveness_frame_quality(
+    payload: LivenessQualityRequest,
+    x_proctorcore_company: int | None = Header(None),
+) -> dict:
+    require_company_scope(payload.companyId, x_proctorcore_company)
+    content = _decode_base64_image(payload.image)
+    try:
+        return LivenessService(get_face_matcher()).check_frame(
+            payload.challengeId,
+            payload.challengeNonce,
+            payload.companyId,
+            payload.userId,
+            payload.contextId,
+            payload.transactionId,
+            content,
+            payload.enrollment,
+            payload.qualityPolicy,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": str(exc), "message": "The live-camera challenge is no longer valid."},
+        ) from exc
 
 
 @router.post(
@@ -181,6 +259,12 @@ def enroll_face_reference(
     require_company_scope(payload.companyId, x_proctorcore_company)
     settings = get_settings()
     threshold = payload.threshold if payload.threshold is not None else float(settings.identity_pass_threshold)
+    liveness = _validate_reference_liveness(payload, enrollment=True)
+    if liveness is not None and liveness["overall"] != "pass":
+        return _liveness_retry_response(payload, threshold, "enrollment", liveness)
+    quality_policy = dict(payload.qualityPolicy or {})
+    if liveness is not None:
+        quality_policy["skipPassivePad"] = True
     try:
         center_frames = _decode_base64_images(payload.centerImages, payload.centerImage)
         left_frames = _decode_optional_base64_images(payload.leftImages, payload.leftImage)
@@ -189,7 +273,7 @@ def enroll_face_reference(
             center_frames,
             left_frames,
             right_frames,
-            payload.qualityPolicy,
+            quality_policy,
         )
     except (HTTPException, ValueError) as exc:
         logger.warning(
@@ -215,6 +299,9 @@ def enroll_face_reference(
     result["userId"] = payload.userId
     result["phase"] = "enrollment"
     result["referenceSaved"] = False
+    if liveness is not None:
+        result["liveness"] = liveness
+        result["livenessPassed"] = True
 
     if result["result"] != "enrolled":
         logger.info(
@@ -261,8 +348,14 @@ def verify_face_reference(
             detail={"code": "reference_not_found", "message": "No face reference is enrolled for this user."},
         )
 
-    threshold = payload.threshold if payload.threshold is not None else float(settings.identity_pass_threshold)
     reference_key, template = stored
+    threshold = payload.threshold if payload.threshold is not None else float(settings.identity_pass_threshold)
+    liveness = _validate_reference_liveness(payload, enrollment=False)
+    if liveness is not None and liveness["overall"] != "pass":
+        return _liveness_retry_response(payload, threshold, "verify", liveness, reference_key)
+    quality_policy = dict(payload.qualityPolicy or {})
+    if liveness is not None:
+        quality_policy["skipPassivePad"] = True
     try:
         center_frames = _decode_base64_images(payload.centerImages, payload.centerImage)
         _decode_optional_base64_images(payload.leftImages, payload.leftImage)
@@ -271,7 +364,7 @@ def verify_face_reference(
             center_frames,
             template,
             payload.threshold,
-            payload.qualityPolicy,
+            quality_policy,
         )
     except (HTTPException, ValueError) as exc:
         logger.warning(
@@ -297,6 +390,9 @@ def verify_face_reference(
     result["companyId"] = payload.companyId
     result["userId"] = payload.userId
     result["referenceKey"] = reference_key
+    if liveness is not None:
+        result["liveness"] = liveness
+        result["livenessPassed"] = True
     if not result.get("accessAllowed"):
         logger.info(
             "identity verification rejected: transaction=%s company=%s user=%s reason=%s diagnostics=%s",
@@ -382,6 +478,76 @@ def _reference_retry_response(
         response["referenceSaved"] = False
     if reference_key is not None:
         response["referenceKey"] = reference_key
+    return response
+
+
+def _validate_reference_liveness(payload, enrollment: bool) -> dict | None:
+    service = LivenessService(get_face_matcher())
+    if not any(service.required_components(enrollment).values()):
+        return None
+    if not payload.challengeId or not payload.challengeNonce or not payload.contextId:
+        return {
+            "overall": "inconclusive",
+            "reason": "liveness_challenge_missing",
+            "challengeId": payload.challengeId,
+            "usableFrameCount": 0,
+            "invalidFrameCount": 0,
+        }
+    evidence = []
+    for frame in payload.livenessEvidence:
+        try:
+            content = _decode_base64_image(frame.image)
+        except HTTPException:
+            continue
+        evidence.append({
+            "bytes": content,
+            "capturedAtMs": frame.capturedAtMs,
+            "elapsedMs": frame.elapsedMs,
+        })
+    try:
+        return service.validate(
+            payload.challengeId,
+            payload.challengeNonce,
+            payload.companyId,
+            payload.userId,
+            payload.contextId,
+            payload.transactionId,
+            evidence,
+            enrollment,
+            payload.qualityPolicy,
+        )
+    except ValueError as exc:
+        return {
+            "overall": "inconclusive",
+            "reason": str(exc),
+            "challengeId": payload.challengeId,
+            "usableFrameCount": 0,
+            "invalidFrameCount": len(payload.livenessEvidence),
+        }
+
+
+def _liveness_retry_response(payload, threshold: float, phase: str, liveness: dict, reference_key: str | None = None) -> dict:
+    reason = str(liveness.get("reason") or "liveness_inconclusive")
+    passive_reason = str((liveness.get("passivePad") or {}).get("reason") or "")
+    strong_spoof = liveness.get("overall") == "fail" and (
+        reason in {"print_attack", "replay_attack", "illumination_inconsistent"}
+        or passive_reason in {"print_attack", "replay_attack"}
+    )
+    public_reason = "spoof_detected" if strong_spoof else (
+        "liveness_failed" if liveness.get("overall") == "fail" else "liveness_inconclusive"
+    )
+    response = _reference_retry_response(
+        payload.transactionId,
+        payload.companyId,
+        payload.userId,
+        threshold,
+        phase,
+        public_reason,
+        reason,
+        reference_key,
+    )
+    response["liveness"] = liveness
+    response["reason"] = public_reason
     return response
 
 
