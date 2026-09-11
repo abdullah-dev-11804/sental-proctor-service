@@ -41,10 +41,25 @@ class TrackingStore(MemoryStore):
         self.failures = 0
 
 
+class AdaptiveStore(TrackingStore):
+    def __init__(self):
+        super().__init__()
+        self.pose = {}
+
+    def save_pose_progress(self, challenge_id, progress):
+        self.pose[challenge_id] = progress
+
+    def get_pose_progress(self, challenge_id):
+        return self.pose.get(challenge_id, {"expectedStep": 0, "holdFrames": 0, "steps": []})
+
+    def consume_pose_progress(self, challenge_id):
+        return self.pose.pop(challenge_id, None)
+
+
 class FakeMatcher:
-    def analyse_liveness_frame(self, content):
+    def _quality(self, content):
         item = json.loads(content.decode())
-        quality = SimpleNamespace(
+        return SimpleNamespace(
             face_count=item.get("faces", 1),
             brightness=item.get("brightness", 120.0),
             blur=item.get("blur", 120.0),
@@ -60,7 +75,16 @@ class FakeMatcher:
                 "replay": item.get("replay", 0.04),
             },
         )
+
+    def analyse_liveness_frame(self, content, include_headpose=True):
+        quality = self._quality(content)
+        if not include_headpose:
+            quality.headpose_yaw_degrees = None
+        item = json.loads(content.decode())
         return quality, item.get("rgb", [1 / 3, 1 / 3, 1 / 3])
+
+    def analyse_headpose_frame(self, content):
+        return self._quality(content)
 
 
 def settings(**overrides):
@@ -379,3 +403,38 @@ def test_retry_limit_rejects_new_challenge_after_configured_failures():
     validate(service, challenge, evidence_for(challenge, movement="none"))
     with pytest.raises(ValueError, match="liveness_retry_limit_reached"):
         issued(service)
+
+
+def test_adaptive_headpose_advances_only_after_each_pose_is_confirmed():
+    store = AdaptiveStore()
+    service = LivenessService(FakeMatcher(), settings(), store)
+    challenge = issued(service)
+    assert challenge["adaptiveHeadPose"] is True
+
+    yaws = {"center": 0.0, "left": 20.0, "right": -20.0}
+    for index, step in enumerate(challenge["movementSteps"]):
+        image = json.dumps({"yaw": yaws[step["action"]]}).encode()
+        first = service.check_pose_frame(
+            challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
+            "transaction-123", index, image, False,
+        )
+        second = service.check_pose_frame(
+            challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
+            "transaction-123", index, image, False,
+        )
+        assert first["reached"] is False
+        assert second["reached"] is True
+
+    result = validate(service, challenge, evidence_for(challenge))
+    assert result["headPose"]["result"] == "pass"
+
+
+def test_adaptive_headpose_rejects_out_of_order_step():
+    store = AdaptiveStore()
+    service = LivenessService(FakeMatcher(), settings(), store)
+    challenge = issued(service)
+    with pytest.raises(ValueError, match="headpose_step_out_of_order"):
+        service.check_pose_frame(
+            challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
+            "transaction-123", 1, json.dumps({"yaw": 20.0}).encode(), False,
+        )

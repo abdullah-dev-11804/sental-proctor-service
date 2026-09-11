@@ -67,9 +67,24 @@ class LivenessChallengeStore:
     def clear_failures(self, company_id: int, user_id: int, context_id: str) -> None:
         self.redis.delete(self._attempt_key(company_id, user_id, context_id))
 
+    def save_pose_progress(self, challenge_id: str, progress: dict[str, Any]) -> None:
+        ttl = max(10, int(self.settings.identity_liveness_challenge_ttl_seconds))
+        self.redis.set(self._progress_key(challenge_id), json.dumps(progress), ex=ttl)
+
+    def get_pose_progress(self, challenge_id: str) -> dict[str, Any]:
+        raw = self.redis.get(self._progress_key(challenge_id))
+        return json.loads(raw) if raw else {"expectedStep": 0, "holdFrames": 0, "steps": []}
+
+    def consume_pose_progress(self, challenge_id: str) -> dict[str, Any] | None:
+        raw = self.redis.getdel(self._progress_key(challenge_id))
+        return json.loads(raw) if raw else None
+
     def _attempt_key(self, company_id: int, user_id: int, context_id: str) -> str:
         safe_context = self._key(context_id).split(":", 2)[-1]
         return f"proctorcore:liveness-attempts:{int(company_id)}:{int(user_id)}:{safe_context}"
+
+    def _progress_key(self, challenge_id: str) -> str:
+        return f"{self._key(challenge_id)}:pose-progress"
 
     @staticmethod
     def _key(challenge_id: str) -> str:
@@ -82,12 +97,7 @@ class LivenessChallengeStore:
 class LivenessService:
     """Issues and validates temporal PAD, head-pose, and RGB illumination signals."""
 
-    MOVEMENT_SEQUENCES = (
-        ("left", "center"),
-        ("right", "center"),
-        ("left", "center", "right", "center"),
-        ("right", "center", "left", "center"),
-    )
+    MOVEMENT_SEQUENCES = (("left", "center"), ("right", "center"))
     COLOURS = {
         "neutral": {"hex": "#ffffff", "rgb": [1.0, 1.0, 1.0]},
         "red": {"hex": "#ff4d5f", "rgb": [1.0, 0.20, 0.24]},
@@ -125,10 +135,13 @@ class LivenessService:
         movements = list(secrets.choice(self.MOVEMENT_SEQUENCES)) if required["headPose"] else ["center"]
         movement_steps = self._movement_steps(movements)
         illumination = self._illumination_steps() if required["illumination"] else []
+        adaptive_headpose = bool(required["headPose"] and hasattr(self.store, "save_pose_progress"))
+        pose_step_timeout_ms = 3000
         duration_ms = max(
             movement_steps[-1]["endMs"] if movement_steps else 0,
             illumination[-1]["endMs"] if illumination else 0,
             min(timeout_ms, int(self.settings.identity_passive_capture_window_ms)),
+            min(timeout_ms, len(movement_steps) * pose_step_timeout_ms) if adaptive_headpose else 0,
         )
         duration_ms = min(duration_ms, timeout_ms)
         challenge = {
@@ -145,8 +158,22 @@ class LivenessService:
             "required": required,
             "movementSteps": movement_steps,
             "illuminationSteps": illumination,
+            "adaptiveHeadPose": adaptive_headpose,
+            "poseStepTimeoutMs": pose_step_timeout_ms,
+            "minimumCaptureMs": max(
+                illumination[-1]["endMs"] if illumination else 0,
+                min(timeout_ms, int(self.settings.identity_passive_capture_window_ms)),
+            ),
         }
         self.store.save(challenge)
+        if adaptive_headpose:
+            self.store.save_pose_progress(challenge_id, {
+                "expectedStep": 0,
+                "holdFrames": 0,
+                "firstDirectedYaw": None,
+                "lastCenterYaw": 0.0,
+                "steps": [],
+            })
         return self._public_challenge(challenge)
 
     def required_components(self, enrollment: bool) -> dict[str, bool]:
@@ -181,14 +208,28 @@ class LivenessService:
             if hasattr(self.store, "register_failure"):
                 self.store.register_failure(company_id, user_id, context_id)
             raise
-        observations, invalid = self._observations(evidence, enrollment, quality_policy)
+        adaptive_progress = (
+            self.store.consume_pose_progress(challenge_id)
+            if challenge.get("adaptiveHeadPose") and hasattr(self.store, "consume_pose_progress")
+            else None
+        )
+        observations, invalid = self._observations(
+            evidence,
+            enrollment,
+            quality_policy,
+            include_headpose=not bool(challenge.get("adaptiveHeadPose")),
+        )
         passive = self._passive_result(
             observations,
             invalid,
             challenge["required"]["passivePad"],
             int(challenge["durationMs"]),
         )
-        headpose = self._headpose_result(observations, challenge)
+        headpose = (
+            self._adaptive_headpose_result(challenge, adaptive_progress)
+            if challenge.get("adaptiveHeadPose")
+            else self._headpose_result(observations, challenge)
+        )
         illumination = self._illumination_result(observations, challenge)
         components = [passive, headpose, illumination]
         required_results = [item for item in components if item["required"]]
@@ -294,6 +335,87 @@ class LivenessService:
         reason = self._quality_reason(quality, enrollment, quality_policy)
         return {"ready": reason is None, "reason": reason or "ok"}
 
+    def check_pose_frame(
+        self,
+        challenge_id: str,
+        nonce: str,
+        company_id: int,
+        user_id: int,
+        context_id: str,
+        transaction_id: str,
+        step_index: int,
+        image: bytes,
+        enrollment: bool,
+        quality_policy: dict | None = None,
+    ) -> dict[str, Any]:
+        challenge = self.store.get(challenge_id)
+        self._validate_binding(
+            challenge, nonce, company_id, user_id, context_id, transaction_id, enrollment,
+        )
+        if not challenge.get("adaptiveHeadPose") or not hasattr(self.store, "get_pose_progress"):
+            raise ValueError("adaptive_headpose_unavailable")
+        steps = challenge.get("movementSteps") or []
+        progress = self.store.get_pose_progress(challenge_id)
+        expected = int(progress.get("expectedStep", 0))
+        if step_index != expected or step_index < 0 or step_index >= len(steps):
+            raise ValueError("headpose_step_out_of_order")
+        try:
+            quality = self.matcher.analyse_headpose_frame(image)
+        except ValueError:
+            return {"reached": False, "reason": "invalid_image", "stepIndex": step_index}
+        reason = self._quality_reason(quality, enrollment, quality_policy)
+        if reason:
+            return {"reached": False, "reason": reason, "stepIndex": step_index}
+        yaw = quality.headpose_yaw_degrees
+        if yaw is None:
+            return {"reached": False, "reason": "headpose_unavailable", "stepIndex": step_index}
+
+        action = str(steps[step_index]["action"])
+        sign = 1 if int(self.settings.identity_headpose_left_sign) >= 0 else -1
+        directed = float(yaw) * sign if action == "left" else -float(yaw) * sign
+        matches = abs(float(yaw)) <= float(self.settings.identity_headpose_center_degrees) if action == "center" else (
+            directed >= float(self.settings.identity_headpose_turn_degrees)
+        )
+        first = progress.get("firstDirectedYaw")
+        if first is None:
+            baseline_yaw = float(progress.get("lastCenterYaw", 0.0))
+            first = (
+                baseline_yaw * sign if action == "left"
+                else -baseline_yaw * sign if action == "right"
+                else 0.0
+            )
+        progressive = action == "center" or (
+            directed - float(first) >= float(self.settings.identity_headpose_min_progress_degrees)
+        )
+        hold_frames = int(progress.get("holdFrames", 0)) + 1 if matches and progressive else 0
+        reached = hold_frames >= max(1, int(self.settings.identity_headpose_min_hold_frames))
+        if reached:
+            progress.setdefault("steps", []).append({
+                "step": step_index,
+                "action": action,
+                "result": "pass",
+                "observedYaw": round(float(yaw), 2),
+            })
+            progress["expectedStep"] = step_index + 1
+            progress["holdFrames"] = 0
+            progress["firstDirectedYaw"] = None
+            if action == "center":
+                progress["lastCenterYaw"] = float(yaw)
+        else:
+            progress["holdFrames"] = hold_frames
+            progress["firstDirectedYaw"] = first
+        self.store.save_pose_progress(challenge_id, progress)
+        logger.info(
+            "headpose_progress challenge=%s company=%s user=%s step=%s action=%s yaw=%.2f hold=%s reached=%s",
+            challenge_id, company_id, user_id, step_index, action, float(yaw), hold_frames, reached,
+        )
+        return {
+            "reached": reached,
+            "reason": "pose_confirmed" if reached else "keep_moving",
+            "stepIndex": step_index,
+            "nextStepIndex": int(progress["expectedStep"]),
+        }
+
     def _required_components(self, enrollment: bool) -> dict[str, bool]:
         active = bool(
             self.settings.identity_active_liveness_enabled
@@ -349,6 +471,9 @@ class LivenessService:
             "components": challenge["required"],
             "movementSteps": challenge["movementSteps"],
             "illuminationSteps": challenge["illuminationSteps"],
+            "adaptiveHeadPose": bool(challenge.get("adaptiveHeadPose")),
+            "poseStepTimeoutMs": int(challenge.get("poseStepTimeoutMs", 3000)),
+            "minimumCaptureMs": int(challenge.get("minimumCaptureMs", 0)),
         }
 
     @staticmethod
@@ -398,6 +523,7 @@ class LivenessService:
         evidence: list[dict[str, Any]],
         enrollment: bool,
         quality_policy: dict | None,
+        include_headpose: bool = True,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         valid, invalid = [], []
         previous_elapsed = -1
@@ -408,7 +534,10 @@ class LivenessService:
                 continue
             previous_elapsed = elapsed
             try:
-                quality, chromaticity = self.matcher.analyse_liveness_frame(item["bytes"])
+                quality, chromaticity = self.matcher.analyse_liveness_frame(
+                    item["bytes"],
+                    include_headpose=include_headpose,
+                )
             except (ValueError, KeyError):
                 invalid.append({"reason": "invalid_image"})
                 continue
@@ -423,6 +552,32 @@ class LivenessService:
                 "chromaticity": chromaticity,
             })
         return valid, invalid
+
+    @staticmethod
+    def _adaptive_headpose_result(
+        challenge: dict[str, Any],
+        progress: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        required = bool(challenge["required"]["headPose"])
+        steps = challenge.get("movementSteps") or []
+        completed = int((progress or {}).get("expectedStep", 0))
+        if not required:
+            return {"required": False, "result": "pass", "reason": "disabled", "steps": []}
+        if completed >= len(steps):
+            return {
+                "required": True,
+                "result": "pass",
+                "reason": "headpose_complete",
+                "steps": list((progress or {}).get("steps", [])),
+            }
+        return {
+            "required": True,
+            "result": "fail",
+            "reason": "headpose_sequence_failed",
+            "steps": list((progress or {}).get("steps", [])),
+            "completedSteps": completed,
+            "requiredSteps": len(steps),
+        }
 
     def _quality_reason(self, quality, enrollment: bool, policy: dict | None) -> str | None:
         if quality.face_count < 1:

@@ -93,6 +93,10 @@ class LivenessQualityRequest(LivenessChallengeRequest):
     qualityPolicy: dict | None = None
 
 
+class LivenessPoseRequest(LivenessQualityRequest):
+    stepIndex: int = Field(ge=0, le=8)
+
+
 class FaceReferenceResetRequest(BaseModel):
     reason: str | None = Field(default=None, max_length=1000)
 
@@ -142,6 +146,33 @@ def check_liveness_frame_quality(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": str(exc), "message": "The live-camera challenge is no longer valid."},
+        ) from exc
+
+
+@compat_router.post("/liveness/challenges/pose", dependencies=[Depends(require_api_auth)])
+def check_liveness_pose(
+    payload: LivenessPoseRequest,
+    x_proctorcore_company: int | None = Header(None),
+) -> dict:
+    require_company_scope(payload.companyId, x_proctorcore_company)
+    content = _decode_base64_image(payload.image)
+    try:
+        return LivenessService(get_face_matcher()).check_pose_frame(
+            payload.challengeId,
+            payload.challengeNonce,
+            payload.companyId,
+            payload.userId,
+            payload.contextId,
+            payload.transactionId,
+            payload.stepIndex,
+            content,
+            payload.enrollment,
+            payload.qualityPolicy,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": str(exc), "message": "The live-camera movement step is no longer valid."},
         ) from exc
 
 

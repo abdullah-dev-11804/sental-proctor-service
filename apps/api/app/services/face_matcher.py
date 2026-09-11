@@ -781,13 +781,27 @@ class FaceMatcher:
             return embedding, self._face_quality(quality)
         return None, self._face_quality(self.advanced_engine.analyse(image))
 
-    def analyse_liveness_frame(self, content: bytes) -> tuple[FaceQuality, list[float] | None]:
+    def analyse_liveness_frame(
+        self,
+        content: bytes,
+        include_headpose: bool = True,
+    ) -> tuple[FaceQuality, list[float] | None]:
         """Runs only detection/PAD/head-pose/illumination measurements, never AdaFace."""
         if self.advanced_engine is None:
             raise RuntimeError("Advanced face engine is not loaded.")
         image = self._decode_image(content)
-        quality, chromaticity = self.advanced_engine.analyse_liveness(image)
+        quality, chromaticity = self.advanced_engine.analyse_liveness(
+            image,
+            include_headpose=include_headpose,
+        )
         return self._face_quality(quality), chromaticity
+
+    def analyse_headpose_frame(self, content: bytes) -> FaceQuality:
+        """Runs only detection, capture quality, and SixDRepNet head pose."""
+        if self.advanced_engine is None:
+            raise RuntimeError("Advanced face engine is not loaded.")
+        image = self._decode_image(content)
+        return self._face_quality(self.advanced_engine.analyse_headpose(image))
 
     @staticmethod
     def _face_quality(advanced_quality) -> FaceQuality:
