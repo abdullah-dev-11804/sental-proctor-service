@@ -38,6 +38,15 @@ class _Detector:
         return np.asarray([[40, 30, 80, 90, 0.96]], dtype=np.float32), None
 
 
+class _ThresholdDetector(_Detector):
+    def __init__(self) -> None:
+        self.threshold = None
+
+    def detect(self, _image, threshold, max_num, metric):
+        self.threshold = threshold
+        return np.asarray([[40, 30, 80, 90, 0.36]], dtype=np.float32), None
+
+
 def test_quality_analysis_does_not_run_adaface(monkeypatch) -> None:
     engine = AdvancedFaceEngine.__new__(AdvancedFaceEngine)
     quality = AdvancedFaceQuality(
@@ -96,6 +105,17 @@ def test_antispoof_preserves_single_probability_output() -> None:
     assert np.isclose(engine._antispoof_score(image, bbox), 0.93)
 
 
+def test_antispoof_crop_preserves_the_detected_box_aspect_ratio() -> None:
+    engine = AdvancedFaceEngine.__new__(AdvancedFaceEngine)
+    image = np.full((300, 300, 3), 127, dtype=np.uint8)
+    bbox = np.asarray([100, 75, 150, 175, 0.99], dtype=np.float32)
+
+    crop = engine._crop_bbox_scaled(image, bbox, scale=2.0)
+
+    assert crop.shape[0] == 201
+    assert crop.shape[1] == 101
+
+
 def test_detected_face_quality_ignores_dark_background(monkeypatch) -> None:
     engine = AdvancedFaceEngine.__new__(AdvancedFaceEngine)
     engine.settings = SimpleNamespace(
@@ -112,3 +132,21 @@ def test_detected_face_quality_ignores_dark_background(monkeypatch) -> None:
 
     assert quality.brightness > 100
     assert quality.face_count == 1
+
+
+def test_headpose_detection_can_use_its_lower_movement_threshold(monkeypatch) -> None:
+    engine = AdvancedFaceEngine.__new__(AdvancedFaceEngine)
+    engine.settings = SimpleNamespace(
+        identity_min_face_confidence=0.65,
+        identity_headpose_min_face_confidence=0.30,
+        identity_antispoof_threshold=0.78,
+    )
+    engine.detector = _ThresholdDetector()
+    monkeypatch.setattr(engine, "_antispoof_scores", lambda _image, _bbox: None)
+    monkeypatch.setattr(engine, "_headpose_yaw", lambda _image, _bbox: -18.0)
+
+    quality = engine.analyse_headpose(np.full((120, 120, 3), 127, dtype=np.uint8))
+
+    assert engine.detector.threshold == 0.30
+    assert quality.face_count == 1
+    assert quality.headpose_yaw_degrees == -18.0

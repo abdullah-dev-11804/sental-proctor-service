@@ -321,6 +321,7 @@ class AdvancedFaceEngine:
             image,
             include_antispoof=False,
             include_headpose=True,
+            detection_threshold=float(self.settings.identity_headpose_min_face_confidence),
         )
         return quality
 
@@ -349,6 +350,7 @@ class AdvancedFaceEngine:
         include_liveness_signals: bool = True,
         include_antispoof: bool | None = None,
         include_headpose: bool | None = None,
+        detection_threshold: float | None = None,
     ) -> tuple[np.ndarray | None, np.ndarray | None, AdvancedFaceQuality]:
         height, width = image.shape[:2]
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -357,7 +359,10 @@ class AdvancedFaceEngine:
 
         bboxes, keypoints = self.detector.detect(
             image,
-            threshold=float(self.settings.identity_min_face_confidence),
+            threshold=float(
+                self.settings.identity_min_face_confidence
+                if detection_threshold is None else detection_threshold
+            ),
             max_num=0,
             metric="default",
         )
@@ -553,28 +558,37 @@ class AdvancedFaceEngine:
         x1, y1, x2, y2 = [float(value) for value in bbox[:4]]
         width = max(1.0, x2 - x1)
         height = max(1.0, y2 - y1)
-        side = max(width, height) * max(1.0, float(scale))
-        side_int = max(1, int(round(side)))
+        applied_scale = min(
+            max(1.0, float(scale)),
+            (image.shape[1] - 1) / width,
+            (image.shape[0] - 1) / height,
+        )
+        crop_width = width * applied_scale
+        crop_height = height * applied_scale
         center_x = (x1 + x2) / 2.0
         center_y = (y1 + y2) / 2.0
-        left = int(round(center_x - (side / 2.0)))
-        top = int(round(center_y - (side / 2.0)))
-        right = left + side_int
-        bottom = top + side_int
-
-        crop = np.zeros((side_int, side_int, 3), dtype=image.dtype)
-        source_left = max(0, left)
-        source_top = max(0, top)
-        source_right = min(image.shape[1], right)
-        source_bottom = min(image.shape[0], bottom)
-        if source_right <= source_left or source_bottom <= source_top:
-            return crop
-
-        dest_left = source_left - left
-        dest_top = source_top - top
-        dest_right = dest_left + (source_right - source_left)
-        dest_bottom = dest_top + (source_bottom - source_top)
-        crop[dest_top:dest_bottom, dest_left:dest_right] = image[source_top:source_bottom, source_left:source_right]
+        left = center_x - (crop_width / 2.0)
+        top = center_y - (crop_height / 2.0)
+        right = center_x + (crop_width / 2.0)
+        bottom = center_y + (crop_height / 2.0)
+        if left < 0:
+            right -= left
+            left = 0
+        if top < 0:
+            bottom -= top
+            top = 0
+        if right > image.shape[1] - 1:
+            left -= right - image.shape[1] + 1
+            right = image.shape[1] - 1
+        if bottom > image.shape[0] - 1:
+            top -= bottom - image.shape[0] + 1
+            bottom = image.shape[0] - 1
+        left, top = max(0, int(left)), max(0, int(top))
+        right = min(image.shape[1] - 1, int(right))
+        bottom = min(image.shape[0] - 1, int(bottom))
+        crop = image[top:bottom + 1, left:right + 1]
+        if crop.size == 0:
+            return np.zeros((80, 80, 3), dtype=np.uint8)
         return crop
 
     def _crop_bbox(self, image: np.ndarray, bbox: np.ndarray, margin_ratio: float) -> np.ndarray:

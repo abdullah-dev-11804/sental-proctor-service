@@ -96,7 +96,7 @@ class LivenessQualityRequest(LivenessChallengeRequest):
 
 class LivenessPoseRequest(LivenessQualityRequest):
     stepIndex: int = Field(ge=0, le=8)
-    images: list[str] = Field(default_factory=list, max_length=4)
+    images: list[str] = Field(default_factory=list, max_length=8)
 
 
 class FaceReferenceResetRequest(BaseModel):
@@ -588,7 +588,14 @@ def _liveness_retry_response(payload, threshold: float, phase: str, liveness: di
     if strong_spoof:
         public_reason = "spoof_detected"
     elif liveness.get("overall") != "fail":
-        public_reason = "liveness_inconclusive"
+        if reason in {"unstable_capture_quality", "face_disappeared"}:
+            public_reason = "liveness_capture_unstable"
+        elif passive.get("result") == "fail":
+            public_reason = "passive_liveness_failed"
+        elif illumination.get("result") == "inconclusive":
+            public_reason = "illumination_liveness_inconclusive"
+        else:
+            public_reason = "liveness_inconclusive"
     elif headpose.get("required") and headpose.get("result") == "fail":
         public_reason = "liveness_failed"
     elif passive.get("required") and passive.get("result") == "fail":

@@ -17,11 +17,13 @@ a differently exported model.
 
 Challenges are tenant/user/quiz/transaction bound, stored in Redis, short-lived, and consumed once. Raw images and embeddings are not written by the liveness validator. Numeric component diagnostics are returned to trusted Moodle code and logged in summarized form.
 
+Challenge evidence uses the movement-safe liveness quality limits. The stricter enrollment limits are applied only to the final straight reference frames before a reusable template is stored.
+
 ## API contract
 
 - `POST /api/v1/identity/liveness/challenges` issues the challenge.
 - `POST /api/v1/identity/liveness/challenges/quality` checks one starting frame without consuming the challenge.
-- `POST /api/v1/identity/liveness/challenges/pose` analyses a chronological burst of up to four movement frames without consuming the challenge.
+- `POST /api/v1/identity/liveness/challenges/pose` analyses a chronological burst of up to eight movement frames without consuming the challenge.
 - `POST /api/v1/identity/references/enroll` and `POST /api/v1/identity/references/verify` accept `contextId`, `challengeId`, `challengeNonce`, and timestamped `livenessEvidence`.
 
 The issue and quality endpoints require the existing API bearer token and matching `X-ProctorCore-Company` header. The final enrollment/verification request consumes the challenge before validation, so a challenge cannot be accepted twice.
@@ -39,6 +41,7 @@ The following values require calibration from client-environment validation data
 - `IDENTITY_HEADPOSE_TURN_DEGREES`
 - `IDENTITY_HEADPOSE_CENTER_DEGREES`
 - `IDENTITY_HEADPOSE_MIN_PROGRESS_DEGREES`
+- `IDENTITY_HEADPOSE_MIN_FACE_CONFIDENCE`
 - `IDENTITY_HEADPOSE_LEFT_SIGN`
 - `IDENTITY_ILLUMINATION_MIN_RESPONSE`
 - `IDENTITY_ILLUMINATION_PASS_CORRELATION`
@@ -92,3 +95,5 @@ docker compose logs -f api | grep --line-buffered -E \
 `liveness_challenge_issued` records the actual randomized movement sequence. Every pose frame then produces either `headpose_progress` with yaw, baseline, directed delta, required delta and hold count, or `headpose_frame_rejected` with the exact quality reason and numeric quality measurements.
 
 For a requested turn, `directed_delta` must increase toward `required_delta`. The validated SixDRepNet export and mirrored SENTAL preview use `IDENTITY_HEADPOSE_LEFT_SIGN=-1`: a user's left turn produces a negative raw yaw delta and a positive directed delta. Revalidate this setting if the model export or capture mirroring changes. Do not lower the turn threshold to compensate for an inverted sign.
+
+`IDENTITY_HEADPOSE_MIN_FACE_CONFIDENCE` applies only while the user is turning. It allows SCRFD to retain a partially rotated face without weakening the stricter straight-pose and reusable-reference quality gates.

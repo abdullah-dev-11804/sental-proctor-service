@@ -64,7 +64,7 @@ class FakeMatcher:
             brightness=item.get("brightness", 120.0),
             blur=item.get("blur", 120.0),
             confidence=item.get("confidence", 0.96),
-            face_width=320,
+            face_width=item.get("face_width", 320),
             width=1000,
             face_center_x=item.get("center_x", 0.5),
             face_center_y=item.get("center_y", 0.5),
@@ -109,6 +109,7 @@ def settings(**overrides):
         "identity_liveness_min_brightness": 30.0,
         "identity_liveness_min_blur": 15.0,
         "identity_liveness_min_face_confidence": 0.55,
+        "identity_headpose_min_face_confidence": 0.30,
         "identity_liveness_min_face_width_ratio": 0.12,
         "identity_liveness_max_face_width_ratio": 0.75,
         "identity_liveness_center_tolerance_x": 0.30,
@@ -386,6 +387,21 @@ def test_quality_probe_provides_framing_feedback_without_consuming_challenge():
     assert challenge["challengeId"] in store.items
 
 
+def test_enrollment_quality_probe_requires_reference_grade_confidence():
+    store = MemoryStore()
+    service = LivenessService(FakeMatcher(), settings(), store)
+    challenge = service.issue(3, 245, "quiz:10", "transaction-123", True)
+
+    result = service.check_frame(
+        challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
+        "transaction-123", json.dumps({"confidence": 0.70}).encode(), True,
+    )
+
+    assert result["ready"] is False
+    assert result["reason"] == "low_face_confidence"
+    assert challenge["challengeId"] in store.items
+
+
 def test_retry_limit_counts_failures_and_success_clears_them():
     store = TrackingStore()
     service = LivenessService(FakeMatcher(), settings(identity_liveness_retry_limit=2), store)
@@ -533,3 +549,60 @@ def test_pose_frames_use_movement_quality_not_strict_enrollment_quality():
     )
 
     assert result["reached"] is True
+
+
+def test_turn_frames_use_pose_confidence_without_weakening_straight_capture(monkeypatch):
+    monkeypatch.setattr("secrets.choice", lambda _items: ("left", "center"))
+    store = AdaptiveStore()
+    service = LivenessService(FakeMatcher(), settings(), store)
+    challenge = service.issue(3, 245, "quiz:10", "transaction-123", True)
+
+    straight = json.dumps({"yaw": 0.0, "confidence": 0.90}).encode()
+    for _ in range(2):
+        service.check_pose_frame(
+            challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
+            "transaction-123", 0, straight, True,
+        )
+
+    turned = json.dumps({"yaw": -18.0, "confidence": 0.35}).encode()
+    first = service.check_pose_frame(
+        challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
+        "transaction-123", 1, turned, True,
+    )
+    second = service.check_pose_frame(
+        challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
+        "transaction-123", 1, turned, True,
+    )
+
+    assert first["reached"] is False
+    assert second["reached"] is True
+
+
+def test_enrollment_liveness_evidence_uses_liveness_not_reference_quality(monkeypatch):
+    monkeypatch.setattr("secrets.choice", lambda _items: ("left", "center"))
+    store = AdaptiveStore()
+    service = LivenessService(FakeMatcher(), settings(), store)
+    challenge = service.issue(3, 245, "quiz:10", "transaction-123", True)
+
+    for index, yaw in enumerate((0.0, -20.0, 0.0)):
+        pose = json.dumps({"yaw": yaw, "confidence": 0.90}).encode()
+        for _ in range(2):
+            service.check_pose_frame(
+                challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
+                "transaction-123", index, pose, True,
+            )
+
+    frames = evidence_for(challenge)
+    for frame in frames:
+        payload = json.loads(frame["bytes"].decode())
+        payload["confidence"] = 0.60
+        payload["face_width"] = 150
+        frame["bytes"] = json.dumps(payload).encode()
+
+    result = service.validate(
+        challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
+        "transaction-123", frames, True,
+    )
+
+    assert result["invalidFrameCount"] == 0
+    assert result["overall"] == "pass"

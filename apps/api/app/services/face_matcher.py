@@ -599,6 +599,7 @@ class FaceMatcher:
                 "pose_min_brightness": float(self.settings.identity_liveness_min_brightness),
                 "pose_min_blur": float(self.settings.identity_liveness_min_blur),
                 "pose_min_face_confidence": float(self.settings.identity_liveness_min_face_confidence),
+                "headpose_min_face_confidence": float(self.settings.identity_headpose_min_face_confidence),
                 "pose_min_face_width_ratio": float(self.settings.identity_liveness_min_face_width_ratio),
                 "pose_max_face_width_ratio": float(self.settings.identity_liveness_max_face_width_ratio),
             },

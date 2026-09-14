@@ -324,7 +324,7 @@ class LivenessService:
         elif overall == "fail" and hasattr(self.store, "register_failure"):
             self.store.register_failure(company_id, user_id, context_id)
         logger.info(
-            "liveness_result challenge=%s company=%s user=%s overall=%s reason=%s usable=%s invalid=%s passive=%s:%s aggregate=%s head=%s:%s steps=%s illumination=%s:%s correlation=%s capture_ms=%s processing_ms=%s",
+            "liveness_result challenge=%s company=%s user=%s overall=%s reason=%s usable=%s invalid=%s invalid_reasons=%s passive=%s:%s aggregate=%s head=%s:%s steps=%s illumination=%s:%s correlation=%s capture_ms=%s processing_ms=%s",
             challenge_id,
             company_id,
             user_id,
@@ -332,6 +332,7 @@ class LivenessService:
             reason,
             len(observations),
             len(invalid),
+            invalid_reasons,
             passive["result"],
             passive["reason"],
             passive.get("aggregate"),
@@ -370,7 +371,11 @@ class LivenessService:
                 challenge_id, company_id, user_id,
             )
             return {"ready": False, "reason": "invalid_image"}
-        reason = self._pose_quality_reason(quality, "center")
+        reason = (
+            self._quality_reason(quality, True, quality_policy)
+            if enrollment
+            else self._pose_quality_reason(quality, "center")
+        )
         diagnostics = self._pose_diagnostics(quality)
         logger.info(
             "liveness_quality challenge=%s company=%s user=%s ready=%s reason=%s quality=%s",
@@ -397,7 +402,7 @@ class LivenessService:
         last: dict[str, Any] | None = None
         processed = 0
         rejected = 0
-        for image in images[:4]:
+        for image in images[:8]:
             last = self.check_pose_frame(
                 challenge_id,
                 nonce,
@@ -425,7 +430,7 @@ class LivenessService:
             company_id,
             user_id,
             step_index,
-            min(len(images), 4),
+            min(len(images), 8),
             processed,
             rejected,
             bool(result.get("reached")),
@@ -706,7 +711,9 @@ class LivenessService:
             except (ValueError, KeyError):
                 invalid.append({"reason": "invalid_image"})
                 continue
-            reason = self._quality_reason(quality, enrollment, quality_policy)
+            # Liveness evidence is captured while screen illumination changes. Its
+            # movement-safe limits are separate from reusable-reference quality.
+            reason = self._pose_quality_reason(quality, "center")
             if reason:
                 invalid.append({"reason": reason})
                 continue
@@ -758,9 +765,14 @@ class LivenessService:
             return "low_light"
         if quality.blur < float(self.settings.identity_liveness_min_blur):
             return "blurry"
+        minimum_confidence = float(
+            self.settings.identity_liveness_min_face_confidence
+            if action == "center"
+            else self.settings.identity_headpose_min_face_confidence
+        )
         if (
             quality.confidence is not None
-            and quality.confidence < float(self.settings.identity_liveness_min_face_confidence)
+            and quality.confidence < minimum_confidence
         ):
             return "low_face_confidence"
         ratio = quality.face_width / max(1, quality.width)

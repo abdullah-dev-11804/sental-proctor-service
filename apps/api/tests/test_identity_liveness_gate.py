@@ -120,3 +120,21 @@ def test_uncorroborated_passive_failure_is_not_reported_as_proven_spoof(monkeypa
     result = identity_api._liveness_retry_response(payload(), 0.85, "enrollment", liveness)
 
     assert result["result"] == "liveness_failed"
+
+
+def test_conflicting_passive_signal_reports_the_specific_retry_reason(monkeypatch):
+    monkeypatch.setattr(identity_api, "get_face_matcher", lambda: FakeMatcher())
+    liveness = {
+        "overall": "inconclusive",
+        "reason": "liveness_signal_conflict",
+        "passivePad": {
+            "result": "fail",
+            "aggregate": {"live": 0.01, "print": 0.01, "replay": 0.98},
+        },
+        "headPose": {"required": True, "result": "pass"},
+        "illumination": {"required": True, "result": "pass"},
+    }
+
+    result = identity_api._liveness_retry_response(payload(), 0.85, "enrollment", liveness)
+
+    assert result["result"] == "passive_liveness_failed"

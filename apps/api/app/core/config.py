@@ -85,6 +85,7 @@ class Settings(BaseSettings):
     identity_liveness_min_brightness: float = 30.0
     identity_liveness_min_blur: float = 15.0
     identity_liveness_min_face_confidence: float = 0.55
+    identity_headpose_min_face_confidence: float = 0.30
     identity_liveness_min_face_width_ratio: float = 0.12
     identity_liveness_max_face_width_ratio: float = 0.75
     identity_liveness_center_tolerance_x: float = 0.30
