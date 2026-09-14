@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     identity_passive_capture_window_ms: int = 4500
     identity_antispoof_model: str = ""
     identity_antispoof_input_size: int = 80
+    identity_antispoof_input_range: str = "raw_255"
     # Upstream Silent-Face-Anti-Spoofing MiniFASNet models use class 1 for a real face.
     identity_antispoof_live_class_index: int = 1
     identity_antispoof_crop_scale: float = 2.7

@@ -252,6 +252,7 @@ class AdvancedFaceEngine:
             "antispoof_model_exists": self._model_path(self.settings.identity_antispoof_model).is_file() if str(self.settings.identity_antispoof_model).strip() else False,
             "antispoof_input_shape": self._session_shape(self.antispoof, "input"),
             "antispoof_output_shape": self._session_shape(self.antispoof, "output"),
+            "antispoof_input_range": str(self.settings.identity_antispoof_input_range).strip().lower(),
             "antispoof_live_class_index": int(self.settings.identity_antispoof_live_class_index),
             "antispoof_crop_scale": float(self.settings.identity_antispoof_crop_scale),
             "headpose_model_exists": self._model_path(self.settings.identity_headpose_model).is_file() if str(self.settings.identity_headpose_model).strip() else False,
@@ -468,13 +469,7 @@ class AdvancedFaceEngine:
         if getattr(self, "antispoof", None) is None:
             return None
         crop = self._crop_bbox_scaled(image, bbox, scale=float(self.settings.identity_antispoof_crop_scale))
-        input_tensor = self._generic_image_tensor(
-            crop,
-            int(self.settings.identity_antispoof_input_size),
-            mean=0.0,
-            std=1.0,
-            bgr=True,
-        )
+        input_tensor = self._antispoof_image_tensor(crop)
         input_name = self.antispoof.get_inputs()[0].name
         output = np.asarray(self.antispoof.run(None, {input_name: input_tensor})[0]).reshape(-1)
         if output.size == 1:
@@ -495,6 +490,17 @@ class AdvancedFaceEngine:
             "print": remaining[0] if remaining else 0.0,
             "replay": remaining[1] if len(remaining) > 1 else max(0.0, 1.0 - live - sum(remaining)),
         }
+
+    def _antispoof_image_tensor(self, image: np.ndarray) -> np.ndarray:
+        """Matches the input convention used by the approved upstream-weight ONNX export."""
+        size = int(self.settings.identity_antispoof_input_size)
+        resized = cv2.resize(image, (size, size), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+        input_range = str(getattr(self.settings, "identity_antispoof_input_range", "raw_255")).strip().lower()
+        if input_range == "unit_1":
+            resized /= 255.0
+        elif input_range != "raw_255":
+            raise RuntimeError(f"Unsupported MiniFASNet input range: {input_range}")
+        return np.transpose(resized, (2, 0, 1))[None, :, :, :].astype(np.float32)
 
     def _facial_chromaticity(
         self,

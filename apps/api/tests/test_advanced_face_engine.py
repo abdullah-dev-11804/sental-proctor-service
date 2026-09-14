@@ -24,6 +24,7 @@ def _antispoof_engine(output, live_class_index=0) -> AdvancedFaceEngine:
     engine.settings = SimpleNamespace(
         identity_antispoof_crop_scale=2.7,
         identity_antispoof_input_size=80,
+        identity_antispoof_input_range="raw_255",
         identity_antispoof_live_class_index=live_class_index,
     )
     engine.antispoof = _AntiSpoofSession(output)
@@ -103,6 +104,30 @@ def test_antispoof_preserves_single_probability_output() -> None:
     bbox = np.asarray([30, 30, 90, 90, 0.99], dtype=np.float32)
 
     assert np.isclose(engine._antispoof_score(image, bbox), 0.93)
+
+
+def test_antispoof_uses_upstream_raw_bgr_pixel_range() -> None:
+    engine = _antispoof_engine([[0.03, 0.94, 0.03]], live_class_index=1)
+    image = np.zeros((80, 80, 3), dtype=np.uint8)
+    image[:, :, 0] = 10
+    image[:, :, 1] = 20
+    image[:, :, 2] = 30
+
+    tensor = engine._antispoof_image_tensor(image)
+
+    assert tensor.shape == (1, 3, 80, 80)
+    assert tensor.dtype == np.float32
+    assert tensor[0, :, 0, 0].tolist() == [10.0, 20.0, 30.0]
+
+
+def test_antispoof_unit_range_remains_available_for_other_exports() -> None:
+    engine = _antispoof_engine([[0.03, 0.94, 0.03]], live_class_index=1)
+    engine.settings.identity_antispoof_input_range = "unit_1"
+    image = np.full((80, 80, 3), 255, dtype=np.uint8)
+
+    tensor = engine._antispoof_image_tensor(image)
+
+    assert np.allclose(tensor, 1.0)
 
 
 def test_antispoof_crop_preserves_the_detected_box_aspect_ratio() -> None:
