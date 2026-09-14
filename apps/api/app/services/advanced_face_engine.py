@@ -257,6 +257,10 @@ class AdvancedFaceEngine:
             "headpose_model_exists": self._model_path(self.settings.identity_headpose_model).is_file() if str(self.settings.identity_headpose_model).strip() else False,
             "headpose_input_shape": self._session_shape(self.headpose, "input"),
             "headpose_output_shape": self._session_shape(self.headpose, "output"),
+            "headpose_left_sign": int(self.settings.identity_headpose_left_sign),
+            "headpose_turn_degrees": float(self.settings.identity_headpose_turn_degrees),
+            "headpose_center_degrees": float(self.settings.identity_headpose_center_degrees),
+            "headpose_step_timeout_ms": int(self.settings.identity_headpose_step_timeout_ms),
         }
 
     def describe_runtime(self) -> dict[str, Any]:
@@ -287,6 +291,14 @@ class AdvancedFaceEngine:
     def analyse(self, image: np.ndarray) -> AdvancedFaceQuality:
         """Runs detection, anti-spoofing, and head pose without AdaFace."""
         _bbox, _keypoints, quality = self._detect_and_measure(image)
+        return quality
+
+    def analyse_capture_quality(self, image: np.ndarray) -> AdvancedFaceQuality:
+        """Runs SCRFD and image-quality measurements without any liveness model."""
+        _bbox, _keypoints, quality = self._detect_and_measure(
+            image,
+            include_liveness_signals=False,
+        )
         return quality
 
     def analyse_liveness(

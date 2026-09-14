@@ -96,6 +96,7 @@ class LivenessQualityRequest(LivenessChallengeRequest):
 
 class LivenessPoseRequest(LivenessQualityRequest):
     stepIndex: int = Field(ge=0, le=8)
+    images: list[str] = Field(default_factory=list, max_length=4)
 
 
 class FaceReferenceResetRequest(BaseModel):
@@ -156,9 +157,10 @@ def check_liveness_pose(
     x_proctorcore_company: int | None = Header(None),
 ) -> dict:
     require_company_scope(payload.companyId, x_proctorcore_company)
-    content = _decode_base64_image(payload.image)
+    encoded = payload.images if payload.images else [payload.image]
+    contents = [_decode_base64_image(image) for image in encoded]
     try:
-        return LivenessService(get_face_matcher()).check_pose_frame(
+        return LivenessService(get_face_matcher()).check_pose_frames(
             payload.challengeId,
             payload.challengeNonce,
             payload.companyId,
@@ -166,7 +168,7 @@ def check_liveness_pose(
             payload.contextId,
             payload.transactionId,
             payload.stepIndex,
-            content,
+            contents,
             payload.enrollment,
             payload.qualityPolicy,
         )

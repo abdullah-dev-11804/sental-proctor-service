@@ -3,7 +3,7 @@
 The pre-quiz identity gate uses independent liveness and identity decisions:
 
 1. Moodle requests a one-use challenge from the Proctoring Server.
-2. SCRFD and the existing quality policy validate every captured frame.
+2. SCRFD applies movement-safe quality limits to liveness frames. The stricter enrollment policy is still applied separately before any reusable reference is stored.
 3. MiniFASNet-V2 scores multiple frames; median live/print/replay scores produce `pass`, `fail`, or `inconclusive`.
 4. SixDRepNet validates a randomized temporal head-pose sequence.
 5. The illumination validator compares facial chromaticity changes with the randomized server-issued colour sequence.
@@ -21,6 +21,7 @@ Challenges are tenant/user/quiz/transaction bound, stored in Redis, short-lived,
 
 - `POST /api/v1/identity/liveness/challenges` issues the challenge.
 - `POST /api/v1/identity/liveness/challenges/quality` checks one starting frame without consuming the challenge.
+- `POST /api/v1/identity/liveness/challenges/pose` analyses a chronological burst of up to four movement frames without consuming the challenge.
 - `POST /api/v1/identity/references/enroll` and `POST /api/v1/identity/references/verify` accept `contextId`, `challengeId`, `challengeNonce`, and timestamped `livenessEvidence`.
 
 The issue and quality endpoints require the existing API bearer token and matching `X-ProctorCore-Company` header. The final enrollment/verification request consumes the challenge before validation, so a challenge cannot be accepted twice.
@@ -38,6 +39,7 @@ The following values require calibration from client-environment validation data
 - `IDENTITY_HEADPOSE_TURN_DEGREES`
 - `IDENTITY_HEADPOSE_CENTER_DEGREES`
 - `IDENTITY_HEADPOSE_MIN_PROGRESS_DEGREES`
+- `IDENTITY_HEADPOSE_LEFT_SIGN`
 - `IDENTITY_ILLUMINATION_MIN_RESPONSE`
 - `IDENTITY_ILLUMINATION_PASS_CORRELATION`
 - `IDENTITY_ILLUMINATION_FAIL_CORRELATION`
@@ -77,3 +79,16 @@ Run at least 20 repeated attempts for each genuine condition and each attack con
 6. Re-run calibration whenever a model, preprocessing step, capture timing, or supported device population changes.
 
 Do not tune a threshold from one person's successful or failed attempt.
+
+## Head-pose diagnostics
+
+During a consented test attempt, tail the API logs:
+
+```bash
+docker compose logs -f api | grep --line-buffered -E \
+  'liveness_challenge_issued|liveness_quality|headpose_'
+```
+
+`liveness_challenge_issued` records the actual randomized movement sequence. Every pose frame then produces either `headpose_progress` with yaw, baseline, directed delta, required delta and hold count, or `headpose_frame_rejected` with the exact quality reason and numeric quality measurements.
+
+For a requested left turn with `IDENTITY_HEADPOSE_LEFT_SIGN=1`, `directed_delta` must increase toward `required_delta`. If a correctly performed left turn consistently produces a negative directed delta, set `IDENTITY_HEADPOSE_LEFT_SIGN=-1`, recreate the API container, and repeat the full validation matrix. Do not lower the turn threshold to compensate for an inverted sign.

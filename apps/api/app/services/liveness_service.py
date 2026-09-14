@@ -12,7 +12,8 @@ import numpy as np
 from app.core.config import Settings, get_settings
 
 
-logger = logging.getLogger(__name__)
+# Uvicorn configures this logger at INFO; using its child keeps diagnostics visible in container logs.
+logger = logging.getLogger("uvicorn.error").getChild("proctorcore.liveness")
 
 
 class LivenessChallengeStore:
@@ -144,7 +145,7 @@ class LivenessService:
         movement_steps = self._movement_steps(movements)
         illumination = self._illumination_steps() if required["illumination"] else []
         adaptive_headpose = bool(required["headPose"] and hasattr(self.store, "save_pose_progress"))
-        pose_step_timeout_ms = max(5000, int(self.settings.identity_headpose_step_timeout_ms))
+        pose_step_timeout_ms = max(12000, int(self.settings.identity_headpose_step_timeout_ms))
         illumination_duration_ms = illumination[-1]["endMs"] if illumination else 0
         adaptive_duration_ms = (
             (len(movement_steps) * (pose_step_timeout_ms + 2000))
@@ -195,6 +196,18 @@ class LivenessService:
                 "baselineYaw": None,
                 "steps": [],
             })
+        logger.info(
+            "liveness_challenge_issued challenge=%s company=%s user=%s enrollment=%s "
+            "adaptive=%s sequence=%s pose_timeout_ms=%s expires_at_ms=%s",
+            challenge_id,
+            company_id,
+            user_id,
+            enrollment,
+            adaptive_headpose,
+            [step["action"] for step in movement_steps],
+            pose_step_timeout_ms,
+            challenge["expiresAtMs"],
+        )
         return self._public_challenge(challenge)
 
     def required_components(self, enrollment: bool) -> dict[str, bool]:
@@ -350,11 +363,62 @@ class LivenessService:
             challenge, nonce, company_id, user_id, context_id, transaction_id, enrollment,
         )
         try:
-            quality, _chromaticity = self.matcher.analyse_liveness_frame(image)
+            quality = self.matcher.analyse_capture_quality_frame(image)
         except ValueError:
+            logger.info(
+                "liveness_quality_rejected challenge=%s company=%s user=%s reason=invalid_image",
+                challenge_id, company_id, user_id,
+            )
             return {"ready": False, "reason": "invalid_image"}
-        reason = self._quality_reason(quality, enrollment, quality_policy)
-        return {"ready": reason is None, "reason": reason or "ok"}
+        reason = self._pose_quality_reason(quality, "center")
+        diagnostics = self._pose_diagnostics(quality)
+        logger.info(
+            "liveness_quality challenge=%s company=%s user=%s ready=%s reason=%s quality=%s",
+            challenge_id, company_id, user_id, reason is None, reason or "ok", diagnostics,
+        )
+        return {"ready": reason is None, "reason": reason or "ok", "diagnostics": diagnostics}
+
+    def check_pose_frames(
+        self,
+        challenge_id: str,
+        nonce: str,
+        company_id: int,
+        user_id: int,
+        context_id: str,
+        transaction_id: str,
+        step_index: int,
+        images: list[bytes],
+        enrollment: bool,
+        quality_policy: dict | None = None,
+    ) -> dict[str, Any]:
+        """Analyses a small chronological burst captured independently of inference latency."""
+        if not images:
+            raise ValueError("liveness_evidence_missing")
+        last: dict[str, Any] | None = None
+        processed = 0
+        rejected = 0
+        for image in images[:4]:
+            last = self.check_pose_frame(
+                challenge_id,
+                nonce,
+                company_id,
+                user_id,
+                context_id,
+                transaction_id,
+                step_index,
+                image,
+                enrollment,
+                quality_policy,
+            )
+            processed += 1
+            if last.get("reason") not in ("keep_moving", "center_not_stable", "return_to_center", "wrong_direction", "pose_confirmed"):
+                rejected += 1
+            if last.get("reached"):
+                break
+        result = last or {"reached": False, "reason": "invalid_image", "stepIndex": step_index}
+        result["batchFramesProcessed"] = processed
+        result["batchRejectedFrames"] = rejected
+        return result
 
     def check_pose_frame(
         self,
@@ -380,22 +444,52 @@ class LivenessService:
         expected = int(progress.get("expectedStep", 0))
         if step_index != expected or step_index < 0 or step_index >= len(steps):
             raise ValueError("headpose_step_out_of_order")
+        action = str(steps[step_index]["action"])
         try:
             quality = self.matcher.analyse_headpose_frame(image)
         except ValueError:
+            logger.info(
+                "headpose_frame_rejected challenge=%s company=%s user=%s step=%s action=%s reason=invalid_image",
+                challenge_id, company_id, user_id, step_index, action,
+            )
             return {"reached": False, "reason": "invalid_image", "stepIndex": step_index}
-        reason = self._quality_reason(quality, enrollment, quality_policy)
+        diagnostics = self._pose_diagnostics(quality)
+        reason = self._pose_quality_reason(quality, action)
         if reason:
-            return {"reached": False, "reason": reason, "stepIndex": step_index}
+            logger.info(
+                "headpose_frame_rejected challenge=%s company=%s user=%s step=%s action=%s reason=%s quality=%s",
+                challenge_id, company_id, user_id, step_index, action, reason, diagnostics,
+            )
+            return {
+                "reached": False,
+                "reason": reason,
+                "stepIndex": step_index,
+                "expectedAction": action,
+                "diagnostics": diagnostics,
+            }
         yaw = quality.headpose_yaw_degrees
         if yaw is None:
-            return {"reached": False, "reason": "headpose_unavailable", "stepIndex": step_index}
+            logger.info(
+                "headpose_frame_rejected challenge=%s company=%s user=%s step=%s action=%s reason=headpose_unavailable quality=%s",
+                challenge_id, company_id, user_id, step_index, action, diagnostics,
+            )
+            return {
+                "reached": False,
+                "reason": "headpose_unavailable",
+                "stepIndex": step_index,
+                "expectedAction": action,
+                "diagnostics": diagnostics,
+            }
 
         yaw = float(yaw)
-        action = str(steps[step_index]["action"])
         center_tolerance = float(self.settings.identity_headpose_center_degrees)
         sign = 1 if int(self.settings.identity_headpose_left_sign) >= 0 else -1
         baseline = progress.get("baselineYaw")
+        required_turn = max(
+            float(self.settings.identity_headpose_turn_degrees),
+            float(self.settings.identity_headpose_min_progress_degrees),
+        )
+        directed_delta = 0.0
 
         if step_index == 0:
             candidate = progress.get("neutralCandidateYaw")
@@ -414,10 +508,6 @@ class LivenessService:
                 matches = abs(yaw_delta) <= center_tolerance
             else:
                 directed_delta = yaw_delta * sign if action == "left" else -yaw_delta * sign
-                required_turn = max(
-                    float(self.settings.identity_headpose_turn_degrees),
-                    float(self.settings.identity_headpose_min_progress_degrees),
-                )
                 matches = directed_delta >= required_turn
             hold_frames = int(progress.get("holdFrames", 0)) + 1 if matches else 0
         reached = hold_frames >= max(1, int(self.settings.identity_headpose_min_hold_frames))
@@ -436,16 +526,46 @@ class LivenessService:
         else:
             progress["holdFrames"] = hold_frames
         self.store.save_pose_progress(challenge_id, progress)
+        if reached:
+            response_reason = "pose_confirmed"
+        elif step_index == 0:
+            response_reason = "center_not_stable"
+        elif action == "center":
+            response_reason = "return_to_center"
+        elif directed_delta <= -3.0:
+            response_reason = "wrong_direction"
+        else:
+            response_reason = "keep_moving"
+        progress_percent = 100 if reached else (
+            min(99, int(round(max(0.0, directed_delta) / max(1.0, required_turn) * 100)))
+            if action != "center" else
+            min(99, int(round(hold_frames / max(1, int(self.settings.identity_headpose_min_hold_frames)) * 100)))
+        )
         logger.info(
-            "headpose_progress challenge=%s company=%s user=%s step=%s action=%s yaw=%.2f baseline=%s delta=%.2f hold=%s reached=%s",
+            "headpose_progress challenge=%s company=%s user=%s step=%s action=%s yaw=%.2f "
+            "baseline=%s delta=%.2f directed_delta=%.2f required_delta=%.2f hold=%s/%s "
+            "reached=%s reason=%s quality=%s",
             challenge_id, company_id, user_id, step_index, action, yaw,
-            progress.get("baselineYaw"), yaw_delta, hold_frames, reached,
+            progress.get("baselineYaw"), yaw_delta, directed_delta, required_turn, hold_frames,
+            int(self.settings.identity_headpose_min_hold_frames), reached, response_reason, diagnostics,
         )
         return {
             "reached": reached,
-            "reason": "pose_confirmed" if reached else "keep_moving",
+            "reason": response_reason,
             "stepIndex": step_index,
             "nextStepIndex": int(progress["expectedStep"]),
+            "expectedAction": action,
+            "progressPercent": progress_percent,
+            "diagnostics": {
+                **diagnostics,
+                "yaw": round(yaw, 2),
+                "baselineYaw": round(float(progress["baselineYaw"]), 2) if progress.get("baselineYaw") is not None else None,
+                "yawDelta": round(yaw_delta, 2),
+                "directedDelta": round(directed_delta, 2),
+                "requiredDelta": round(required_turn, 2),
+                "holdFrames": hold_frames,
+                "requiredHoldFrames": int(self.settings.identity_headpose_min_hold_frames),
+            },
         }
 
     def _required_components(self, enrollment: bool) -> dict[str, bool]:
@@ -613,6 +733,51 @@ class LivenessService:
             "steps": list((progress or {}).get("steps", [])),
             "completedSteps": completed,
             "requiredSteps": len(steps),
+        }
+
+    def _pose_quality_reason(self, quality, action: str) -> str | None:
+        """Applies movement-safe quality limits; reusable reference frames remain strict."""
+        if quality.face_count < 1:
+            return "no_face"
+        if quality.face_count > 1:
+            return "multiple_faces"
+        if quality.brightness < float(self.settings.identity_liveness_min_brightness):
+            return "low_light"
+        if quality.blur < float(self.settings.identity_liveness_min_blur):
+            return "blurry"
+        if (
+            quality.confidence is not None
+            and quality.confidence < float(self.settings.identity_liveness_min_face_confidence)
+        ):
+            return "low_face_confidence"
+        ratio = quality.face_width / max(1, quality.width)
+        if ratio < float(self.settings.identity_liveness_min_face_width_ratio):
+            return "face_too_far"
+        if ratio > float(self.settings.identity_liveness_max_face_width_ratio):
+            return "face_too_close"
+        if quality.face_center_x is None or quality.face_center_y is None:
+            return "face_not_framed"
+        if action == "center" and (
+            abs(float(quality.face_center_x) - 0.5) > float(self.settings.identity_liveness_center_tolerance_x)
+            or abs(float(quality.face_center_y) - 0.5) > float(self.settings.identity_liveness_center_tolerance_y)
+        ):
+            return "face_not_centered"
+        return None
+
+    @staticmethod
+    def _pose_diagnostics(quality) -> dict[str, Any]:
+        return {
+            "faceCount": int(quality.face_count),
+            "brightness": round(float(quality.brightness), 2),
+            "blur": round(float(quality.blur), 2),
+            "confidence": round(float(quality.confidence), 4) if quality.confidence is not None else None,
+            "faceWidthRatio": round(float(quality.face_width / max(1, quality.width)), 4),
+            "faceCenterX": round(float(quality.face_center_x), 4) if quality.face_center_x is not None else None,
+            "faceCenterY": round(float(quality.face_center_y), 4) if quality.face_center_y is not None else None,
+            "yaw": (
+                round(float(quality.headpose_yaw_degrees), 2)
+                if quality.headpose_yaw_degrees is not None else None
+            ),
         }
 
     def _quality_reason(self, quality, enrollment: bool, policy: dict | None) -> str | None:

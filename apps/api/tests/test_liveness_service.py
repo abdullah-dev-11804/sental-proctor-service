@@ -83,6 +83,11 @@ class FakeMatcher:
         item = json.loads(content.decode())
         return quality, item.get("rgb", [1 / 3, 1 / 3, 1 / 3])
 
+    def analyse_capture_quality_frame(self, content):
+        quality = self._quality(content)
+        quality.headpose_yaw_degrees = None
+        return quality
+
     def analyse_headpose_frame(self, content):
         return self._quality(content)
 
@@ -101,6 +106,13 @@ def settings(**overrides):
         "identity_headpose_center_degrees": 9.0,
         "identity_headpose_min_hold_frames": 2,
         "identity_headpose_min_progress_degrees": 7.0,
+        "identity_liveness_min_brightness": 30.0,
+        "identity_liveness_min_blur": 15.0,
+        "identity_liveness_min_face_confidence": 0.55,
+        "identity_liveness_min_face_width_ratio": 0.12,
+        "identity_liveness_max_face_width_ratio": 0.75,
+        "identity_liveness_center_tolerance_x": 0.30,
+        "identity_liveness_center_tolerance_y": 0.35,
         "identity_illumination_phase_ms": 850,
         "identity_illumination_min_frames_per_phase": 2,
         "identity_illumination_min_response": 0.008,
@@ -368,7 +380,9 @@ def test_quality_probe_provides_framing_feedback_without_consuming_challenge():
         challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
         "transaction-123", image, False,
     )
-    assert result == {"ready": False, "reason": "face_not_centered"}
+    assert result["ready"] is False
+    assert result["reason"] == "face_not_centered"
+    assert result["diagnostics"]["faceCenterX"] == 0.9
     assert challenge["challengeId"] in store.items
 
 
@@ -485,3 +499,37 @@ def test_adaptive_headpose_does_not_advance_for_the_wrong_direction(monkeypatch)
         )
         assert result["reached"] is False
     assert store.get_pose_progress(challenge["challengeId"])["expectedStep"] == 1
+
+
+def test_pose_burst_confirms_stable_center_without_waiting_for_network_round_trips():
+    store = AdaptiveStore()
+    service = LivenessService(FakeMatcher(), settings(), store)
+    challenge = service.issue(3, 245, "quiz:10", "transaction-123", True)
+    frames = [json.dumps({"yaw": yaw}).encode() for yaw in (11.5, 12.0, 11.8)]
+
+    result = service.check_pose_frames(
+        challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
+        "transaction-123", 0, frames, True,
+    )
+
+    assert result["reached"] is True
+    assert result["batchFramesProcessed"] == 2
+    assert result["batchRejectedFrames"] == 0
+
+
+def test_pose_frames_use_movement_quality_not_strict_enrollment_quality():
+    store = AdaptiveStore()
+    configured = settings(
+        identity_enrollment_min_blur=45.0,
+        identity_liveness_min_blur=15.0,
+    )
+    service = LivenessService(FakeMatcher(), configured, store)
+    challenge = service.issue(3, 245, "quiz:10", "transaction-123", True)
+    moving_frames = [json.dumps({"yaw": 8.0, "blur": 20.0}).encode()] * 2
+
+    result = service.check_pose_frames(
+        challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",
+        "transaction-123", 0, moving_frames, True,
+    )
+
+    assert result["reached"] is True

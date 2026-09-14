@@ -596,6 +596,11 @@ class FaceMatcher:
                 "headpose_challenge": bool(self.settings.identity_headpose_challenge_enabled),
                 "illumination_challenge": bool(self.settings.identity_illumination_challenge_enabled),
                 "challenge_timeout_ms": int(self.settings.identity_liveness_challenge_timeout_ms),
+                "pose_min_brightness": float(self.settings.identity_liveness_min_brightness),
+                "pose_min_blur": float(self.settings.identity_liveness_min_blur),
+                "pose_min_face_confidence": float(self.settings.identity_liveness_min_face_confidence),
+                "pose_min_face_width_ratio": float(self.settings.identity_liveness_min_face_width_ratio),
+                "pose_max_face_width_ratio": float(self.settings.identity_liveness_max_face_width_ratio),
             },
         }
         if self.advanced_engine is not None:
@@ -795,6 +800,13 @@ class FaceMatcher:
             include_headpose=include_headpose,
         )
         return self._face_quality(quality), chromaticity
+
+    def analyse_capture_quality_frame(self, content: bytes) -> FaceQuality:
+        """Runs only SCRFD and image-quality measurements for pre-challenge guidance."""
+        if self.advanced_engine is None:
+            raise RuntimeError("Advanced face engine is not loaded.")
+        image = self._decode_image(content)
+        return self._face_quality(self.advanced_engine.analyse_capture_quality(image))
 
     def analyse_headpose_frame(self, content: bytes) -> FaceQuality:
         """Runs only detection, capture quality, and SixDRepNet head pose."""

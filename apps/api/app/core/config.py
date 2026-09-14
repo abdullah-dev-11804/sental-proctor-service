@@ -81,7 +81,14 @@ class Settings(BaseSettings):
     identity_headpose_min_hold_frames: int = 2
     identity_headpose_min_progress_degrees: float = 7.0
     identity_headpose_left_sign: int = 1
-    identity_headpose_step_timeout_ms: int = 8000
+    identity_headpose_step_timeout_ms: int = 12000
+    identity_liveness_min_brightness: float = 30.0
+    identity_liveness_min_blur: float = 15.0
+    identity_liveness_min_face_confidence: float = 0.55
+    identity_liveness_min_face_width_ratio: float = 0.12
+    identity_liveness_max_face_width_ratio: float = 0.75
+    identity_liveness_center_tolerance_x: float = 0.30
+    identity_liveness_center_tolerance_y: float = 0.35
     identity_illumination_phase_ms: int = 1000
     identity_illumination_min_frames_per_phase: int = 2
     identity_illumination_min_response: float = 0.008
