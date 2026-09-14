@@ -87,6 +87,32 @@ def test_resume_uses_a_new_segment_then_submission_queues_finalization(store: Me
     assert store.jobs.calls[0][0] == "app.workers.jobs.finalize_session_media"
 
 
+def test_reopened_fallback_segment_continues_chunk_sequence(store: MediaStore) -> None:
+    session = store.create_session(_payload())
+    store.egress = type("FailedEgress", (), {
+        "start_participant": lambda *_args: {"state": "failed"},
+        "stop": lambda *_args: {"state": "stopped"},
+    })()
+    token = store.create_media_token(session["id"], _scope())
+    started = store.start_recording(session["id"], {**_scope(), "segment": 1})
+    store.save_media_chunk(
+        session["id"],
+        token["uploadToken"],
+        b"chunk",
+        segment=1,
+        sequence=1,
+        duration_ms=5000,
+        mime_type="video/webm",
+    )
+
+    resumed = store.start_recording(session["id"], {**_scope(), "segment": 1})
+
+    assert started["fallback"] is True
+    assert resumed["duplicate"] is True
+    assert resumed["fallback"] is True
+    assert resumed["nextSequence"] == 1
+
+
 def test_retention_begins_at_completion_and_classifies_assets(store: MediaStore) -> None:
     session = store.create_session(_payload())
     assert session["retention"]["videoExpiresAt"] is None

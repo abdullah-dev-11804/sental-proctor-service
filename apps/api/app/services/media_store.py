@@ -170,11 +170,16 @@ class MediaStore:
         self._require_scope(session, payload)
         recording = self._recording(session)
         if recording.get("state") == "active":
+            segment = int(recording.get("currentSegment") or 1)
+            provider = str(recording.get("provider") or "browser_fallback")
             return {
                 "ok": True,
                 "status": "active",
                 "recordingId": recording.get("recordingId"),
-                "segment": recording.get("currentSegment") or 1,
+                "segment": segment,
+                "nextSequence": self._next_chunk_sequence(session, segment),
+                "provider": provider,
+                "fallback": provider != "livekit_egress",
                 "duplicate": True,
             }
         segment = int(payload.get("segment") or recording.get("currentSegment") or 0) or 1
@@ -218,6 +223,7 @@ class MediaStore:
             "status": "active",
             "recordingId": recording_id,
             "segment": segment,
+            "nextSequence": self._next_chunk_sequence(session, segment),
             "provider": provider,
             "fallback": provider != "livekit_egress",
         }
@@ -800,6 +806,15 @@ class MediaStore:
     def _recording(self, session: dict[str, Any]) -> dict[str, Any]:
         recording = session.get("recording")
         return recording if isinstance(recording, dict) else {"state": "not_started", "currentSegment": 0, "segments": {}}
+
+    @staticmethod
+    def _next_chunk_sequence(session: dict[str, Any], segment: int) -> int:
+        sequences = [
+            int(item.get("sequence") or 0)
+            for item in (session.get("chunks") or [])
+            if int(item.get("segment") or 1) == segment
+        ]
+        return max(sequences, default=0)
 
     def _save_session(self, session: dict[str, Any]) -> None:
         self.state.save_session(session)

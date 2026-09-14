@@ -25,9 +25,9 @@ class JobQueue:
         connection = Redis.from_url(self.settings.redis_url)
         queue = Queue(self.settings.queue_name, connection=connection, default_timeout=14400)
         try:
-            job = queue.enqueue(
-                function,
-                *args,
+            job = queue.enqueue_call(
+                func=function,
+                args=args,
                 kwargs=kwargs,
                 job_id=job_id,
                 result_ttl=86400,
