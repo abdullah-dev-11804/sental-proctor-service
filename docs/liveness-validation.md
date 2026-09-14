@@ -4,9 +4,9 @@ The pre-quiz identity gate uses independent liveness and identity decisions:
 
 1. Moodle requests a one-use challenge from the Proctoring Server.
 2. SCRFD applies movement-safe quality limits to liveness frames. The stricter enrollment policy is still applied separately before any reusable reference is stored.
-3. MiniFASNet-V2 scores multiple frames; median live/print/replay scores produce `pass`, `fail`, or `inconclusive`.
-4. SixDRepNet validates a randomized temporal head-pose sequence.
-5. The illumination validator compares facial chromaticity changes with the randomized server-issued colour sequence.
+3. MiniFASNet-V2 scores a dedicated neutral frontal burst; median live/print/replay scores produce `pass`, `fail`, or `inconclusive`.
+4. SixDRepNet validates a separate randomized temporal head-pose sequence.
+5. When an administrator explicitly enables it in Moodle, the illumination validator uses a separate coloured-frame sequence to compare facial chromaticity changes with the server-issued colours.
 6. AdaFace runs only after all configured liveness components pass.
 
 The deployed MiniFASNet-V2 file is a direct ONNX export of upstream
@@ -14,8 +14,11 @@ The deployed MiniFASNet-V2 file is a direct ONNX export of upstream
 keeps resized BGR pixels as float values in the `0..255` range and treats class
 index `1` as the genuine/live class. Production must therefore use
 `IDENTITY_ANTISPOOF_INPUT_RANGE=raw_255` and
-`IDENTITY_ANTISPOOF_LIVE_CLASS_INDEX=1` for this approved file. Validate both
-conventions before using a differently wrapped or exported model.
+`IDENTITY_ANTISPOOF_LIVE_CLASS_INDEX=1` for this approved file. Its approved
+SHA-256 is `d7b3cd9ba8a7ceb13baa8c4720902e27ca3112eff52f926c08804af6b6eecc7b`;
+set this as `IDENTITY_ANTISPOOF_MODEL_SHA256` so startup rejects a different
+binary. Validate all three conventions before using a differently wrapped or
+exported model.
 
 Challenges are tenant/user/quiz/transaction bound, stored in Redis, short-lived, and consumed once. Raw images and embeddings are not written by the liveness validator. Numeric component diagnostics are returned to trusted Moodle code and logged in summarized form.
 
@@ -28,11 +31,11 @@ Challenge evidence uses the movement-safe liveness quality limits. The stricter 
 - `POST /api/v1/identity/liveness/challenges/pose` analyses a chronological burst of up to eight movement frames without consuming the challenge.
 - `POST /api/v1/identity/references/enroll` and `POST /api/v1/identity/references/verify` accept `contextId`, `challengeId`, `challengeNonce`, and timestamped `livenessEvidence`.
 
-The issue and quality endpoints require the existing API bearer token and matching `X-ProctorCore-Company` header. The final enrollment/verification request consumes the challenge before validation, so a challenge cannot be accepted twice.
+The issue and quality endpoints require the existing API bearer token and matching `X-ProctorCore-Company` header. The final enrollment/verification request consumes the challenge before validation, so a challenge cannot be accepted twice. Every evidence frame is tagged as `passive`, `headpose`, or `illumination`; a signal is evaluated only from its matching stream.
 
 ## Configuration
 
-Use `.env.kazakhstan.example` as the complete production-oriented example. New installations must explicitly enable the temporal and active checks. Existing configurations remain disabled by default.
+Use `.env.kazakhstan.example` as the complete production-oriented example. New installations must explicitly enable the temporal and active checks. Existing configurations remain disabled by default. `IDENTITY_ILLUMINATION_CHALLENGE_ENABLED` only makes the server capability available; the screen-light test is requested only when an administrator enables **Require screen-light liveness challenge** in Moodle. That Moodle setting is off by default.
 
 The following values require calibration from client-environment validation data:
 

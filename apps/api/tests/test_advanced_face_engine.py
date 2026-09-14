@@ -1,5 +1,7 @@
-import numpy as np
 from types import SimpleNamespace
+
+import numpy as np
+import pytest
 
 from app.services.advanced_face_engine import AdvancedFaceEngine, AdvancedFaceQuality
 
@@ -139,6 +141,14 @@ def test_antispoof_crop_preserves_the_detected_box_aspect_ratio() -> None:
 
     assert crop.shape[0] == 201
     assert crop.shape[1] == 101
+
+
+def test_antispoof_model_checksum_rejects_an_unapproved_binary(tmp_path) -> None:
+    model = tmp_path / "minifasnet.onnx"
+    model.write_bytes(b"unexpected model")
+
+    with pytest.raises(RuntimeError, match="checksum"):
+        AdvancedFaceEngine._validate_model_hash(model, "0" * 64, "anti-spoof")
 
 
 def test_detected_face_quality_ignores_dark_background(monkeypatch) -> None:

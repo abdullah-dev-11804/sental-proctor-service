@@ -47,6 +47,7 @@ def test_production_checks_reject_local_storage(monkeypatch) -> None:
     monkeypatch.setattr(main.settings, "identity_active_liveness_enabled", True)
     monkeypatch.setattr(main.settings, "identity_headpose_challenge_enabled", True)
     monkeypatch.setattr(main.settings, "identity_illumination_challenge_enabled", True)
+    monkeypatch.setattr(main.settings, "identity_antispoof_model_sha256", "c" * 64)
 
     checks = main._production_checks(
         {"ready": True, "private": True, "backend": "local"},
@@ -70,6 +71,7 @@ def test_production_checks_reject_disabled_active_liveness(monkeypatch) -> None:
     monkeypatch.setattr(main.settings, "identity_active_liveness_enabled", False)
     monkeypatch.setattr(main.settings, "identity_headpose_challenge_enabled", True)
     monkeypatch.setattr(main.settings, "identity_illumination_challenge_enabled", True)
+    monkeypatch.setattr(main.settings, "identity_antispoof_model_sha256", "c" * 64)
 
     checks = main._production_checks(
         {"ready": True, "private": True, "backend": "minio"},

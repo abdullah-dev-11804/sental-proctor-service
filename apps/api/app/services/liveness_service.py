@@ -132,8 +132,9 @@ class LivenessService:
         context_id: str,
         transaction_id: str,
         enrollment: bool,
+        illumination_required: bool = False,
     ) -> dict[str, Any]:
-        required = self._required_components(enrollment)
+        required = self._required_components(enrollment, illumination_required)
         if any(required.values()) and hasattr(self.store, "failure_count"):
             failures = self.store.failure_count(company_id, user_id, context_id)
             if failures >= max(1, int(self.settings.identity_liveness_retry_limit)):
@@ -141,27 +142,33 @@ class LivenessService:
         challenge_id = secrets.token_urlsafe(24)
         nonce = secrets.token_urlsafe(32)
         issued_at = int(time.time() * 1000)
-        timeout_ms = max(3000, int(self.settings.identity_liveness_challenge_timeout_ms))
         movements = list(secrets.choice(self.MOVEMENT_SEQUENCES)) if required["headPose"] else ["center"]
         movement_steps = self._movement_steps(movements)
         illumination = self._illumination_steps() if required["illumination"] else []
         adaptive_headpose = bool(required["headPose"] and hasattr(self.store, "save_pose_progress"))
         pose_step_timeout_ms = max(12000, int(self.settings.identity_headpose_step_timeout_ms))
+        passive_duration_ms = (
+            max(1000, int(self.settings.identity_passive_capture_window_ms))
+            if required["passivePad"] else 0
+        )
         illumination_duration_ms = illumination[-1]["endMs"] if illumination else 0
         adaptive_duration_ms = (
             (len(movement_steps) * (pose_step_timeout_ms + 2000))
+            + passive_duration_ms
             + illumination_duration_ms
             + 3000
             if adaptive_headpose else 0
         )
+        sequential_duration_ms = (
+            (movement_steps[-1]["endMs"] if required["headPose"] and movement_steps else 0)
+            + passive_duration_ms
+            + illumination_duration_ms
+            + 3000
+        )
         duration_ms = max(
-            movement_steps[-1]["endMs"] if movement_steps else 0,
-            illumination_duration_ms,
-            min(timeout_ms, int(self.settings.identity_passive_capture_window_ms)),
+            sequential_duration_ms,
             adaptive_duration_ms,
         )
-        if not adaptive_headpose:
-            duration_ms = min(duration_ms, timeout_ms)
         ttl_seconds = max(
             MINIMUM_CHALLENGE_TTL_SECONDS,
             int(self.settings.identity_liveness_challenge_ttl_seconds),
@@ -183,10 +190,8 @@ class LivenessService:
             "illuminationSteps": illumination,
             "adaptiveHeadPose": adaptive_headpose,
             "poseStepTimeoutMs": pose_step_timeout_ms,
-            "minimumCaptureMs": max(
-                illumination[-1]["endMs"] if illumination else 0,
-                min(timeout_ms, int(self.settings.identity_passive_capture_window_ms)),
-            ),
+            "passiveCaptureMs": passive_duration_ms,
+            "minimumCaptureMs": passive_duration_ms + illumination_duration_ms,
         }
         self.store.save(challenge)
         if adaptive_headpose:
@@ -211,8 +216,8 @@ class LivenessService:
         )
         return self._public_challenge(challenge)
 
-    def required_components(self, enrollment: bool) -> dict[str, bool]:
-        return self._required_components(enrollment)
+    def required_components(self, enrollment: bool, illumination_required: bool = False) -> dict[str, bool]:
+        return self._required_components(enrollment, illumination_required)
 
     def validate(
         self,
@@ -325,7 +330,9 @@ class LivenessService:
         elif overall == "fail" and hasattr(self.store, "register_failure"):
             self.store.register_failure(company_id, user_id, context_id)
         logger.info(
-            "liveness_result challenge=%s company=%s user=%s overall=%s reason=%s usable=%s invalid=%s invalid_reasons=%s passive=%s:%s aggregate=%s head=%s:%s steps=%s illumination=%s:%s correlation=%s capture_ms=%s processing_ms=%s",
+            "liveness_result challenge=%s company=%s user=%s overall=%s reason=%s usable=%s invalid=%s "
+            "invalid_reasons=%s passive=%s:%s aggregate=%s samples=%s head=%s:%s steps=%s "
+            "illumination=%s:%s correlation=%s capture_ms=%s processing_ms=%s",
             challenge_id,
             company_id,
             user_id,
@@ -337,6 +344,7 @@ class LivenessService:
             passive["result"],
             passive["reason"],
             passive.get("aggregate"),
+            passive.get("samples"),
             headpose["result"],
             headpose["reason"],
             headpose.get("steps"),
@@ -587,7 +595,7 @@ class LivenessService:
             },
         }
 
-    def _required_components(self, enrollment: bool) -> dict[str, bool]:
+    def _required_components(self, enrollment: bool, illumination_required: bool = False) -> dict[str, bool]:
         active = bool(
             self.settings.identity_active_liveness_enabled
             or self.settings.identity_require_active_liveness
@@ -602,7 +610,11 @@ class LivenessService:
                 self.settings.identity_headpose_challenge_enabled
                 or self.settings.identity_require_headpose_liveness
             )),
-            "illumination": bool(active and self.settings.identity_illumination_challenge_enabled),
+            "illumination": bool(
+                illumination_required
+                and active
+                and self.settings.identity_illumination_challenge_enabled
+            ),
         }
 
     def _movement_steps(self, actions: list[str]) -> list[dict[str, Any]]:
@@ -644,6 +656,7 @@ class LivenessService:
             "illuminationSteps": challenge["illuminationSteps"],
             "adaptiveHeadPose": bool(challenge.get("adaptiveHeadPose")),
             "poseStepTimeoutMs": int(challenge.get("poseStepTimeoutMs", 8000)),
+            "passiveCaptureMs": int(challenge.get("passiveCaptureMs", 0)),
             "minimumCaptureMs": int(challenge.get("minimumCaptureMs", 0)),
         }
 
@@ -704,22 +717,31 @@ class LivenessService:
                 invalid.append({"reason": "invalid_timestamps"})
                 continue
             previous_elapsed = elapsed
+            purpose = str(item.get("purpose") or "combined").strip().lower()
+            if purpose not in {"passive", "headpose", "illumination", "combined"}:
+                invalid.append({"reason": "invalid_evidence_purpose"})
+                continue
+            include_antispoof = purpose in {"passive", "combined"}
+            include_chromaticity = purpose in {"illumination", "combined"}
+            frame_headpose = include_headpose and purpose in {"headpose", "combined"}
             try:
                 quality, chromaticity = self.matcher.analyse_liveness_frame(
                     item["bytes"],
-                    include_headpose=include_headpose,
+                    include_headpose=frame_headpose,
+                    include_antispoof=include_antispoof,
+                    include_chromaticity=include_chromaticity,
                 )
             except (ValueError, KeyError):
                 invalid.append({"reason": "invalid_image"})
                 continue
-            # Liveness evidence is captured while screen illumination changes. Its
-            # movement-safe limits are separate from reusable-reference quality.
+            # Liveness uses movement-safe limits; reusable-reference quality remains stricter.
             reason = self._pose_quality_reason(quality, "center")
             if reason:
                 invalid.append({"reason": reason})
                 continue
             valid.append({
                 "elapsedMs": elapsed,
+                "purpose": purpose,
                 "illuminationElapsedMs": (
                     int(item["illuminationElapsedMs"])
                     if item.get("illuminationElapsedMs") is not None else elapsed
@@ -858,14 +880,19 @@ class LivenessService:
     ) -> dict[str, Any]:
         if not required:
             return {"required": False, "result": "pass", "reason": "disabled", "validFrames": 0, "invalidFrames": len(invalid)}
-        scores = [item["quality"].antispoof_scores for item in observations if item["quality"].antispoof_scores]
+        passive_observations = [
+            item for item in observations
+            if item.get("purpose", "combined") in {"passive", "combined"}
+            and item["quality"].antispoof_scores
+        ]
+        scores = [item["quality"].antispoof_scores for item in passive_observations]
         minimum = max(2, int(self.settings.identity_passive_min_valid_frames))
         if len(scores) < minimum:
             return {"required": True, "result": "inconclusive", "reason": "passive_insufficient_frames", "validFrames": len(scores), "invalidFrames": len(invalid)}
-        elapsed = [item["elapsedMs"] for item in observations if item["quality"].antispoof_scores]
+        elapsed = [item["elapsedMs"] for item in passive_observations]
         required_span = min(
             int(self.settings.identity_passive_capture_window_ms),
-            challenge_duration_ms,
+            max(0, int(challenge_duration_ms)),
         ) * 0.65
         actual_span = max(elapsed) - min(elapsed)
         if actual_span < required_span:
@@ -897,10 +924,7 @@ class LivenessService:
             "aggregate": {name: round(value, 4) for name, value in medians.items()},
             "samples": [
                 {"elapsedMs": item["elapsedMs"], **{name: round(float(score.get(name, 0.0)), 4) for name in ("live", "print", "replay")}}
-                for item, score in zip(
-                    [item for item in observations if item["quality"].antispoof_scores],
-                    scores,
-                )
+                for item, score in zip(passive_observations, scores)
             ],
         }
 
@@ -908,7 +932,11 @@ class LivenessService:
         required = bool(challenge["required"]["headPose"])
         if not required:
             return {"required": False, "result": "pass", "reason": "disabled", "steps": []}
-        yaws = [(item["elapsedMs"], item["quality"].headpose_yaw_degrees) for item in observations]
+        yaws = [
+            (item["elapsedMs"], item["quality"].headpose_yaw_degrees)
+            for item in observations
+            if item.get("purpose", "combined") in {"headpose", "combined"}
+        ]
         yaws = [(elapsed, float(yaw)) for elapsed, yaw in yaws if yaw is not None]
         if not yaws:
             return {"required": True, "result": "inconclusive", "reason": "headpose_unavailable", "steps": []}
@@ -972,7 +1000,8 @@ class LivenessService:
             values = [
                 item["chromaticity"]
                 for item in observations
-                if item["chromaticity"] is not None
+                if item.get("purpose", "combined") in {"illumination", "combined"}
+                and item["chromaticity"] is not None
                 and phase["startMs"] <= item["illuminationElapsedMs"] < phase["endMs"]
             ]
             if len(values) < minimum:

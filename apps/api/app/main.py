@@ -198,6 +198,6 @@ def _production_checks(storage: dict, egress: dict) -> dict[str, bool]:
             and settings.identity_require_passive_antispoof
             and settings.identity_active_liveness_enabled
             and settings.identity_headpose_challenge_enabled
-            and settings.identity_illumination_challenge_enabled
         ),
+        "antispoof_model_pinned": len(settings.identity_antispoof_model_sha256.strip()) == 64,
     }

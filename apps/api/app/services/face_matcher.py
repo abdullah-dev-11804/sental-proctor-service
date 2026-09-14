@@ -796,6 +796,8 @@ class FaceMatcher:
         self,
         content: bytes,
         include_headpose: bool = True,
+        include_antispoof: bool = True,
+        include_chromaticity: bool = True,
     ) -> tuple[FaceQuality, list[float] | None]:
         """Runs only detection/PAD/head-pose/illumination measurements, never AdaFace."""
         if self.advanced_engine is None:
@@ -804,6 +806,8 @@ class FaceMatcher:
         quality, chromaticity = self.advanced_engine.analyse_liveness(
             image,
             include_headpose=include_headpose,
+            include_antispoof=include_antispoof,
+            include_chromaticity=include_chromaticity,
         )
         return self._face_quality(quality), chromaticity
 

@@ -76,12 +76,21 @@ class FakeMatcher:
             },
         )
 
-    def analyse_liveness_frame(self, content, include_headpose=True):
+    def analyse_liveness_frame(
+        self,
+        content,
+        include_headpose=True,
+        include_antispoof=True,
+        include_chromaticity=True,
+    ):
         quality = self._quality(content)
         if not include_headpose:
             quality.headpose_yaw_degrees = None
+        if not include_antispoof:
+            quality.antispoof_scores = None
         item = json.loads(content.decode())
-        return quality, item.get("rgb", [1 / 3, 1 / 3, 1 / 3])
+        chromaticity = item.get("rgb", [1 / 3, 1 / 3, 1 / 3]) if include_chromaticity else None
+        return quality, chromaticity
 
     def analyse_capture_quality_frame(self, content):
         quality = self._quality(content)
@@ -125,13 +134,63 @@ def settings(**overrides):
 
 
 def issued(service):
-    return service.issue(3, 245, "quiz:10", "transaction-123", False)
+    return service.issue(3, 245, "quiz:10", "transaction-123", False, True)
 
 
 def test_challenge_lifetime_allows_slow_cpu_inference():
     service = LivenessService(FakeMatcher(), settings(), MemoryStore())
     challenge = issued(service)
     assert challenge["expiresAtMs"] - challenge["issuedAtMs"] >= 300_000
+
+
+def test_illumination_is_not_required_without_explicit_request():
+    service = LivenessService(FakeMatcher(), settings(), MemoryStore())
+    challenge = service.issue(3, 245, "quiz:10", "transaction-123", False)
+    assert challenge["components"]["illumination"] is False
+
+
+def test_illumination_request_respects_server_feature_switch():
+    service = LivenessService(
+        FakeMatcher(),
+        settings(identity_illumination_challenge_enabled=False),
+        MemoryStore(),
+    )
+    challenge = service.issue(3, 245, "quiz:10", "transaction-123", False, True)
+    assert challenge["components"]["illumination"] is False
+
+
+def test_liveness_signal_models_receive_only_their_evidence_stream():
+    service = LivenessService(FakeMatcher(), settings(), MemoryStore())
+    frames = [
+        {
+            "bytes": json.dumps({"live": 0.91, "yaw": 12.0}).encode(),
+            "elapsedMs": 100,
+            "purpose": "passive",
+        },
+        {
+            "bytes": json.dumps({"live": 0.01, "replay": 0.98, "yaw": 18.0}).encode(),
+            "elapsedMs": 400,
+            "purpose": "illumination",
+        },
+        {
+            "bytes": json.dumps({"live": 0.01, "yaw": -18.0}).encode(),
+            "elapsedMs": 700,
+            "purpose": "headpose",
+        },
+    ]
+
+    observations, invalid = service._observations(frames, False, None)
+
+    assert invalid == []
+    assert observations[0]["quality"].antispoof_scores is not None
+    assert observations[0]["chromaticity"] is None
+    assert observations[0]["quality"].headpose_yaw_degrees is None
+    assert observations[1]["quality"].antispoof_scores is None
+    assert observations[1]["chromaticity"] is not None
+    assert observations[1]["quality"].headpose_yaw_degrees is None
+    assert observations[2]["quality"].antispoof_scores is None
+    assert observations[2]["chromaticity"] is None
+    assert observations[2]["quality"].headpose_yaw_degrees == -18.0
 
 
 def evidence_for(challenge, passive=None, movement="correct", illumination="correct", faces=1):

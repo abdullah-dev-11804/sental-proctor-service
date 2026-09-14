@@ -3,6 +3,7 @@ import binascii
 import logging
 import time
 from functools import lru_cache
+from typing import Literal
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
@@ -39,6 +40,7 @@ class LivenessEvidenceFrame(BaseModel):
     capturedAtMs: int = Field(ge=0)
     elapsedMs: int = Field(ge=0)
     illuminationElapsedMs: int | None = Field(default=None, ge=0)
+    purpose: Literal["passive", "headpose", "illumination", "combined"] = "combined"
 
 
 class FaceReferenceEnrollRequest(BaseModel):
@@ -85,6 +87,7 @@ class LivenessChallengeRequest(BaseModel):
     userId: int = Field(ge=1)
     contextId: str = Field(min_length=1, max_length=128)
     enrollment: bool = False
+    illuminationRequired: bool = False
 
 
 class LivenessQualityRequest(LivenessChallengeRequest):
@@ -116,6 +119,7 @@ def issue_liveness_challenge(
             payload.contextId,
             payload.transactionId,
             payload.enrollment,
+            payload.illuminationRequired,
         )
     except ValueError as exc:
         code = str(exc)
@@ -548,6 +552,7 @@ def _validate_reference_liveness(payload, enrollment: bool) -> dict | None:
             "capturedAtMs": frame.capturedAtMs,
             "elapsedMs": frame.elapsedMs,
             "illuminationElapsedMs": frame.illuminationElapsedMs,
+            "purpose": frame.purpose,
         })
     try:
         return service.validate(

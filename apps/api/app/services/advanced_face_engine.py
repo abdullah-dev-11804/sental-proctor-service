@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -203,7 +204,13 @@ class AdvancedFaceEngine:
 
         antispoof_model = str(settings.identity_antispoof_model).strip()
         if antispoof_model:
-            self.antispoof = self._load_onnx(self._model_path(antispoof_model), "anti-spoof")
+            antispoof_path = self._model_path(antispoof_model)
+            self._validate_model_hash(
+                antispoof_path,
+                str(settings.identity_antispoof_model_sha256).strip().lower(),
+                "anti-spoof",
+            )
+            self.antispoof = self._load_onnx(antispoof_path, "anti-spoof")
         elif settings.identity_require_passive_antispoof or settings.identity_temporal_passive_pad_enabled:
             raise RuntimeError("Passive anti-spoofing is required but IDENTITY_ANTISPOOF_MODEL is empty.")
 
@@ -250,6 +257,7 @@ class AdvancedFaceEngine:
             "pass_threshold": float(self.settings.identity_pass_threshold),
             "review_threshold": float(self.settings.identity_review_threshold),
             "antispoof_model_exists": self._model_path(self.settings.identity_antispoof_model).is_file() if str(self.settings.identity_antispoof_model).strip() else False,
+            "antispoof_model_sha256": self._file_sha256(self._model_path(self.settings.identity_antispoof_model)) if str(self.settings.identity_antispoof_model).strip() else "",
             "antispoof_input_shape": self._session_shape(self.antispoof, "input"),
             "antispoof_output_shape": self._session_shape(self.antispoof, "output"),
             "antispoof_input_range": str(self.settings.identity_antispoof_input_range).strip().lower(),
@@ -306,15 +314,33 @@ class AdvancedFaceEngine:
         self,
         image: np.ndarray,
         include_headpose: bool = True,
+        include_antispoof: bool = True,
+        include_chromaticity: bool = True,
     ) -> tuple[AdvancedFaceQuality, list[float] | None]:
         """Returns non-recognition liveness signals and stable facial RGB chromaticity."""
         bbox, keypoints, quality = self._detect_and_measure(
             image,
+            include_antispoof=include_antispoof,
             include_headpose=include_headpose,
         )
         if bbox is None:
             return quality, None
-        return quality, self._facial_chromaticity(image, bbox, keypoints)
+        return quality, self._facial_chromaticity(image, bbox, keypoints) if include_chromaticity else None
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        if not path.is_file():
+            return ""
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @classmethod
+    def _validate_model_hash(cls, path: Path, expected: str, label: str) -> None:
+        if expected and cls._file_sha256(path) != expected:
+            raise RuntimeError(f"The {label} model checksum does not match the approved file.")
 
     def analyse_headpose(self, image: np.ndarray) -> AdvancedFaceQuality:
         """Runs face detection and head pose without PAD, illumination, or AdaFace."""
