@@ -5,6 +5,7 @@ import numpy as np
 
 from app.core.config import get_settings
 from app.services.advanced_face_engine import AdvancedFaceEngine
+from app.services.liveness_service import MINIMUM_CHALLENGE_TTL_SECONDS
 
 
 @dataclass(frozen=True)
@@ -596,6 +597,10 @@ class FaceMatcher:
                 "headpose_challenge": bool(self.settings.identity_headpose_challenge_enabled),
                 "illumination_challenge": bool(self.settings.identity_illumination_challenge_enabled),
                 "challenge_timeout_ms": int(self.settings.identity_liveness_challenge_timeout_ms),
+                "challenge_ttl_seconds": max(
+                    MINIMUM_CHALLENGE_TTL_SECONDS,
+                    int(self.settings.identity_liveness_challenge_ttl_seconds),
+                ),
                 "pose_min_brightness": float(self.settings.identity_liveness_min_brightness),
                 "pose_min_blur": float(self.settings.identity_liveness_min_blur),
                 "pose_min_face_confidence": float(self.settings.identity_liveness_min_face_confidence),

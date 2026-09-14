@@ -128,6 +128,12 @@ def issued(service):
     return service.issue(3, 245, "quiz:10", "transaction-123", False)
 
 
+def test_challenge_lifetime_allows_slow_cpu_inference():
+    service = LivenessService(FakeMatcher(), settings(), MemoryStore())
+    challenge = issued(service)
+    assert challenge["expiresAtMs"] - challenge["issuedAtMs"] >= 300_000
+
+
 def evidence_for(challenge, passive=None, movement="correct", illumination="correct", faces=1):
     frames = []
     elapsed = 100

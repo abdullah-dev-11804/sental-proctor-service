@@ -71,7 +71,7 @@ class Settings(BaseSettings):
     identity_active_liveness_enabled: bool = False
     identity_headpose_challenge_enabled: bool = False
     identity_illumination_challenge_enabled: bool = False
-    identity_liveness_challenge_ttl_seconds: int = 45
+    identity_liveness_challenge_ttl_seconds: int = 300
     identity_liveness_challenge_timeout_ms: int = 9000
     identity_liveness_retry_limit: int = 3
     identity_liveness_retry_window_seconds: int = 900

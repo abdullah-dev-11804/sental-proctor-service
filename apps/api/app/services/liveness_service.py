@@ -14,6 +14,7 @@ from app.core.config import Settings, get_settings
 
 # Uvicorn configures this logger at INFO; using its child keeps diagnostics visible in container logs.
 logger = logging.getLogger("uvicorn.error").getChild("proctorcore.liveness")
+MINIMUM_CHALLENGE_TTL_SECONDS = 300
 
 
 class LivenessChallengeStore:
@@ -162,9 +163,9 @@ class LivenessService:
         if not adaptive_headpose:
             duration_ms = min(duration_ms, timeout_ms)
         ttl_seconds = max(
-            10,
+            MINIMUM_CHALLENGE_TTL_SECONDS,
             int(self.settings.identity_liveness_challenge_ttl_seconds),
-            int(np.ceil(duration_ms / 1000)) + 30,
+            int(np.ceil(duration_ms / 1000)) + 60,
         )
         challenge = {
             "challengeId": challenge_id,
