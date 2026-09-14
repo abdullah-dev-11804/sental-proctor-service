@@ -80,7 +80,7 @@ class Settings(BaseSettings):
     identity_headpose_center_degrees: float = 9.0
     identity_headpose_min_hold_frames: int = 2
     identity_headpose_min_progress_degrees: float = 7.0
-    identity_headpose_left_sign: int = 1
+    identity_headpose_left_sign: int = -1
     identity_headpose_step_timeout_ms: int = 12000
     identity_liveness_min_brightness: float = 30.0
     identity_liveness_min_blur: float = 15.0

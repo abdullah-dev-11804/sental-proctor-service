@@ -139,9 +139,9 @@ def evidence_for(challenge, passive=None, movement="correct", illumination="corr
         progress = (elapsed - movement_step["startMs"]) / max(1, movement_step["endMs"] - movement_step["startMs"])
         yaw = 0.0
         if action == "left":
-            yaw = 20.0 * min(1.0, progress * 2.0)
-        elif action == "right":
             yaw = -20.0 * min(1.0, progress * 2.0)
+        elif action == "right":
+            yaw = 20.0 * min(1.0, progress * 2.0)
         if movement == "inverse":
             yaw = -yaw
         elif movement == "none":
@@ -425,7 +425,7 @@ def test_adaptive_headpose_advances_only_after_each_pose_is_confirmed():
     challenge = issued(service)
     assert challenge["adaptiveHeadPose"] is True
 
-    yaws = {"center": 0.0, "left": 20.0, "right": -20.0}
+    yaws = {"center": 0.0, "left": -20.0, "right": 20.0}
     for index, step in enumerate(challenge["movementSteps"]):
         image = json.dumps({"yaw": yaws[step["action"]]}).encode()
         first = service.check_pose_frame(
@@ -454,7 +454,7 @@ def test_adaptive_headpose_rejects_out_of_order_step():
         )
 
 
-@pytest.mark.parametrize(("direction", "turned_yaw"), [("left", 34.0), ("right", -4.0)])
+@pytest.mark.parametrize(("direction", "turned_yaw"), [("left", -4.0), ("right", 34.0)])
 def test_adaptive_headpose_uses_the_users_neutral_baseline(monkeypatch, direction, turned_yaw):
     monkeypatch.setattr("secrets.choice", lambda _items: (direction, "center"))
     store = AdaptiveStore()
@@ -491,7 +491,7 @@ def test_adaptive_headpose_does_not_advance_for_the_wrong_direction(monkeypatch)
             "transaction-123", 0, center, False,
         )
 
-    wrong_turn = json.dumps({"yaw": -12.0}).encode()
+    wrong_turn = json.dumps({"yaw": 36.0}).encode()
     for _ in range(3):
         result = service.check_pose_frame(
             challenge["challengeId"], challenge["nonce"], 3, 245, "quiz:10",

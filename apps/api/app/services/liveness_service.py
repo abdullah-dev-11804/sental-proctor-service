@@ -418,6 +418,19 @@ class LivenessService:
         result = last or {"reached": False, "reason": "invalid_image", "stepIndex": step_index}
         result["batchFramesProcessed"] = processed
         result["batchRejectedFrames"] = rejected
+        logger.info(
+            "headpose_batch challenge=%s company=%s user=%s step=%s received=%s processed=%s "
+            "rejected=%s reached=%s reason=%s",
+            challenge_id,
+            company_id,
+            user_id,
+            step_index,
+            min(len(images), 4),
+            processed,
+            rejected,
+            bool(result.get("reached")),
+            result.get("reason"),
+        )
         return result
 
     def check_pose_frame(

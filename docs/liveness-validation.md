@@ -91,4 +91,4 @@ docker compose logs -f api | grep --line-buffered -E \
 
 `liveness_challenge_issued` records the actual randomized movement sequence. Every pose frame then produces either `headpose_progress` with yaw, baseline, directed delta, required delta and hold count, or `headpose_frame_rejected` with the exact quality reason and numeric quality measurements.
 
-For a requested left turn with `IDENTITY_HEADPOSE_LEFT_SIGN=1`, `directed_delta` must increase toward `required_delta`. If a correctly performed left turn consistently produces a negative directed delta, set `IDENTITY_HEADPOSE_LEFT_SIGN=-1`, recreate the API container, and repeat the full validation matrix. Do not lower the turn threshold to compensate for an inverted sign.
+For a requested turn, `directed_delta` must increase toward `required_delta`. The validated SixDRepNet export and mirrored SENTAL preview use `IDENTITY_HEADPOSE_LEFT_SIGN=-1`: a user's left turn produces a negative raw yaw delta and a positive directed delta. Revalidate this setting if the model export or capture mirroring changes. Do not lower the turn threshold to compensate for an inverted sign.
