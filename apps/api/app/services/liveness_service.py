@@ -148,10 +148,14 @@ class LivenessService:
         illumination = self._illumination_steps() if required["illumination"] else []
         adaptive_headpose = bool(required["headPose"] and hasattr(self.store, "save_pose_progress"))
         pose_step_timeout_ms = max(12000, int(self.settings.identity_headpose_step_timeout_ms))
-        passive_duration_ms = (
-            max(1000, int(self.settings.identity_passive_capture_window_ms))
-            if required["passivePad"] else 0
-        )
+        passive_duration_ms = 0
+        if required["passivePad"]:
+            passive_duration_ms = max(1000, int(self.settings.identity_passive_capture_window_ms))
+            if not movement_required and not required["illumination"]:
+                passive_duration_ms = min(
+                    passive_duration_ms,
+                    max(1000, int(self.settings.identity_passive_fast_capture_window_ms)),
+                )
         illumination_duration_ms = illumination[-1]["endMs"] if illumination else 0
         adaptive_duration_ms = (
             (len(movement_steps) * (pose_step_timeout_ms + 2000))
@@ -269,7 +273,7 @@ class LivenessService:
             observations,
             invalid,
             challenge["required"]["passivePad"],
-            int(challenge["durationMs"]),
+            int(challenge.get("passiveCaptureMs") or challenge["durationMs"]),
         )
         headpose = (
             self._adaptive_headpose_result(challenge, adaptive_progress)

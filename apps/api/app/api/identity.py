@@ -303,7 +303,9 @@ def enroll_face_reference(
     threshold = payload.threshold if payload.threshold is not None else float(settings.identity_pass_threshold)
     liveness = _validate_reference_liveness(payload, enrollment=True)
     if liveness is not None and liveness["overall"] != "pass":
-        return _liveness_retry_response(payload, threshold, "enrollment", liveness)
+        response = _liveness_retry_response(payload, threshold, "enrollment", liveness)
+        response["processingMs"] = int(round((time.perf_counter() - started) * 1000))
+        return response
     quality_policy = dict(payload.qualityPolicy or {})
     if liveness is not None:
         quality_policy["skipPassivePad"] = True
@@ -325,7 +327,7 @@ def enroll_face_reference(
             payload.userId,
             _exception_detail(exc),
         )
-        return _reference_retry_response(
+        response = _reference_retry_response(
             payload.transactionId,
             payload.companyId,
             payload.userId,
@@ -334,6 +336,8 @@ def enroll_face_reference(
             "not_enough_good_frames",
             _exception_detail(exc),
         )
+        response["processingMs"] = int(round((time.perf_counter() - started) * 1000))
+        return response
 
     result["transactionId"] = payload.transactionId
     result["threshold"] = threshold
@@ -346,6 +350,7 @@ def enroll_face_reference(
         result["livenessPassed"] = True
 
     if result["result"] != "enrolled":
+        result["processingMs"] = int(round((time.perf_counter() - started) * 1000))
         logger.info(
             "identity enrollment rejected: transaction=%s company=%s user=%s reason=%s diagnostics=%s",
             payload.transactionId,
@@ -373,13 +378,14 @@ def enroll_face_reference(
     result["referenceKey"] = reference_key
     result["bestReferenceKey"] = best_reference_key
     result["referenceSaved"] = True
+    result["processingMs"] = int(round((time.perf_counter() - started) * 1000))
     logger.info(
         "identity_enrollment_complete transaction=%s company=%s user=%s frames=%s processing_ms=%s",
         payload.transactionId,
         payload.companyId,
         payload.userId,
         result.get("referenceFaceCount"),
-        int(round((time.perf_counter() - started) * 1000)),
+        result["processingMs"],
     )
     return result
 
@@ -389,6 +395,7 @@ def verify_face_reference(
     payload: FaceReferenceVerifyRequest,
     x_proctorcore_company: int | None = Header(None),
 ) -> dict:
+    started = time.perf_counter()
     require_company_scope(payload.companyId, x_proctorcore_company)
     settings = get_settings()
     stored = LocalStorage().latest_face_template(payload.companyId, payload.userId)
@@ -402,7 +409,9 @@ def verify_face_reference(
     threshold = payload.threshold if payload.threshold is not None else float(settings.identity_pass_threshold)
     liveness = _validate_reference_liveness(payload, enrollment=False)
     if liveness is not None and liveness["overall"] != "pass":
-        return _liveness_retry_response(payload, threshold, "verify", liveness, reference_key)
+        response = _liveness_retry_response(payload, threshold, "verify", liveness, reference_key)
+        response["processingMs"] = int(round((time.perf_counter() - started) * 1000))
+        return response
     quality_policy = dict(payload.qualityPolicy or {})
     if liveness is not None:
         quality_policy["skipPassivePad"] = True
@@ -424,7 +433,7 @@ def verify_face_reference(
             payload.userId,
             _exception_detail(exc),
         )
-        return _reference_retry_response(
+        response = _reference_retry_response(
             payload.transactionId,
             payload.companyId,
             payload.userId,
@@ -434,6 +443,8 @@ def verify_face_reference(
             _exception_detail(exc),
             reference_key=reference_key,
         )
+        response["processingMs"] = int(round((time.perf_counter() - started) * 1000))
+        return response
 
     result["transactionId"] = payload.transactionId
     result["threshold"] = threshold
@@ -443,6 +454,7 @@ def verify_face_reference(
     if liveness is not None:
         result["liveness"] = liveness
         result["livenessPassed"] = True
+    result["processingMs"] = int(round((time.perf_counter() - started) * 1000))
     if not result.get("accessAllowed"):
         logger.info(
             "identity verification rejected: transaction=%s company=%s user=%s reason=%s diagnostics=%s",

@@ -109,6 +109,7 @@ def settings(**overrides):
         "identity_headpose_challenge_enabled": True,
         "identity_illumination_challenge_enabled": True,
         "identity_passive_min_valid_frames": 5,
+        "identity_passive_fast_capture_window_ms": 1800,
         "identity_liveness_challenge_timeout_ms": 9000,
         "identity_liveness_challenge_ttl_seconds": 45,
         "identity_headpose_turn_degrees": 14.0,
@@ -172,6 +173,25 @@ def test_movement_request_can_disable_headpose_without_disabling_passive_pad():
     )
     assert challenge["components"]["headPose"] is False
     assert challenge["components"]["passivePad"] is True
+    assert challenge["passiveCaptureMs"] == 1800
+
+
+def test_fast_passive_challenge_still_requires_five_frames_across_capture_window():
+    service = LivenessService(FakeMatcher(), settings(), MemoryStore())
+    challenge = service.issue(3, 245, "quiz:10", "transaction-123", False, False, False)
+    frames = [
+        {
+            "bytes": json.dumps({"live": 0.92, "print": 0.04, "replay": 0.04}).encode(),
+            "capturedAtMs": challenge["issuedAtMs"] + elapsed,
+            "elapsedMs": elapsed,
+            "purpose": "passive",
+        }
+        for elapsed in (100, 400, 700, 1000, 1300, 1600)
+    ]
+    result = validate(service, challenge, frames)
+    assert result["overall"] == "pass"
+    assert result["passivePad"]["validFrames"] == 6
+    assert result["passivePad"]["captureSpanMs"] == 1500
 
 
 def test_liveness_signal_models_receive_only_their_evidence_stream():
