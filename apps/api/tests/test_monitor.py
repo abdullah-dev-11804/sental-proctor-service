@@ -17,8 +17,9 @@ class _Store:
 class _Matcher:
     engine = "scrfd_adaface"
 
-    def __init__(self):
+    def __init__(self, antispoof_score=0.99):
         self.embedding_requests = []
+        self.antispoof_score = antispoof_score
 
     def analyse_frame(self, content, include_embedding=False):
         self.embedding_requests.append(include_embedding)
@@ -29,8 +30,8 @@ class _Matcher:
             width=640,
             height=480,
             yaw=0.1,
-            antispoof_score=0.99,
-            antispoof_passed=True,
+            antispoof_score=self.antispoof_score,
+            antispoof_passed=self.antispoof_score >= 0.78,
         )
         embedding = np.ones((1, 4), dtype=np.float32) if include_embedding else None
         return embedding, quality
@@ -59,7 +60,11 @@ def test_monitoring_skips_adaface_when_periodic_identity_is_not_requested(monkey
     monkeypatch.setattr(
         monitor_api,
         "get_settings",
-        lambda: SimpleNamespace(monitor_lookaway_yaw_threshold=0.42, identity_pass_threshold=0.85),
+        lambda: SimpleNamespace(
+            monitor_lookaway_yaw_threshold=0.42,
+            identity_pass_threshold=0.85,
+            identity_antispoof_spoof_threshold=0.35,
+        ),
     )
 
     result = monitor_api.analyse_frame(_payload(), x_proctorcore_company=7)
@@ -67,6 +72,31 @@ def test_monitoring_skips_adaface_when_periodic_identity_is_not_requested(monkey
     assert result["faceCount"] == 1
     assert result["lookingAway"] is False
     assert matcher.embedding_requests == [False]
+
+
+@pytest.mark.parametrize(
+    ("score", "expected"),
+    [(0.60, False), (0.20, True)],
+)
+def test_monitoring_distinguishes_uncertain_liveness_from_confirmed_spoof(
+    monkeypatch, score, expected
+) -> None:
+    matcher = _Matcher(antispoof_score=score)
+    monkeypatch.setattr(monitor_api, "MediaStore", _Store)
+    monkeypatch.setattr(monitor_api, "get_face_matcher", lambda: matcher)
+    monkeypatch.setattr(
+        monitor_api,
+        "get_settings",
+        lambda: SimpleNamespace(
+            monitor_lookaway_yaw_threshold=0.42,
+            identity_pass_threshold=0.85,
+            identity_antispoof_spoof_threshold=0.35,
+        ),
+    )
+
+    result = monitor_api.analyse_frame(_payload(), x_proctorcore_company=7)
+
+    assert result["spoofDetected"] is expected
 
 
 def test_monitoring_rejects_cross_company_request() -> None:

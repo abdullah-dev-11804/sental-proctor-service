@@ -511,6 +511,8 @@ class MediaStore:
         segment: int,
     ) -> None:
         pending = list(session.get("pendingClips") or [])
+        if any(str(item.get("violationId")) == str(violation_id) for item in pending):
+            return
         pending.append({
             "reason": reason,
             "occurredAt": int(occurred_at),

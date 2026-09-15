@@ -149,11 +149,9 @@ def _build_recording(
 
     for segment in sorted(segment_numbers):
         entry = next((item for item in entries if int(item.get("segment") or 1) == segment), {})
-        output = _build_egress_segment(entry, segment, objects, work)
-        strategy = "livekit_egress_hls"
-        if output is None:
-            output = _build_browser_segment(chunks, segment, objects, work)
-            strategy = "browser_chunk_fallback"
+        egress_output = _build_egress_segment(entry, segment, objects, work)
+        browser_output = _build_browser_segment(chunks, segment, objects, work)
+        output, strategy = _prefer_complete_segment(egress_output, browser_output)
         if output is None:
             continue
         segment_media[segment] = {
@@ -176,6 +174,17 @@ def _build_recording(
         _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(full)])
     strategy = "mixed_segment_reconciliation" if len(set(strategies)) > 1 else strategies[0]
     return full, strategy, segment_media
+
+
+def _prefer_complete_segment(egress: Path | None, browser: Path | None) -> tuple[Path | None, str]:
+    """Prefer Egress unless the browser safety copy has materially more media."""
+    if egress is None:
+        return browser, "browser_chunk_fallback"
+    if browser is None:
+        return egress, "livekit_egress_hls"
+    if _media_duration_seconds(browser) > _media_duration_seconds(egress) + 2.0:
+        return browser, "browser_chunk_fallback"
+    return egress, "livekit_egress_hls"
 
 
 def _build_egress_segment(
@@ -209,28 +218,59 @@ def _build_browser_segment(
     )
     if not selected:
         return None
-    chunk_dir = work / "browser" / f"segment_{segment:03d}"
-    chunk_dir.mkdir(parents=True, exist_ok=True)
-    local_chunks = []
-    for index, chunk in enumerate(selected):
-        target = chunk_dir / f"chunk_{index:06d}.webm"
+    chunk_contents = []
+    for chunk in selected:
         try:
-            objects.download_file(str(chunk["bucket"]), str(chunk["objectKey"]), target)
-            local_chunks.append(target)
+            chunk_contents.append(objects.get_bytes(str(chunk["bucket"]), str(chunk["objectKey"])))
         except Exception:
             continue
-    if not local_chunks:
+    streams = _group_webm_chunks(chunk_contents)
+    if not streams:
         return None
-    concat_file = chunk_dir / "chunks.txt"
-    concat_file.write_text("".join(f"file '{path.as_posix()}'\n" for path in local_chunks), encoding="utf-8")
-    joined = work / f"segment_{segment:03d}_browser.webm"
-    _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(joined)])
+
+    chunk_dir = work / "browser" / f"segment_{segment:03d}"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    converted = []
+    for index, content in enumerate(streams):
+        joined = chunk_dir / f"stream_{index:04d}.webm"
+        joined.write_bytes(content)
+        converted_path = chunk_dir / f"stream_{index:04d}.mp4"
+        _run_ffmpeg([
+            "-i", str(joined), "-map", "0:v?", "-map", "0:a?", "-c:v", "libx264",
+            "-preset", "veryfast", "-c:a", "aac", "-movflags", "+faststart", str(converted_path),
+        ])
+        if _media_duration_seconds(converted_path) > 0:
+            converted.append(converted_path)
+    if not converted:
+        return None
+
     output = work / f"segment_{segment:03d}_browser.mp4"
-    _run_ffmpeg([
-        "-i", str(joined), "-map", "0:v?", "-map", "0:a?", "-c:v", "libx264",
-        "-preset", "veryfast", "-c:a", "aac", "-movflags", "+faststart", str(output),
-    ])
+    if len(converted) == 1:
+        output.write_bytes(converted[0].read_bytes())
+    else:
+        concat_file = chunk_dir / "streams.txt"
+        concat_file.write_text(
+            "".join(f"file '{path.as_posix()}'\n" for path in converted),
+            encoding="utf-8",
+        )
+        _run_ffmpeg([
+            "-f", "concat", "-safe", "0", "-i", str(concat_file),
+            "-c", "copy", "-movflags", "+faststart", str(output),
+        ])
     return output if output.is_file() and output.stat().st_size > 0 else None
+
+
+def _group_webm_chunks(contents: list[bytes]) -> list[bytes]:
+    """Reassemble MediaRecorder chunks, splitting at each new EBML stream."""
+    ebml_header = b"\x1a\x45\xdf\xa3"
+    groups: list[bytearray] = []
+    for content in contents:
+        if not content:
+            continue
+        if not groups or content.startswith(ebml_header):
+            groups.append(bytearray())
+        groups[-1].extend(content)
+    return [bytes(group) for group in groups if group]
 
 
 def _create_violation_clips(
@@ -272,7 +312,7 @@ def _create_violation_clips(
             "-map", "0:v?", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
             "-c:a", "aac", "-movflags", "+faststart", str(clip_path),
         ])
-        if not clip_path.is_file() or clip_path.stat().st_size == 0:
+        if _media_duration_seconds(clip_path) <= 0:
             continue
         asset = store.register_asset_bytes(
             session_id,
@@ -307,6 +347,29 @@ def _run_ffmpeg(arguments: list[str]) -> None:
     )
     if completed.returncode != 0:
         raise RuntimeError(f"ffmpeg_failed: {completed.stderr[-800:]}")
+
+
+def _media_duration_seconds(path: Path | None) -> float:
+    """Return zero for empty, corrupt, or streamless media."""
+    if path is None or not path.is_file() or path.stat().st_size == 0:
+        return 0.0
+    completed = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        return 0.0
+    try:
+        duration = float(completed.stdout.strip())
+    except (TypeError, ValueError):
+        return 0.0
+    return duration if duration > 0 else 0.0
 
 
 def _wait_for_object(objects: ObjectStore, bucket: str, key: str, timeout: int) -> bool:

@@ -140,6 +140,23 @@ def test_snapshot_data_url_is_decoded_and_tenant_scope_is_enforced(store: MediaS
         store.start_session(session["id"], {**_scope(), "companyId": 8})
 
 
+def test_duplicate_violation_does_not_queue_duplicate_clip(store: MediaStore) -> None:
+    session = store.create_session(_payload())
+    payload = {
+        **_scope(),
+        "sessionId": session["id"],
+        "violationId": "violation-1",
+        "violationType": "tab_hidden",
+        "occurredAt": 100,
+    }
+
+    store.record_violation(payload)
+    store.record_violation(payload)
+
+    pending = store.get_session(session["id"])["pendingClips"]
+    assert len(pending) == 1
+
+
 def test_deleting_one_asset_does_not_hide_other_assets(store: MediaStore) -> None:
     session = store.create_session(_payload())
     first = store.register_asset_bytes(session["id"], "snapshot", b"first", ".jpg", "image/jpeg", "one")

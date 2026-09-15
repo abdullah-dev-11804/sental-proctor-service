@@ -43,7 +43,14 @@ def analyse_frame(
 
     yaw = matcher._estimate_yaw(quality)
     looking_away = yaw is not None and abs(float(yaw)) >= float(settings.monitor_lookaway_yaw_threshold)
-    spoof_detected = quality.face_count == 1 and quality.antispoof_passed is False
+    # A frame below the normal "live" threshold is inconclusive, not proof of
+    # spoofing. Match the identity pipeline's three-way decision and report a
+    # spoof only at the stricter confirmed-spoof threshold.
+    spoof_detected = (
+        quality.face_count == 1
+        and quality.antispoof_score is not None
+        and float(quality.antispoof_score) <= float(settings.identity_antispoof_spoof_threshold)
+    )
     identity_result = "not_checked"
     similarity_score = None
 
