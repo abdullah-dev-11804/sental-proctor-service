@@ -378,7 +378,8 @@ class MediaStore:
         chunks = list(session.get("chunks") or [])
         chunks.append(entry)
         session["chunks"] = chunks
-        self._prune_old_chunks(session, now)
+        # Every chunk can be needed to bridge an Egress gap during finalization.
+        # Cleanup happens only after durable evidence is reconciled with Moodle.
         self._save_session(session)
         return {"ok": True, "chunk": entry}
 
@@ -599,12 +600,84 @@ class MediaStore:
         session["chunks"] = []
         self._save_session(session)
 
-    def _delete_temporary_media(self, session: dict[str, Any]) -> None:
-        self._delete_temporary_chunks(session)
+    def _delete_temporary_media(self, session: dict[str, Any]) -> dict[str, Any]:
+        temporary = dict(session.get("temporaryMedia") or {})
+        full_recording = dict(temporary.get("fullRecording") or {})
+        deleted_full_recording = False
+        if full_recording.get("bucket") and full_recording.get("objectKey"):
+            deleted_full_recording = self.objects.delete(
+                str(full_recording["bucket"]),
+                str(full_recording["objectKey"]),
+            )
+        deleted_chunks = 0
+        for chunk in session.get("chunks") or []:
+            deleted_chunks += 1 if self.objects.delete(str(chunk["bucket"]), str(chunk["objectKey"])) else 0
+        session["chunks"] = []
+        deleted_egress_objects = 0
+        prefixes = []
         for entry in (session.get("recording") or {}).get("segments", {}).values():
             prefix = str((entry.get("egress") or {}).get("objectPrefix") or "")
             if prefix:
-                self.objects.delete_prefix(self.settings.s3_bucket_temp, prefix)
+                prefixes.append(prefix)
+                deleted_egress_objects += self.objects.delete_prefix(self.settings.s3_bucket_temp, prefix)
+        receipt = {
+            "deletedAt": _now(),
+            "deletedFullRecording": deleted_full_recording,
+            "deletedBrowserChunks": deleted_chunks,
+            "deletedEgressObjects": deleted_egress_objects,
+            "egressPrefixes": prefixes,
+        }
+        session["temporaryMedia"] = {
+            **temporary,
+            "state": "deleted",
+            "deletionReceipt": receipt,
+        }
+        self._save_session(session)
+        return receipt
+
+    @_session_locked
+    def reconcile_and_cleanup_temporary_media(self, session_id: str) -> dict[str, Any]:
+        """Delete source media only after durable assets reached Moodle."""
+        session = self.get_session(session_id)
+        return self._cleanup_temporary_media_if_ready(session)
+
+    def _cleanup_temporary_media_if_ready(self, session: dict[str, Any]) -> dict[str, Any]:
+        """Locked implementation shared by the cleanup job and manual reconciliation."""
+        temporary = dict(session.get("temporaryMedia") or {})
+        if temporary.get("state") == "deleted":
+            return dict(temporary.get("deletionReceipt") or {})
+        if _now() < int(temporary.get("cleanupNotBefore") or 0):
+            raise RuntimeError("temporary_media_reconciliation_period_active")
+
+        required_event_ids = [str(value) for value in temporary.get("requiredEventIds") or []]
+        latest_deliveries: dict[str, str] = {}
+        for delivery in session.get("webhookDeliveries") or []:
+            event_id = str(delivery.get("eventId") or "")
+            if event_id:
+                latest_deliveries[event_id] = str(delivery.get("status") or "")
+        undelivered = [
+            event_id for event_id in required_event_ids
+            if latest_deliveries.get(event_id) != "delivered"
+        ]
+        if undelivered:
+            raise RuntimeError("temporary_media_webhooks_pending: " + ",".join(undelivered[:10]))
+
+        missing_assets = []
+        for asset_id in temporary.get("requiredAssetIds") or []:
+            asset = self._find_asset(str(asset_id))
+            if asset is None or asset.get("status") != "active" or not self.objects.exists(
+                str(asset.get("bucket") or ""),
+                str(asset.get("objectKey") or ""),
+            ):
+                missing_assets.append(str(asset_id))
+        if missing_assets:
+            raise RuntimeError("temporary_media_assets_missing: " + ",".join(missing_assets[:10]))
+
+        temporary["reconciledAt"] = _now()
+        temporary["state"] = "reconciled"
+        session["temporaryMedia"] = temporary
+        self._save_session(session)
+        return self._delete_temporary_media(session)
 
     def _save_asset_file(
         self,
@@ -889,7 +962,20 @@ class MediaStore:
             "missingCount": len(missing),
         }
         self._save_session(session)
-        return {"available": available, "missing": missing, **session["reconciliation"]}
+        cleanup = None
+        cleanup_pending = None
+        if session.get("temporaryMedia") and not resend_webhooks:
+            try:
+                cleanup = self._cleanup_temporary_media_if_ready(session)
+            except RuntimeError as exc:
+                cleanup_pending = str(exc)
+        return {
+            "available": available,
+            "missing": missing,
+            "temporaryCleanup": cleanup,
+            "temporaryCleanupPending": cleanup_pending,
+            **session["reconciliation"],
+        }
 
     def _payload_user_id(self, payload: dict[str, Any]) -> int | None:
         user = payload.get("user")

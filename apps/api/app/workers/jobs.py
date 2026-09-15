@@ -67,7 +67,7 @@ def _record_delivery(
 
 
 def finalize_session_media(session_id: str, reason: str = "submitted", result: str = "passed") -> dict[str, Any]:
-    """Finalize Egress/browser media, create clips, then publish the final result."""
+    """Build temporary full media, retain key evidence, then publish the result."""
     settings = get_settings()
     store = MediaStore()
     objects = ObjectStore(settings)
@@ -82,38 +82,81 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
             recording, strategy, segment_media = _build_recording(session, objects, work)
             if recording is None:
                 raise RuntimeError("media_finalization_failed: no durable recording was available")
-            recording_asset = store.register_asset_bytes(
-                session_id,
-                "full_recording",
-                recording.read_bytes(),
-                ".mp4",
+            temporary_recording = objects.put_file(
+                settings.s3_bucket_temp,
+                (
+                    f"temp/{int(session.get('companyId') or 0)}/{session_id}/"
+                    "finalized/full-session.mp4"
+                ),
+                recording,
                 "video/mp4",
-                "full_session",
-                metadata={"strategy": strategy, "segmentCount": len(segment_media)},
+                {
+                    "session-id": session_id,
+                    "company-id": str(int(session.get("companyId") or 0)),
+                    "temporary": "true",
+                },
             )
             _create_violation_clips(
                 store,
                 session_id,
                 session,
                 recording,
-                recording_asset["assetId"],
                 work,
                 segment_media,
             )
 
+        cleanup_not_before = int(time.time()) + max(1, int(settings.media_reconciliation_grace_seconds))
         with store.state.session_lock(session_id):
             session = store.get_session(session_id)
-            session["processing"] = {"state": "completed", "jobId": _current_job_id(), "error": None}
+            session["processing"] = {
+                "state": "completed",
+                "jobId": _current_job_id(),
+                "error": None,
+                "recordingStrategy": strategy,
+            }
             recording = dict(session.get("recording") or {})
             recording["state"] = "completed"
             session["recording"] = recording
+            required_assets = [
+                str(asset["assetId"])
+                for asset in session.get("assets") or []
+                if asset.get("status") == "active"
+            ]
+            session["temporaryMedia"] = {
+                "state": "awaiting_reconciliation",
+                "cleanupNotBefore": cleanup_not_before,
+                "fullRecording": {
+                    "bucket": temporary_recording.bucket,
+                    "objectKey": temporary_recording.key,
+                    "sizeBytes": temporary_recording.size,
+                    "strategy": strategy,
+                    "segmentCount": len(segment_media),
+                },
+                "requiredAssetIds": required_assets,
+                "requiredEventIds": [
+                    *[f"asset-{asset_id}" for asset_id in required_assets],
+                    f"final-{session_id}",
+                ],
+            }
             store._save_session(session)
-            store._delete_temporary_media(session)
             store._finalize_session(
                 session,
                 result="failed" if result == "failed" else "passed",
                 reason=reason,
             )
+        cleanup = store.jobs.enqueue(
+            "app.workers.jobs.cleanup_temporary_media",
+            session_id,
+            job_id=f"cleanup-{session_id}",
+            retry=True,
+            delay_seconds=max(1, int(settings.media_reconciliation_grace_seconds)),
+        )
+        with store.state.session_lock(session_id):
+            session = store.get_session(session_id)
+            temporary = dict(session.get("temporaryMedia") or {})
+            temporary["cleanupJobId"] = cleanup["jobId"]
+            session["temporaryMedia"] = temporary
+            store._save_session(session)
         return {"status": "completed", "sessionId": session_id}
     except Exception as exc:
         with store.state.session_lock(session_id):
@@ -132,6 +175,28 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
             store._save_session(session)
             if retries_left <= 0:
                 store._finalize_session(session, result="failed", reason="media_processing_failed")
+        raise
+
+
+def cleanup_temporary_media(session_id: str) -> dict[str, Any]:
+    """Reconcile durable evidence and remove full-session temporary source media."""
+    store = MediaStore()
+    try:
+        receipt = store.reconcile_and_cleanup_temporary_media(session_id)
+        return {"status": "deleted", "sessionId": session_id, "receipt": receipt}
+    except Exception as exc:
+        with store.state.session_lock(session_id):
+            session = store.get_session(session_id)
+            temporary = dict(session.get("temporaryMedia") or {})
+            retries_left = _current_retries_left()
+            temporary.update({
+                "state": "retrying" if retries_left > 0 else "manual_reconciliation_required",
+                "lastError": str(exc)[:1000],
+                "retriesLeft": retries_left,
+                "lastCheckedAt": int(time.time()),
+            })
+            session["temporaryMedia"] = temporary
+            store._save_session(session)
         raise
 
 
@@ -278,7 +343,6 @@ def _create_violation_clips(
     session_id: str,
     session: dict[str, Any],
     recording: Path,
-    source_asset_id: str,
     work: Path,
     segment_media: dict[int, dict[str, Any]],
 ) -> None:
@@ -323,7 +387,7 @@ def _create_violation_clips(
             str(candidate.get("reason") or violation.get("type") or "violation"),
             violation_id=candidate.get("violationId") or violation.get("id"),
             metadata={
-                "sourceAssetId": source_asset_id,
+                "source": "temporary_full_session",
                 "clipStartSeconds": start_offset,
                 "clipDurationSeconds": duration,
                 "recordingSegment": segment,
@@ -335,6 +399,9 @@ def _create_violation_clips(
     current = store.get_session(session_id)
     current["pendingClips"] = candidates
     store._save_session(current)
+    missing = [str(candidate.get("violationId") or "unknown") for candidate in candidates if not candidate.get("assetId")]
+    if missing:
+        raise RuntimeError("violation_clip_creation_failed: " + ",".join(missing[:10]))
 
 
 def _run_ffmpeg(arguments: list[str]) -> None:

@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import app.workers.jobs as worker_jobs
 from app.core.config import Settings
 from app.services.media_store import MediaStore
 
@@ -157,6 +158,45 @@ def test_duplicate_violation_does_not_queue_duplicate_clip(store: MediaStore) ->
     assert len(pending) == 1
 
 
+def test_finalization_retains_only_key_evidence_and_schedules_source_cleanup(
+    store: MediaStore, monkeypatch
+) -> None:
+    session = store.create_session(_payload())
+
+    def build_recording(_session, _objects, work):
+        recording = work / "recording.mp4"
+        recording.write_bytes(b"temporary-full-session")
+        return recording, "browser_chunk_fallback", {}
+
+    def create_clips(service, session_id, *_args):
+        service.register_asset_bytes(
+            session_id,
+            "video_clip",
+            b"clip",
+            ".mp4",
+            "video/mp4",
+            "tab_hidden",
+            violation_id="violation-1",
+        )
+
+    monkeypatch.setattr(worker_jobs, "get_settings", lambda: store.settings)
+    monkeypatch.setattr(worker_jobs, "MediaStore", lambda: store)
+    monkeypatch.setattr(worker_jobs, "ObjectStore", lambda _settings: store.objects)
+    monkeypatch.setattr(worker_jobs, "_build_recording", build_recording)
+    monkeypatch.setattr(worker_jobs, "_create_violation_clips", create_clips)
+
+    result = worker_jobs.finalize_session_media(session["id"])
+    current = store.get_session(session["id"])
+
+    assert result["status"] == "completed"
+    assert [asset["type"] for asset in current["assets"]] == ["video_clip"]
+    assert current["temporaryMedia"]["state"] == "awaiting_reconciliation"
+    full_recording = current["temporaryMedia"]["fullRecording"]
+    assert store.objects.exists(full_recording["bucket"], full_recording["objectKey"])
+    assert store.jobs.calls[-1][0] == "app.workers.jobs.cleanup_temporary_media"
+    assert store.jobs.calls[-1][2]["delay_seconds"] == store.settings.media_reconciliation_grace_seconds
+
+
 def test_deleting_one_asset_does_not_hide_other_assets(store: MediaStore) -> None:
     session = store.create_session(_payload())
     first = store.register_asset_bytes(session["id"], "snapshot", b"first", ".jpg", "image/jpeg", "one")
@@ -193,6 +233,54 @@ def test_reconciliation_marks_only_the_missing_physical_object(store: MediaStore
     assert result["available"] == [available["assetId"]]
     assert store.state.get_asset(missing["assetId"])["status"] == "missing"
     assert store.state.get_asset(available["assetId"])["status"] == "active"
+
+
+def test_temporary_media_waits_for_moodle_delivery_then_is_deleted(store: MediaStore) -> None:
+    session = store.create_session(_payload())
+    clip = store.register_asset_bytes(
+        session["id"], "video_clip", b"clip", ".mp4", "video/mp4", "tab_hidden"
+    )
+    temporary = store.objects.put_bytes(
+        store.settings.s3_bucket_temp,
+        f"temp/7/{session['id']}/browser/segment_001/chunk_000001.webm",
+        b"temporary",
+        "video/webm",
+    )
+    full_recording = store.objects.put_bytes(
+        store.settings.s3_bucket_temp,
+        f"temp/7/{session['id']}/finalized/full-session.mp4",
+        b"temporary-full-session",
+        "video/mp4",
+    )
+    session = store.get_session(session["id"])
+    session["chunks"] = [{"bucket": temporary.bucket, "objectKey": temporary.key}]
+    session["temporaryMedia"] = {
+        "state": "awaiting_reconciliation",
+        "cleanupNotBefore": 0,
+        "fullRecording": {"bucket": full_recording.bucket, "objectKey": full_recording.key},
+        "requiredAssetIds": [clip["assetId"]],
+        "requiredEventIds": [f"asset-{clip['assetId']}", f"final-{session['id']}"],
+    }
+    store._save_session(session)
+
+    with pytest.raises(RuntimeError, match="webhooks_pending"):
+        store.reconcile_and_cleanup_temporary_media(session["id"])
+    assert store.objects.exists(temporary.bucket, temporary.key)
+
+    session = store.get_session(session["id"])
+    session["webhookDeliveries"] = [
+        {"eventId": f"asset-{clip['assetId']}", "status": "delivered"},
+        {"eventId": f"final-{session['id']}", "status": "delivered"},
+    ]
+    store._save_session(session)
+
+    receipt = store.reconcile_and_cleanup_temporary_media(session["id"])
+
+    assert receipt["deletedBrowserChunks"] == 1
+    assert receipt["deletedFullRecording"] is True
+    assert not store.objects.exists(temporary.bucket, temporary.key)
+    assert not store.objects.exists(full_recording.bucket, full_recording.key)
+    assert store.get_session(session["id"])["temporaryMedia"]["state"] == "deleted"
 
 
 def test_asset_webhook_uses_a_deterministic_receiver_event_id(store: MediaStore) -> None:

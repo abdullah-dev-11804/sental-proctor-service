@@ -13,10 +13,10 @@ This service is intentionally separate from Moodle:
   MiniFASNet passive anti-spoofing, and SixDRepNet head pose.
 - Authenticated, company-scoped Moodle integration endpoints.
 - LiveKit participant Egress to private MinIO HLS segments.
-- Browser MediaRecorder chunk fallback when Egress cannot start.
+- Low-bitrate browser MediaRecorder safety chunks alongside LiveKit Egress.
 - Redis/RQ media finalization and signed webhook jobs with retries and dead-letter visibility.
-- FFmpeg full-recording assembly and timestamped violation clips.
-- Indexed, company-scoped recordings, clips, snapshots, identity evidence, and retention state.
+- Temporary FFmpeg full-session assembly and timestamped violation clips.
+- Indexed, company-scoped clips, snapshots, identity evidence, and retention state; complete source media is deleted after Moodle reconciliation.
 - Session interruption/resume, partial-media preservation, evidence hold/release, and reconciliation.
 - Detailed health and per-session diagnostics for deployment validation.
 - Moodle-side PDF reports; the Proctoring Server supplies indexed evidence and final status.

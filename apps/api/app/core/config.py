@@ -124,6 +124,7 @@ class Settings(BaseSettings):
     clip_pre_seconds: int = 15
     clip_post_seconds: int = 15
     media_chunk_retention_seconds: int = 900
+    media_reconciliation_grace_seconds: int = 300
     media_upload_token_ttl_seconds: int = 14400
     media_chunk_max_bytes: int = 26214400
     monitor_lookaway_yaw_threshold: float = 0.42

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Any
 
 from app.core.config import Settings, get_settings
@@ -15,6 +16,7 @@ class JobQueue:
         *args: Any,
         job_id: str | None = None,
         retry: bool = False,
+        delay_seconds: int = 0,
         **kwargs: Any,
     ) -> dict[str, Any]:
         from redis import Redis
@@ -25,18 +27,30 @@ class JobQueue:
         connection = Redis.from_url(self.settings.redis_url)
         queue = Queue(self.settings.queue_name, connection=connection, default_timeout=14400)
         try:
-            job = queue.enqueue_call(
-                func=function,
-                args=args,
-                kwargs=kwargs,
-                job_id=job_id,
-                result_ttl=86400,
-                failure_ttl=604800,
-                retry=Retry(
+            options = {
+                "job_id": job_id,
+                "result_ttl": 86400,
+                "failure_ttl": 604800,
+                "retry": Retry(
                     max=max(1, int(self.settings.webhook_max_attempts)),
                     interval=self.settings.webhook_retry_schedule,
                 ) if retry else None,
-            )
+            }
+            if delay_seconds > 0:
+                job = queue.enqueue_in(
+                    timedelta(seconds=int(delay_seconds)),
+                    function,
+                    *args,
+                    **kwargs,
+                    **options,
+                )
+            else:
+                job = queue.enqueue_call(
+                    func=function,
+                    args=args,
+                    kwargs=kwargs,
+                    **options,
+                )
         except (InvalidJobOperation, ValueError):
             if not job_id:
                 raise
