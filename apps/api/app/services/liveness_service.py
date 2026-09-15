@@ -133,8 +133,9 @@ class LivenessService:
         transaction_id: str,
         enrollment: bool,
         illumination_required: bool = False,
+        movement_required: bool = True,
     ) -> dict[str, Any]:
-        required = self._required_components(enrollment, illumination_required)
+        required = self._required_components(enrollment, illumination_required, movement_required)
         if any(required.values()) and hasattr(self.store, "failure_count"):
             failures = self.store.failure_count(company_id, user_id, context_id)
             if failures >= max(1, int(self.settings.identity_liveness_retry_limit)):
@@ -216,8 +217,13 @@ class LivenessService:
         )
         return self._public_challenge(challenge)
 
-    def required_components(self, enrollment: bool, illumination_required: bool = False) -> dict[str, bool]:
-        return self._required_components(enrollment, illumination_required)
+    def required_components(
+        self,
+        enrollment: bool,
+        illumination_required: bool = False,
+        movement_required: bool = True,
+    ) -> dict[str, bool]:
+        return self._required_components(enrollment, illumination_required, movement_required)
 
     def validate(
         self,
@@ -595,7 +601,12 @@ class LivenessService:
             },
         }
 
-    def _required_components(self, enrollment: bool, illumination_required: bool = False) -> dict[str, bool]:
+    def _required_components(
+        self,
+        enrollment: bool,
+        illumination_required: bool = False,
+        movement_required: bool = True,
+    ) -> dict[str, bool]:
         active = bool(
             self.settings.identity_active_liveness_enabled
             or self.settings.identity_require_active_liveness
@@ -606,7 +617,7 @@ class LivenessService:
                 self.settings.identity_temporal_passive_pad_enabled
                 or self.settings.identity_require_passive_antispoof
             ),
-            "headPose": bool(active and (
+            "headPose": bool(movement_required and active and (
                 self.settings.identity_headpose_challenge_enabled
                 or self.settings.identity_require_headpose_liveness
             )),

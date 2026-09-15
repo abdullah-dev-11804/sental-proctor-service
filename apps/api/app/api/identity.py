@@ -88,6 +88,7 @@ class LivenessChallengeRequest(BaseModel):
     contextId: str = Field(min_length=1, max_length=128)
     enrollment: bool = False
     illuminationRequired: bool = False
+    movementRequired: bool = True
 
 
 class LivenessQualityRequest(LivenessChallengeRequest):
@@ -120,6 +121,7 @@ def issue_liveness_challenge(
             payload.transactionId,
             payload.enrollment,
             payload.illuminationRequired,
+            payload.movementRequired,
         )
     except ValueError as exc:
         code = str(exc)

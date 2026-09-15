@@ -159,6 +159,21 @@ def test_illumination_request_respects_server_feature_switch():
     assert challenge["components"]["illumination"] is False
 
 
+def test_movement_request_can_disable_headpose_without_disabling_passive_pad():
+    service = LivenessService(FakeMatcher(), settings(), MemoryStore())
+    challenge = service.issue(
+        3,
+        245,
+        "quiz:10",
+        "transaction-123",
+        False,
+        False,
+        False,
+    )
+    assert challenge["components"]["headPose"] is False
+    assert challenge["components"]["passivePad"] is True
+
+
 def test_liveness_signal_models_receive_only_their_evidence_stream():
     service = LivenessService(FakeMatcher(), settings(), MemoryStore())
     frames = [
