@@ -5,6 +5,7 @@ PYTHON ?= python3.12
 install:
 	$(PYTHON) -m venv .venv
 	. .venv/bin/activate && pip install --upgrade pip
+	. .venv/bin/activate && pip install --index-url https://download.pytorch.org/whl/cpu torch==2.8.0 torchaudio==2.8.0
 	. .venv/bin/activate && pip install -r apps/api/requirements.txt
 
 dev:

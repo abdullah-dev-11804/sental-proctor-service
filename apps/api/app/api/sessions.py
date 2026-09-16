@@ -36,6 +36,7 @@ class MoodleSessionCreateRequest(BaseModel):
     returnUrl: str | None = None
     timer: dict | None = None
     retention: dict | None = None
+    audioAnalysis: dict | None = None
     source: dict | None = None
 
 
@@ -176,6 +177,8 @@ def get_moodle_session(session_id: str, x_proctorcore_company: int | None = Head
             "assets": session.get("assets", []),
             "violations": session.get("violations", []),
             "processing": session.get("processing", {}),
+            "audioAnalysis": session.get("audioAnalysis", {}),
+            "audioAnalysisState": session.get("audioAnalysisState", {}),
             "retention": session.get("retention", {}),
             "webhookDeliveries": session.get("webhookDeliveries", []),
         },

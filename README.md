@@ -20,9 +20,8 @@ This service is intentionally separate from Moodle:
 - Session interruption/resume, partial-media preservation, evidence hold/release, and reconciliation.
 - Detailed health and per-session diagnostics for deployment validation.
 - Moodle-side PDF reports; the Proctoring Server supplies indexed evidence and final status.
-
-Audio content analysis is outside the current production-hardening slice. Camera and microphone
-tracks are recorded, but VAD, noise classification, and speaker analysis are not enabled yet.
+- Optional real-time LiveKit microphone analysis with RMS/dBFS noise detection, Silero VAD,
+  SpeechBrain ECAPA-TDNN temporal speaker clustering, and cautious suspicious-speech rules.
 
 ## Quick Start
 
@@ -34,8 +33,10 @@ cp .env.example .env
 apps/api/scripts/create_venv.sh
 source .venv/bin/activate
 pip install --upgrade pip
+pip install --index-url https://download.pytorch.org/whl/cpu torch==2.8.0 torchaudio==2.8.0
 pip install -r apps/api/requirements.txt
-# Place the approved SCRFD, AdaFace, MiniFASNet and SixDRepNet ONNX files in models/.
+# Place the approved face models in models/, then install the pinned audio models if enabled.
+python apps/api/scripts/download_audio_models.py --model-root models/audio
 uvicorn app.main:app --app-dir apps/api --reload --host 127.0.0.1 --port 8091
 ```
 
@@ -63,7 +64,8 @@ curl -X POST http://127.0.0.1:8091/v1/identity/verify \
 ```bash
 cd sental-proctor-service
 cp .env.example .env
-# Place the approved SCRFD, AdaFace, MiniFASNet and SixDRepNet ONNX files in models/.
+# Place the approved face models in models/ and install audio models when enabling audio analysis.
+python apps/api/scripts/download_audio_models.py --model-root models/audio
 docker compose up --build
 ```
 
@@ -78,6 +80,10 @@ not SCRFD + AdaFace; YuNet, SFace and Haar fallbacks are not supported.
 For the stronger face stack, set `IDENTITY_ENGINE=scrfd_adaface` and place the
 required SCRFD/AdaFace ONNX files under `models/`. Details are in
 `docs/identity-production-stack.md`.
+
+Audio model licensing, settings, health checks, calibration and manual testing are documented in
+`docs/audio-production-pipeline.md`. Audio analysis remains disabled until both the Server B
+environment and the Moodle administrator setting enable it.
 
 The randomized temporal liveness flow, configuration, manual attack matrix, and
 calibration procedure are documented in `docs/liveness-validation.md`.

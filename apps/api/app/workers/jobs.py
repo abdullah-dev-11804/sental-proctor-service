@@ -77,6 +77,8 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
         store._save_session(session)
 
     try:
+        _wait_for_audio_analysis(store, session_id, settings)
+        session = store.get_session(session_id)
         with tempfile.TemporaryDirectory(prefix=f"proctor-{session_id[:12]}-") as temporary:
             work = Path(temporary)
             recording, strategy, segment_media = _build_recording(session, objects, work)
@@ -176,6 +178,31 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
             if retries_left <= 0:
                 store._finalize_session(session, result="failed", reason="media_processing_failed")
         raise
+
+
+def _wait_for_audio_analysis(store: MediaStore, session_id: str, settings) -> None:
+    """Allows the live analyzer to flush its final active speech/noise event."""
+    session = store.get_session(session_id)
+    requested = bool((session.get("audioAnalysis") or {}).get("enabled"))
+    if not requested or not settings.audio_analysis_enabled:
+        return
+    deadline = time.monotonic() + max(1, int(settings.audio_finalize_wait_seconds))
+    while time.monotonic() < deadline:
+        session = store.get_session(session_id)
+        state = session.get("audioAnalysisState") if isinstance(session.get("audioAnalysisState"), dict) else {}
+        if state.get("status") in {"stopped", "failed", "degraded"}:
+            return
+        time.sleep(0.25)
+    with store.state.session_lock(session_id):
+        session = store.get_session(session_id)
+        state = session.get("audioAnalysisState") if isinstance(session.get("audioAnalysisState"), dict) else {}
+        state.update({
+            "status": "degraded",
+            "error": "audio_analysis_flush_timeout",
+            "updatedAt": int(time.time()),
+        })
+        session["audioAnalysisState"] = state
+        store._save_session(session)
 
 
 def cleanup_temporary_media(session_id: str) -> dict[str, Any]:

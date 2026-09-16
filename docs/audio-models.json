@@ -1,0 +1,22 @@
+{
+  "models": [
+    {
+      "name": "Silero VAD",
+      "version": "v6.2",
+      "source": "https://github.com/snakers4/silero-vad/tree/v6.2",
+      "artifact": "src/silero_vad/data/silero_vad.onnx",
+      "license": "MIT",
+      "sha256": "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
+    },
+    {
+      "name": "SpeechBrain spkrec-ecapa-voxceleb",
+      "version": "0f99f2d0ebe89ac095bcc5903c4dd8f72b367286",
+      "source": "https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb/tree/0f99f2d0ebe89ac095bcc5903c4dd8f72b367286",
+      "artifact": "embedding_model.ckpt",
+      "license": "Apache-2.0",
+      "sha256": "0575cb64845e6b9a10db9bcb74d5ac32b326b8dc90352671d345e2ee3d0126a2",
+      "trainingData": "VoxCeleb1 and VoxCeleb2",
+      "publishedEerPercent": 0.8
+    }
+  ]
+}

@@ -107,6 +107,7 @@ class MediaStore:
             "pendingClips": [],
             "assets": [],
             "violations": [],
+            "audioAnalysis": payload.get("audioAnalysis") if isinstance(payload.get("audioAnalysis"), dict) else {},
             "source": payload,
         }
         self._save_session(session)
@@ -429,17 +430,35 @@ class MediaStore:
             )
         return {"ok": True, "status": "captured", "reason": reason, "assetId": asset["assetId"]}
 
+    @_session_locked
     def record_violation(self, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(str(payload.get("sessionId") or payload.get("session_id")))
         self._require_scope(session, payload)
         now = self._timestamp(payload.get("occurredAt") or payload.get("occurred_at")) or _now()
+        violation_id = str(payload.get("violationId") or uuid4().hex)
+        existing = next(
+            (item for item in session.get("violations") or [] if str(item.get("id")) == violation_id),
+            None,
+        )
+        if existing:
+            deliveries = [
+                item for item in session.get("webhookDeliveries") or []
+                if str(item.get("eventId")) == violation_id
+            ]
+            if not deliveries or str(deliveries[-1].get("status")) in {"queue_failed", "retrying"}:
+                self._send_violation_webhook(session, existing)
+            return {"ok": True, "status": "duplicate", "violation": existing}
         violation = {
-            "id": str(payload.get("violationId") or uuid4().hex),
+            "id": violation_id,
             "type": str(payload.get("violationType") or payload.get("violation_type") or "unknown"),
             "severity": payload.get("severity") or "warning",
             "confidence": payload.get("confidence"),
             "occurredAt": now,
-            "metadata": payload,
+            "endedAt": self._timestamp(payload.get("endedAt") or payload.get("ended_at")),
+            "durationMs": max(0, int(payload.get("durationMs") or payload.get("duration_ms") or 0)),
+            "description": str(payload.get("description") or "")[:500],
+            "source": str(payload.get("source") or "server")[:64],
+            "metadata": payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {},
         }
         session.setdefault("violations", []).append(violation)
         self._queue_clip(
@@ -449,6 +468,8 @@ class MediaStore:
             violation_id=violation["id"],
             segment=int(self._recording(session).get("currentSegment") or 1),
         )
+        self._save_session(session)
+        self._send_violation_webhook(session, violation)
         return {"ok": True, "status": "recorded", "violation": violation}
 
     def get_asset_content(self, asset_id: str) -> tuple[bytes, str]:
@@ -740,6 +761,18 @@ class MediaStore:
             "attemptId": session.get("attemptId"),
             "userId": session.get("userId"),
             "asset": asset,
+        })
+
+    def _send_violation_webhook(self, session: dict[str, Any], violation: dict[str, Any]) -> None:
+        self._send_webhook(session, {
+            "eventId": str(violation["id"]),
+            "eventType": "violation.detected",
+            "sessionId": session["id"],
+            "moodleSessionId": session.get("moodleSessionId"),
+            "companyId": session.get("companyId"),
+            "attemptId": session.get("attemptId"),
+            "userId": session.get("userId"),
+            "violation": violation,
         })
 
     def _finalize_session(self, session: dict[str, Any], *, result: str, reason: str) -> None:

@@ -130,6 +130,40 @@ class Settings(BaseSettings):
     monitor_lookaway_yaw_threshold: float = 0.42
     monitor_request_timeout_seconds: float = 8.0
 
+    # Real-time microphone analysis. Models are mounted locally and are never
+    # downloaded implicitly by the running production service.
+    audio_analysis_enabled: bool = False
+    audio_sample_rate: int = 16000
+    audio_model_root: Path = Path("./models/audio")
+    audio_silero_model: str = "silero_vad.onnx"
+    audio_silero_model_version: str = "v6.2"
+    audio_silero_model_sha256: str = ""
+    audio_speaker_model: str = "speechbrain-spkrec-ecapa-voxceleb"
+    audio_speaker_model_version: str = "0f99f2d0ebe89ac095bcc5903c4dd8f72b367286"
+    audio_speaker_model_sha256: str = ""
+    audio_background_noise_enabled: bool = True
+    audio_noise_threshold_dbfs: float = -35.0
+    audio_noise_min_duration_seconds: float = 5.0
+    audio_noise_cooldown_seconds: int = 60
+    audio_speech_enabled: bool = True
+    audio_vad_threshold: float = 0.65
+    audio_speech_min_duration_seconds: float = 0.8
+    audio_speech_cooldown_seconds: int = 30
+    audio_second_speaker_enabled: bool = True
+    audio_speaker_similarity_threshold: float = 0.72
+    audio_speaker_min_segments: int = 3
+    audio_speaker_window_seconds: int = 60
+    audio_second_speaker_cooldown_seconds: int = 120
+    audio_prompting_enabled: bool = True
+    audio_prompt_sustained_speech_seconds: float = 12.0
+    audio_prompt_rolling_speech_seconds: float = 20.0
+    audio_prompt_window_seconds: int = 60
+    audio_prompt_multispeaker_enabled: bool = True
+    audio_prompt_cooldown_seconds: int = 180
+    audio_supervisor_poll_seconds: float = 2.0
+    audio_health_stale_seconds: int = 20
+    audio_finalize_wait_seconds: int = 15
+
     default_video_retention_days: int = 30
     default_report_retention_days: int = 183
     default_appeal_period_days: int = 14
@@ -164,4 +198,5 @@ def get_settings() -> Settings:
     settings = Settings()
     settings.local_storage_root.mkdir(parents=True, exist_ok=True)
     settings.identity_model_root.mkdir(parents=True, exist_ok=True)
+    settings.audio_model_root.mkdir(parents=True, exist_ok=True)
     return settings

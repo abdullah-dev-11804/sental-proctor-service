@@ -34,6 +34,7 @@ def main() -> None:
         and int((features.get("worker") or {}).get("workers") or 0) > 0,
         "egress": (features.get("egress") or {}).get("ready") is True,
         "webhook": (features.get("webhook") or {}).get("ready") is True,
+        "audio_analysis": (features.get("audioAnalysis") or {}).get("ready") is True,
     }
     failures.extend(name for name, ready in required.items() if not ready)
 

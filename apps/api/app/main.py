@@ -17,6 +17,7 @@ from app.services.job_queue import JobQueue
 from app.services.livekit_egress import LiveKitEgress
 from app.services.object_store import ObjectStore
 from app.services.state_store import StateStore
+from app.services.audio_analysis import audio_service_status
 
 
 settings = get_settings()
@@ -79,6 +80,7 @@ def health() -> dict:
     egress = LiveKitEgress(settings).status()
     webhook_ready = bool(settings.moodle_webhook_url.strip() and settings.moodle_webhook_secret.strip())
     production = _production_checks(storage, egress)
+    audio = audio_service_status(settings)
     required_ready = bool(
         storage.get("ready")
         and redis_ready
@@ -87,6 +89,7 @@ def health() -> dict:
         and int(queue.get("workers") or 0) > 0
         and egress.get("ready")
         and webhook_ready
+        and audio.get("ready")
         and all(production.values())
     )
     return {
@@ -110,6 +113,7 @@ def health() -> dict:
             "redis": {"ready": redis_ready},
             "worker": queue,
             "egress": egress,
+            "audioAnalysis": audio,
             "webhook": {"ready": webhook_ready, "urlConfigured": bool(settings.moodle_webhook_url.strip())},
             "productionConfiguration": {
                 "ready": all(production.values()),

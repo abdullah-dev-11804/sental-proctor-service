@@ -101,6 +101,28 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  audio-analyzer:
+    build:
+      context: ./apps/api
+    command: python -m app.audio.main
+    env_file:
+      - .env
+    environment:
+      LOCAL_STORAGE_ROOT: /app/storage
+      IDENTITY_MODEL_ROOT: /app/models
+      AUDIO_MODEL_ROOT: /app/models/audio
+      REDIS_URL: redis://redis:6379/0
+      LIVEKIT_INTERNAL_URL: http://livekit:7880
+    volumes:
+      - ./storage:/app/storage
+      - ./models:/app/models:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+    restart: unless-stopped
+
 volumes:
   redis_data:
   minio_data:

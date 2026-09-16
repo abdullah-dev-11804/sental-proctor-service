@@ -46,6 +46,18 @@ class StateStore:
             raise KeyError("session_not_found")
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def list_session_ids(self) -> list[str]:
+        """Returns durable session ids for supervisor-style background services."""
+        values: set[str] = set()
+        try:
+            for key in self.redis.scan_iter(match="proctorcore:session:*", count=500):
+                values.add(str(key).rsplit(":", 1)[-1])
+        except Exception:
+            pass
+        for path in self.sessions_root.glob("*.json"):
+            values.add(path.stem)
+        return sorted(values)
+
     def save_session(self, session: dict[str, Any]) -> None:
         session_id = self._safe(str(session["id"]))
         encoded = json.dumps(session, indent=2, sort_keys=True, ensure_ascii=False)
