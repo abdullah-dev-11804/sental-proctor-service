@@ -214,6 +214,10 @@ class AudioEventEngine:
         self.cluster_observations: deque[tuple[float, int]] = deque()
         self.last_emitted: dict[str, float] = {}
         self.second_speaker_active = False
+        self.diagnostic_frames = 0
+        self.diagnostic_speech_frames = 0
+        self.diagnostic_max_vad = 0.0
+        self.diagnostic_max_dbfs = -180.0
 
     def process(self, samples: np.ndarray, started_at: float) -> list[dict[str, Any]]:
         if not self.policy.enabled:
@@ -252,6 +256,10 @@ class AudioEventEngine:
         smoothed = float(np.mean(self.vad_history))
         speech_active = smoothed >= self.policy.vad_threshold
         dbfs = _dbfs(frame)
+        self.diagnostic_frames += 1
+        self.diagnostic_speech_frames += int(speech_active)
+        self.diagnostic_max_vad = max(self.diagnostic_max_vad, probability)
+        self.diagnostic_max_dbfs = max(self.diagnostic_max_dbfs, dbfs)
         events: list[dict[str, Any]] = []
 
         if self.policy.noise_enabled and dbfs >= self.policy.noise_threshold_dbfs and not speech_active:
@@ -297,6 +305,21 @@ class AudioEventEngine:
             if started_at - float(self.speech_last_at or started_at) >= self.SPEECH_HANGOVER_SECONDS:
                 events.extend(self._finish_speech(float(self.speech_last_at or started_at)))
         return events
+
+    def diagnostics(self, reset: bool = False) -> dict[str, float | int]:
+        """Returns non-content audio levels for operational pipeline diagnostics."""
+        result = {
+            "frames": self.diagnostic_frames,
+            "speechFrames": self.diagnostic_speech_frames,
+            "maxVadProbability": round(self.diagnostic_max_vad, 4),
+            "maxDbfs": round(self.diagnostic_max_dbfs, 2),
+        }
+        if reset:
+            self.diagnostic_frames = 0
+            self.diagnostic_speech_frames = 0
+            self.diagnostic_max_vad = 0.0
+            self.diagnostic_max_dbfs = -180.0
+        return result
 
     def _finish_noise(self, ended_at: float) -> list[dict[str, Any]]:
         if self.noise_started_at is None:

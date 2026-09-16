@@ -61,6 +61,10 @@ def test_silence_has_no_audio_violation() -> None:
     engine = AudioEventEngine(policy(), SequenceVad([0.0] * 100))
     events = engine.process(frames(50), 1000.0) + engine.flush(1002.0)
     assert events == []
+    diagnostics = engine.diagnostics()
+    assert diagnostics["frames"] == 50
+    assert diagnostics["speechFrames"] == 0
+    assert diagnostics["maxVadProbability"] == 0.0
 
 
 def test_short_isolated_sound_is_not_sustained_noise() -> None:
@@ -86,6 +90,10 @@ def test_brief_human_speech_creates_speech_event_without_prompting() -> None:
     events = engine.process(frames(speech_frames, 0.08), 1000.0)
     events += finish_with_silence(engine, 1000.0 + speech_frames * FRAME_SECONDS)
     assert [event["type"] for event in events] == ["speech_detected"]
+    diagnostics = engine.diagnostics(reset=True)
+    assert diagnostics["speechFrames"] > 0
+    assert diagnostics["maxVadProbability"] == 0.95
+    assert engine.diagnostics()["frames"] == 0
 
 
 def test_continuous_speech_can_create_prompting_review_signal() -> None:

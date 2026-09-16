@@ -151,7 +151,7 @@ class AudioSupervisor:
             .to_jwt()
         )
         room = rtc.Room()
-        candidate_track: asyncio.Future = asyncio.get_running_loop().create_future()
+        candidate_tracks: asyncio.Queue[Any] = asyncio.Queue()
 
         @room.on("track_subscribed")
         def on_track_subscribed(track, _publication, participant) -> None:
@@ -163,36 +163,54 @@ class AudioSupervisor:
                 candidate_identity,
             )
             if participant.identity == candidate_identity \
-                    and track.kind == rtc.TrackKind.KIND_AUDIO \
-                    and not candidate_track.done():
-                candidate_track.set_result(track)
+                    and track.kind == rtc.TrackKind.KIND_AUDIO:
+                candidate_tracks.put_nowait(track)
 
         self._mark_session_state(session_id, "connecting")
         try:
             logger.info("Connecting audio monitor session=%s room=%s url=%s", session_id, room_name, rtc_url)
             await room.connect(rtc_url, token, options=rtc.RoomOptions(auto_subscribe=True))
             logger.info("Audio monitor connected session=%s room=%s", session_id, room_name)
-            track = await asyncio.wait_for(candidate_track, timeout=30)
+            track = await asyncio.wait_for(candidate_tracks.get(), timeout=30)
             self._mark_session_state(session_id, "active")
             logger.info("Candidate microphone active session=%s participant=%s", session_id, candidate_identity)
-            stream = rtc.AudioStream(
-                track,
-                capacity=100,
-                sample_rate=16000,
-                num_channels=1,
-                frame_size_ms=32,
+            consumer: asyncio.Task | None = asyncio.create_task(
+                self._consume_audio_track(session_id, track, engine),
+                name=f"audio-track-{session_id}",
             )
-            async for event in stream:
+            missing_since: float | None = None
+            while True:
                 current = self.state.get_session(session_id)
                 recording = current.get("recording") if isinstance(current.get("recording"), dict) else {}
                 if current.get("status") != "active" or recording.get("state") != "active":
                     break
-                frame = event.frame
-                samples = np.frombuffer(frame.data, dtype=np.int16).astype(np.float32) / 32768.0
-                ended_at = time.time()
-                started_at = ended_at - (samples.size / 16000.0)
-                for violation in engine.process(samples, started_at):
-                    self._record_event(current, violation)
+                try:
+                    replacement = await asyncio.wait_for(candidate_tracks.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if consumer is not None and consumer.done():
+                        exception = consumer.exception()
+                        if exception:
+                            raise exception
+                        consumer = None
+                        missing_since = missing_since or time.monotonic()
+                    if consumer is None and missing_since is not None \
+                            and time.monotonic() - missing_since >= 30:
+                        raise RuntimeError("candidate_audio_track_unavailable_for_30_seconds")
+                    continue
+
+                logger.info("Switching to newest candidate microphone track session=%s", session_id)
+                if consumer is not None:
+                    consumer.cancel()
+                    await asyncio.gather(consumer, return_exceptions=True)
+                consumer = asyncio.create_task(
+                    self._consume_audio_track(session_id, replacement, engine),
+                    name=f"audio-track-{session_id}",
+                )
+                missing_since = None
+
+            if consumer is not None:
+                consumer.cancel()
+                await asyncio.gather(consumer, return_exceptions=True)
             current = self.state.get_session(session_id)
             for violation in engine.flush(time.time()):
                 self._record_event(current, violation)
@@ -206,6 +224,48 @@ class AudioSupervisor:
             raise
         finally:
             await room.disconnect()
+
+    async def _consume_audio_track(
+        self,
+        session_id: str,
+        track: Any,
+        engine: AudioEventEngine,
+    ) -> None:
+        from livekit import rtc
+
+        stream = rtc.AudioStream(
+            track,
+            capacity=100,
+            sample_rate=16000,
+            num_channels=1,
+            frame_size_ms=32,
+        )
+        next_diagnostic_at = time.monotonic() + 5
+        try:
+            async for event in stream:
+                current = self.state.get_session(session_id)
+                recording = current.get("recording") if isinstance(current.get("recording"), dict) else {}
+                if current.get("status") != "active" or recording.get("state") != "active":
+                    break
+                frame = event.frame
+                samples = np.frombuffer(frame.data, dtype=np.int16).astype(np.float32) / 32768.0
+                ended_at = time.time()
+                started_at = ended_at - (samples.size / 16000.0)
+                for violation in engine.process(samples, started_at):
+                    self._record_event(current, violation)
+                if time.monotonic() >= next_diagnostic_at:
+                    diagnostics = engine.diagnostics(reset=True)
+                    logger.info(
+                        "Audio frames session=%s frames=%s speech_frames=%s max_vad=%s max_dbfs=%s",
+                        session_id,
+                        diagnostics["frames"],
+                        diagnostics["speechFrames"],
+                        diagnostics["maxVadProbability"],
+                        diagnostics["maxDbfs"],
+                    )
+                    next_diagnostic_at = time.monotonic() + 5
+        finally:
+            await stream.aclose()
 
     def _record_event(self, session: dict[str, Any], event: dict[str, Any]) -> None:
         session_id = str(session["id"])
