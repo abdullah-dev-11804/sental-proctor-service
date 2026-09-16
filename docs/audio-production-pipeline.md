@@ -16,6 +16,9 @@ corresponding WebSocket URL (`http` to `ws`, or `https` to `wss`) before joining
 Moodle question navigation republishes the candidate tracks; the analyzer follows the newest
 microphone track while retaining the same event engine and temporal speaker state. Operational logs
 emit five-second frame counts, peak dBFS, and maximum VAD probability without logging audio content.
+Silero inference matches its official 16 kHz streaming wrapper: each 512-sample frame is combined
+with the preceding 64-sample context before ONNX inference, and recurrent state is retained per
+proctoring session.
 
 The four reportable types are `background_noise`, `speech_detected`,
 `second_voice_detected`, and `possible_prompting`. The final type means only that sustained,

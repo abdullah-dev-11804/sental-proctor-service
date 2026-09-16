@@ -7,7 +7,7 @@ import numpy as np
 
 from app.core.config import Settings
 from app.audio.main import _livekit_rtc_url
-from app.services.audio_analysis import AudioEventEngine, AudioPolicy, SpeechBrainSpeakerEncoder
+from app.services.audio_analysis import AudioEventEngine, AudioPolicy, SileroVad, SpeechBrainSpeakerEncoder
 
 
 FRAME_SECONDS = 512 / 16000
@@ -204,3 +204,38 @@ def test_livekit_http_api_url_is_converted_for_rtc_connection() -> None:
     assert _livekit_rtc_url("https://proctoring.example/rtc") == "wss://proctoring.example/rtc"
     assert _livekit_rtc_url("ws://livekit:7880") == "ws://livekit:7880"
     assert _livekit_rtc_url("wss://proctoring.example/rtc") == "wss://proctoring.example/rtc"
+
+
+def test_silero_streaming_inference_includes_rolling_context(tmp_path, monkeypatch) -> None:
+    model_root = tmp_path / "models" / "audio"
+    model_root.mkdir(parents=True)
+    model_path = model_root / "silero_vad.onnx"
+    model_path.write_bytes(b"pinned-silero-model")
+    checksum = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    received = []
+
+    class FakeInferenceSession:
+        def __init__(self, _path, providers):
+            assert providers == ["CPUExecutionProvider"]
+
+        def run(self, _outputs, inputs):
+            received.append(inputs["input"].copy())
+            return np.array([[0.75]], dtype=np.float32), inputs["state"] + 1
+
+    onnxruntime_module = ModuleType("onnxruntime")
+    onnxruntime_module.InferenceSession = FakeInferenceSession
+    monkeypatch.setitem(sys.modules, "onnxruntime", onnxruntime_module)
+
+    vad = SileroVad(Settings(
+        audio_model_root=model_root,
+        audio_silero_model_sha256=checksum,
+        local_storage_root=tmp_path / "storage",
+    ))
+    assert vad(np.ones(512, dtype=np.float32)) == 0.75
+    assert vad(np.full(512, 2.0, dtype=np.float32)) == 0.75
+
+    assert received[0].shape == (1, 576)
+    np.testing.assert_array_equal(received[0][0, :64], np.zeros(64, dtype=np.float32))
+    np.testing.assert_array_equal(received[1][0, :64], np.ones(64, dtype=np.float32))
+    vad.reset()
+    np.testing.assert_array_equal(vad.context, np.zeros((1, 64), dtype=np.float32))

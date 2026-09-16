@@ -130,16 +130,29 @@ class SileroVad:
         _require_model(self.path, self.settings.audio_silero_model_sha256, "Silero VAD")
         self.session = ort.InferenceSession(str(self.path), providers=["CPUExecutionProvider"])
         self.state = np.zeros((2, 1, 128), dtype=np.float32)
+        # Silero's streaming ONNX wrapper prepends 64 samples of rolling
+        # context to every 512-sample frame at 16 kHz. The graph accepts input
+        # without it, but speech probabilities become unusably low.
+        self.context = np.zeros((1, 64), dtype=np.float32)
         self.sample_rate = np.array(16000, dtype=np.int64)
 
     def __call__(self, frame: np.ndarray) -> float:
         samples = np.asarray(frame, dtype=np.float32).reshape(1, -1)
-        outputs = self.session.run(None, {"input": samples, "state": self.state, "sr": self.sample_rate})
+        if samples.shape[1] != 512:
+            raise ValueError(f"Silero VAD requires 512 samples at 16 kHz, received {samples.shape[1]}")
+        model_input = np.concatenate((self.context, samples), axis=1)
+        outputs = self.session.run(None, {
+            "input": model_input,
+            "state": self.state,
+            "sr": self.sample_rate,
+        })
         self.state = np.asarray(outputs[1], dtype=np.float32)
+        self.context = model_input[:, -64:].copy()
         return float(np.asarray(outputs[0]).reshape(-1)[0])
 
     def reset(self) -> None:
         self.state.fill(0)
+        self.context.fill(0)
 
 
 class SpeechBrainSpeakerEncoder:
