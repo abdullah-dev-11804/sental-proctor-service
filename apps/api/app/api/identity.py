@@ -89,6 +89,8 @@ class LivenessChallengeRequest(BaseModel):
     enrollment: bool = False
     illuminationRequired: bool = False
     movementRequired: bool = True
+    retryLimit: int = Field(default=3, ge=1, le=20)
+    retryWindowSeconds: int = Field(default=900, ge=60, le=86400)
 
 
 class LivenessQualityRequest(LivenessChallengeRequest):
@@ -122,6 +124,8 @@ def issue_liveness_challenge(
             payload.enrollment,
             payload.illuminationRequired,
             payload.movementRequired,
+            payload.retryLimit,
+            payload.retryWindowSeconds,
         )
     except ValueError as exc:
         code = str(exc)

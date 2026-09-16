@@ -29,12 +29,14 @@ class TrackingStore(MemoryStore):
     def __init__(self):
         super().__init__()
         self.failures = 0
+        self.retry_window_seconds = None
 
     def failure_count(self, _company_id, _user_id, _context_id):
         return self.failures
 
-    def register_failure(self, _company_id, _user_id, _context_id):
+    def register_failure(self, _company_id, _user_id, _context_id, _window_seconds=None):
         self.failures += 1
+        self.retry_window_seconds = _window_seconds
         return self.failures
 
     def clear_failures(self, _company_id, _user_id, _context_id):
@@ -514,6 +516,21 @@ def test_retry_limit_rejects_new_challenge_after_configured_failures():
     validate(service, challenge, evidence_for(challenge, movement="none"))
     with pytest.raises(ValueError, match="liveness_retry_limit_reached"):
         issued(service)
+
+
+def test_challenge_retry_policy_overrides_server_defaults():
+    store = TrackingStore()
+    store.failures = 2
+    service = LivenessService(FakeMatcher(), settings(identity_liveness_retry_limit=1), store)
+
+    challenge = service.issue(
+        3, 245, "quiz:10", "transaction-123", False, True, True, 3, 1200,
+    )
+    result = validate(service, challenge, evidence_for(challenge, movement="none"))
+
+    assert challenge["maxAttempts"] == 3
+    assert result["overall"] == "fail"
+    assert store.retry_window_seconds == 1200
 
 
 def test_adaptive_headpose_advances_only_after_each_pose_is_confirmed():

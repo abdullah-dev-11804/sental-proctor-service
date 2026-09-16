@@ -66,11 +66,18 @@ class LivenessChallengeStore:
     def failure_count(self, company_id: int, user_id: int, context_id: str) -> int:
         return int(self.redis.get(self._attempt_key(company_id, user_id, context_id)) or 0)
 
-    def register_failure(self, company_id: int, user_id: int, context_id: str) -> int:
+    def register_failure(
+        self,
+        company_id: int,
+        user_id: int,
+        context_id: str,
+        window_seconds: int | None = None,
+    ) -> int:
         key = self._attempt_key(company_id, user_id, context_id)
         pipeline = self.redis.pipeline()
         pipeline.incr(key)
-        pipeline.expire(key, max(60, int(self.settings.identity_liveness_retry_window_seconds)))
+        window = window_seconds or self.settings.identity_liveness_retry_window_seconds
+        pipeline.expire(key, min(86400, max(60, int(window))))
         count, _expiry = pipeline.execute()
         return int(count)
 
@@ -134,11 +141,18 @@ class LivenessService:
         enrollment: bool,
         illumination_required: bool = False,
         movement_required: bool = True,
+        retry_limit: int | None = None,
+        retry_window_seconds: int | None = None,
     ) -> dict[str, Any]:
+        retry_limit = min(20, max(1, int(retry_limit or self.settings.identity_liveness_retry_limit)))
+        retry_window_seconds = min(
+            86400,
+            max(60, int(retry_window_seconds or self.settings.identity_liveness_retry_window_seconds)),
+        )
         required = self._required_components(enrollment, illumination_required, movement_required)
         if any(required.values()) and hasattr(self.store, "failure_count"):
             failures = self.store.failure_count(company_id, user_id, context_id)
-            if failures >= max(1, int(self.settings.identity_liveness_retry_limit)):
+            if failures >= retry_limit:
                 raise ValueError("liveness_retry_limit_reached")
         challenge_id = secrets.token_urlsafe(24)
         nonce = secrets.token_urlsafe(32)
@@ -193,6 +207,8 @@ class LivenessService:
             "poseStepTimeoutMs": pose_step_timeout_ms,
             "passiveCaptureMs": passive_duration_ms,
             "minimumCaptureMs": passive_duration_ms + illumination_duration_ms,
+            "retryLimit": retry_limit,
+            "retryWindowSeconds": retry_window_seconds,
         }
         self.store.save(challenge)
         if adaptive_headpose:
@@ -252,7 +268,12 @@ class LivenessService:
             self._validate_evidence_timing(challenge, evidence)
         except ValueError:
             if hasattr(self.store, "register_failure"):
-                self.store.register_failure(company_id, user_id, context_id)
+                self.store.register_failure(
+                    company_id,
+                    user_id,
+                    context_id,
+                    int(challenge.get("retryWindowSeconds", 900)),
+                )
             raise
         adaptive_progress = (
             self.store.consume_pose_progress(challenge_id)
@@ -334,7 +355,12 @@ class LivenessService:
         if overall == "pass" and hasattr(self.store, "clear_failures"):
             self.store.clear_failures(company_id, user_id, context_id)
         elif overall == "fail" and hasattr(self.store, "register_failure"):
-            self.store.register_failure(company_id, user_id, context_id)
+            self.store.register_failure(
+                company_id,
+                user_id,
+                context_id,
+                int(challenge.get("retryWindowSeconds", 900)),
+            )
         logger.info(
             "liveness_result challenge=%s company=%s user=%s overall=%s reason=%s usable=%s invalid=%s "
             "invalid_reasons=%s passive=%s:%s aggregate=%s samples=%s head=%s:%s steps=%s "
@@ -669,6 +695,7 @@ class LivenessService:
             "poseStepTimeoutMs": int(challenge.get("poseStepTimeoutMs", 8000)),
             "passiveCaptureMs": int(challenge.get("passiveCaptureMs", 0)),
             "minimumCaptureMs": int(challenge.get("minimumCaptureMs", 0)),
+            "maxAttempts": int(challenge.get("retryLimit", 3)),
         }
 
     @staticmethod
