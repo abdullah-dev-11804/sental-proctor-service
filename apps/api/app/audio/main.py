@@ -118,11 +118,22 @@ class AudioSupervisor:
                 continue
             if policy.enabled and recording.get("state") == "active" and session.get("status") == "active":
                 logger.info(
-                    "Starting audio monitor session=%s room=%s participant=%s provider=%s",
+                    "Starting audio monitor session=%s room=%s participant=%s provider=%s "
+                    "speech_enabled=%s speech_threshold=%s speech_min_seconds=%s "
+                    "noise_enabled=%s second_speaker_enabled=%s prompting_enabled=%s "
+                    "prompt_sustained_seconds=%s prompt_rolling_seconds=%s",
                     session_id,
                     session.get("roomId"),
                     session.get("participantIdentity"),
                     recording.get("provider"),
+                    policy.speech_enabled,
+                    policy.vad_threshold,
+                    policy.speech_min_seconds,
+                    policy.noise_enabled,
+                    policy.second_speaker_enabled,
+                    policy.prompting_enabled,
+                    policy.prompt_sustained_seconds,
+                    policy.prompt_rolling_seconds,
                 )
                 self.tasks[session_id] = asyncio.create_task(
                     self._monitor_session(session_id),
