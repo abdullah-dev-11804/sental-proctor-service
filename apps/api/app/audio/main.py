@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import signal
 import time
 from contextlib import suppress
@@ -22,6 +23,19 @@ from app.services.media_store import MediaStore
 from app.services.state_store import StateStore
 
 
+logger = logging.getLogger("proctorcore.audio")
+
+
+def _livekit_rtc_url(url: str) -> str:
+    """Converts the shared LiveKit HTTP API URL into an RTC WebSocket URL."""
+    value = url.strip()
+    if value.startswith("https://"):
+        return "wss://" + value[len("https://"):]
+    if value.startswith("http://"):
+        return "ws://" + value[len("http://"):]
+    return value
+
+
 class AudioSupervisor:
     """Discovers active sessions and subscribes to their candidate audio tracks."""
 
@@ -36,6 +50,11 @@ class AudioSupervisor:
 
     async def run(self) -> None:
         self._load_models()
+        logger.info(
+            "Audio analyzer started enabled=%s models_available=%s sample_rate=16000",
+            self.settings.audio_analysis_enabled,
+            self.model_state.get("available"),
+        )
         while not self.stopping.is_set():
             await self._reconcile_sessions()
             self._write_health()
@@ -74,6 +93,7 @@ class AudioSupervisor:
             with suppress(asyncio.CancelledError):
                 exception = task.exception()
                 if exception:
+                    logger.error("Audio session failed session=%s error=%s", session_id, exception)
                     self._mark_session_state(session_id, "failed", str(exception))
 
         for session_id in self.state.list_session_ids():
@@ -97,6 +117,13 @@ class AudioSupervisor:
                 )
                 continue
             if policy.enabled and recording.get("state") == "active" and session.get("status") == "active":
+                logger.info(
+                    "Starting audio monitor session=%s room=%s participant=%s provider=%s",
+                    session_id,
+                    session.get("roomId"),
+                    session.get("participantIdentity"),
+                    recording.get("provider"),
+                )
                 self.tasks[session_id] = asyncio.create_task(
                     self._monitor_session(session_id),
                     name=f"audio-{session_id}",
@@ -115,6 +142,7 @@ class AudioSupervisor:
         engine = AudioEventEngine(policy, SileroVad(self.settings), self.speaker)
         room_name = str(session.get("roomId") or "")
         candidate_identity = str(session.get("participantIdentity") or f"user-{session.get('userId') or 'unknown'}")
+        rtc_url = _livekit_rtc_url(self.settings.livekit_internal_url)
         token = (
             api.AccessToken(self.settings.livekit_api_key, self.settings.livekit_api_secret)
             .with_identity(f"audio-analyzer-{session_id[:48]}")
@@ -127,6 +155,13 @@ class AudioSupervisor:
 
         @room.on("track_subscribed")
         def on_track_subscribed(track, _publication, participant) -> None:
+            logger.info(
+                "LiveKit track subscribed session=%s participant=%s kind=%s expected_participant=%s",
+                session_id,
+                participant.identity,
+                track.kind,
+                candidate_identity,
+            )
             if participant.identity == candidate_identity \
                     and track.kind == rtc.TrackKind.KIND_AUDIO \
                     and not candidate_track.done():
@@ -134,9 +169,12 @@ class AudioSupervisor:
 
         self._mark_session_state(session_id, "connecting")
         try:
-            await room.connect(self.settings.livekit_internal_url, token, options=rtc.RoomOptions(auto_subscribe=True))
+            logger.info("Connecting audio monitor session=%s room=%s url=%s", session_id, room_name, rtc_url)
+            await room.connect(rtc_url, token, options=rtc.RoomOptions(auto_subscribe=True))
+            logger.info("Audio monitor connected session=%s room=%s", session_id, room_name)
             track = await asyncio.wait_for(candidate_track, timeout=30)
             self._mark_session_state(session_id, "active")
+            logger.info("Candidate microphone active session=%s participant=%s", session_id, candidate_identity)
             stream = rtc.AudioStream(
                 track,
                 capacity=100,
@@ -159,10 +197,12 @@ class AudioSupervisor:
             for violation in engine.flush(time.time()):
                 self._record_event(current, violation)
             self._mark_session_state(session_id, "stopped")
+            logger.info("Audio monitor stopped session=%s", session_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self._mark_session_state(session_id, "failed", str(exc))
+            logger.exception("Audio monitor error session=%s", session_id)
             raise
         finally:
             await room.disconnect()
@@ -198,6 +238,14 @@ class AudioSupervisor:
             },
             "containsTranscript": False,
         })
+        logger.info(
+            "Audio violation session=%s type=%s start=%s end=%s confidence=%s",
+            session_id,
+            event_type,
+            started_at,
+            int(event["endedAt"]),
+            event.get("confidence"),
+        )
         MediaStore().record_violation({
             "sessionId": session_id,
             "companyId": int(session.get("companyId") or 0),
@@ -264,6 +312,10 @@ class AudioSupervisor:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     supervisor = AudioSupervisor()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

@@ -6,6 +6,7 @@ from types import ModuleType
 import numpy as np
 
 from app.core.config import Settings
+from app.audio.main import _livekit_rtc_url
 from app.services.audio_analysis import AudioEventEngine, AudioPolicy, SpeechBrainSpeakerEncoder
 
 
@@ -188,3 +189,10 @@ def test_speechbrain_runtime_files_use_writable_storage_not_model_directory(tmp_
     assert encoder.cache_root.is_dir()
     assert storage_root in encoder.cache_root.parents
     assert speaker_root not in encoder.cache_root.parents
+
+
+def test_livekit_http_api_url_is_converted_for_rtc_connection() -> None:
+    assert _livekit_rtc_url("http://livekit:7880") == "ws://livekit:7880"
+    assert _livekit_rtc_url("https://proctoring.example/rtc") == "wss://proctoring.example/rtc"
+    assert _livekit_rtc_url("ws://livekit:7880") == "ws://livekit:7880"
+    assert _livekit_rtc_url("wss://proctoring.example/rtc") == "wss://proctoring.example/rtc"

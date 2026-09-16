@@ -11,6 +11,9 @@ microphone track. It converts frames to 16 kHz mono PCM and applies, in order:
 4. Rolling speaker clustering and observable speech-pattern rules.
 5. Normalized `violation.detected` webhooks to Moodle's existing violation, scoring and report flow.
 
+The analyzer is an RTC participant, so it converts the internal LiveKit HTTP API URL to the
+corresponding WebSocket URL (`http` to `ws`, or `https` to `wss`) before joining the room.
+
 The four reportable types are `background_noise`, `speech_detected`,
 `second_voice_detected`, and `possible_prompting`. The final type means only that sustained,
 repeated, or multi-speaker speech activity needs review. There is no transcription, semantic
