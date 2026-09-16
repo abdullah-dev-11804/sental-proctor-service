@@ -153,10 +153,18 @@ class SpeechBrainSpeakerEncoder:
         self.root = self.settings.audio_model_root / self.settings.audio_speaker_model
         checkpoint = self.root / "embedding_model.ckpt"
         _require_model(checkpoint, self.settings.audio_speaker_model_sha256, "SpeechBrain ECAPA-TDNN")
+        cache_key = hashlib.sha256(
+            f"{self.settings.audio_speaker_model}:{self.settings.audio_speaker_model_version}".encode("utf-8")
+        ).hexdigest()[:16]
+        self.cache_root = self.settings.local_storage_root / "audio-model-cache" / cache_key
+        self.cache_root.mkdir(parents=True, exist_ok=True)
         self.torch = torch
         self.classifier = EncoderClassifier.from_hparams(
             source=str(self.root),
-            savedir=str(self.root),
+            # SpeechBrain materializes runtime files such as label_encoder.ckpt.
+            # Models are intentionally mounted read-only, so keep generated files
+            # in the service's writable, persistent storage instead.
+            savedir=str(self.cache_root),
             run_opts={"device": "cpu"},
         )
 

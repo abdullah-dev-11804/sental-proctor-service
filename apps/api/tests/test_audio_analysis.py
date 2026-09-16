@@ -1,8 +1,12 @@
+import hashlib
+import sys
 from dataclasses import replace
+from types import ModuleType
 
 import numpy as np
 
-from app.services.audio_analysis import AudioEventEngine, AudioPolicy
+from app.core.config import Settings
+from app.services.audio_analysis import AudioEventEngine, AudioPolicy, SpeechBrainSpeakerEncoder
 
 
 FRAME_SECONDS = 512 / 16000
@@ -144,3 +148,42 @@ def test_one_continuous_speech_event_is_consolidated() -> None:
     events = engine.process(frames(speech_frames, 0.08), 1000.0)
     events += finish_with_silence(engine, 1000.0 + speech_frames * FRAME_SECONDS)
     assert len([event for event in events if event["type"] == "speech_detected"]) == 1
+
+
+def test_speechbrain_runtime_files_use_writable_storage_not_model_directory(tmp_path, monkeypatch) -> None:
+    model_root = tmp_path / "models" / "audio"
+    speaker_root = model_root / "speechbrain-spkrec-ecapa-voxceleb"
+    speaker_root.mkdir(parents=True)
+    checkpoint = speaker_root / "embedding_model.ckpt"
+    checkpoint.write_bytes(b"pinned-speaker-model")
+    checksum = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    storage_root = tmp_path / "storage"
+    captured = {}
+
+    class FakeEncoderClassifier:
+        @classmethod
+        def from_hparams(cls, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+    torch_module = ModuleType("torch")
+    speechbrain_module = ModuleType("speechbrain")
+    inference_module = ModuleType("speechbrain.inference")
+    speaker_module = ModuleType("speechbrain.inference.speaker")
+    speaker_module.EncoderClassifier = FakeEncoderClassifier
+    monkeypatch.setitem(sys.modules, "torch", torch_module)
+    monkeypatch.setitem(sys.modules, "speechbrain", speechbrain_module)
+    monkeypatch.setitem(sys.modules, "speechbrain.inference", inference_module)
+    monkeypatch.setitem(sys.modules, "speechbrain.inference.speaker", speaker_module)
+
+    encoder = SpeechBrainSpeakerEncoder(Settings(
+        audio_model_root=model_root,
+        audio_speaker_model_sha256=checksum,
+        local_storage_root=storage_root,
+    ))
+
+    assert captured["source"] == str(speaker_root)
+    assert captured["savedir"] == str(encoder.cache_root)
+    assert encoder.cache_root.is_dir()
+    assert storage_root in encoder.cache_root.parents
+    assert speaker_root not in encoder.cache_root.parents

@@ -64,9 +64,19 @@ curl -X POST http://127.0.0.1:8091/v1/identity/verify \
 ```bash
 cd sental-proctor-service
 cp .env.example .env
-# Place the approved face models in models/ and install audio models when enabling audio analysis.
-python apps/api/scripts/download_audio_models.py --model-root models/audio
-docker compose up --build
+# Place the approved face models in models/, then install the audio models when enabled.
+docker compose build api
+mkdir -p models/audio
+docker compose run --rm --no-deps \
+  --volume "$(pwd)/models/audio:/audio-models:rw" \
+  api python /app/scripts/download_audio_models.py \
+  --model-root /audio-models
+docker compose run --rm --no-deps \
+  --volume "$(pwd)/models/audio:/audio-models:ro" \
+  api python /app/scripts/download_audio_models.py \
+  --model-root /audio-models \
+  --verify-only
+docker compose up -d --build
 ```
 
 The local configuration can use file storage and browser recording fallback. The Kazakhstan

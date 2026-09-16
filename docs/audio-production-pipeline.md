@@ -35,16 +35,33 @@ The pinned inventory is machine-readable in `docs/audio-models.json`.
 Both licences permit commercial use. Model accuracy on an exam-room microphone is not implied by
 the published benchmark; thresholds must be calibrated on representative consented recordings.
 The service never downloads models at runtime and refuses to load a model whose configured
-SHA-256 does not match.
+SHA-256 does not match. Downloaded model artifacts remain read-only at runtime. SpeechBrain's
+generated cache files are written under `/app/storage/audio-model-cache`, not into the model mount.
 
 ## Installation
 
 From the service root:
 
 ```bash
-python apps/api/scripts/download_audio_models.py --model-root models/audio
-python apps/api/scripts/download_audio_models.py --model-root models/audio --verify-only
+docker compose build api
+mkdir -p models/audio
+
+docker compose run --rm --no-deps \
+  --volume "$(pwd)/models/audio:/audio-models:rw" \
+  api python /app/scripts/download_audio_models.py \
+  --model-root /audio-models
+
+docker compose run --rm --no-deps \
+  --volume "$(pwd)/models/audio:/audio-models:ro" \
+  api python /app/scripts/download_audio_models.py \
+  --model-root /audio-models \
+  --verify-only
 ```
+
+The one-off download container mounts the host `models/audio` directory at the separate
+`/audio-models` path with temporary write access. This avoids conflicting with the service's
+inherited read-only `/app/models` mount. The normal API, worker, and analyzer services continue to
+read the downloaded files at `/app/models/audio` through their read-only model mount.
 
 Copy the audio variables from `.env.example`, set `AUDIO_ANALYSIS_ENABLED=true`, retain the pinned
 checksums, then rebuild and start the API, worker and analyzer:
