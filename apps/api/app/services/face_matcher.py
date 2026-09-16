@@ -155,6 +155,7 @@ class FaceMatcher:
             "result": "enrolled",
             "accessAllowed": True,
             "similarityScore": 1.0,
+            "bestLiveFrameIndex": int(best_sample["index"]),
             "bestReferenceBytes": best_sample["bytes"],
             "template": template,
             "referenceFaceCount": template["quality"]["validFrameCount"],
@@ -267,6 +268,7 @@ class FaceMatcher:
             "accessDecision": decision,
             "accessAllowed": allowed,
             "similarityScore": float(round(final_score, 4)),
+            "bestLiveFrameIndex": int(max(samples, key=lambda sample: sample["score"])["index"]),
             "threshold": float(threshold),
             "reviewThreshold": review_threshold,
             "livenessPassed": True,
@@ -304,7 +306,7 @@ class FaceMatcher:
         samples: list[dict] = []
         self._last_rejection_reasons = []
         self._last_rejected_qualities = []
-        for frame in frames[: max(1, int(self.settings.identity_max_enrollment_frames))]:
+        for index, frame in enumerate(frames[: max(1, int(self.settings.identity_max_enrollment_frames))]):
             try:
                 image = self._decode_image(frame)
                 embedding, quality = self._extract_primary_face_advanced(
@@ -325,6 +327,7 @@ class FaceMatcher:
                 self._last_rejected_qualities.append({"reason": retry_reason, **quality.__dict__})
                 continue
             sample = {
+                "index": index,
                 "bytes": frame,
                 "embedding": self._normalize_embedding(embedding),
                 "quality": quality,

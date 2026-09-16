@@ -141,6 +141,28 @@ def test_snapshot_data_url_is_decoded_and_tenant_scope_is_enforced(store: MediaS
         store.start_session(session["id"], {**_scope(), "companyId": 8})
 
 
+def test_verified_identity_frame_is_stored_as_identity_evidence(store: MediaStore) -> None:
+    session = store.create_session(_payload())
+    accepted_frame = b"accepted-verification-frame"
+    encoded = "data:image/jpeg;base64," + base64.b64encode(accepted_frame).decode("ascii")
+
+    captured = store.capture_snapshot(session["id"], {
+        **_scope(),
+        "reason": "identity_verification",
+        "snapshotImage": encoded,
+    })
+    asset = next(
+        item for item in store.get_session(session["id"])["assets"]
+        if item["assetId"] == captured["assetId"]
+    )
+    content, mime_type = store.get_asset_content(captured["assetId"])
+
+    assert asset["type"] == "identity_photo"
+    assert asset["reason"] == "identity_verification"
+    assert content == accepted_frame
+    assert mime_type == "image/jpeg"
+
+
 def test_duplicate_violation_does_not_queue_duplicate_clip(store: MediaStore) -> None:
     session = store.create_session(_payload())
     payload = {
