@@ -37,6 +37,8 @@ the published benchmark; thresholds must be calibrated on representative consent
 The service never downloads models at runtime and refuses to load a model whose configured
 SHA-256 does not match. Downloaded model artifacts remain read-only at runtime. SpeechBrain's
 generated cache files are written under `/app/storage/audio-model-cache`, not into the model mount.
+The analyzer overrides the upstream YAML's remote `pretrained_path` with the verified local model
+directory and runs with `HF_HUB_OFFLINE=1`, preventing runtime Hub downloads.
 
 ## Installation
 

@@ -111,6 +111,7 @@ services:
       LOCAL_STORAGE_ROOT: /app/storage
       IDENTITY_MODEL_ROOT: /app/models
       AUDIO_MODEL_ROOT: /app/models/audio
+      HF_HUB_OFFLINE: "1"
       REDIS_URL: redis://redis:6379/0
       LIVEKIT_INTERNAL_URL: http://livekit:7880
     volumes:

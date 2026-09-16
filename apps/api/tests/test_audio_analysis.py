@@ -184,6 +184,7 @@ def test_speechbrain_runtime_files_use_writable_storage_not_model_directory(tmp_
 
     assert captured["source"] == str(speaker_root)
     assert captured["savedir"] == str(encoder.cache_root)
+    assert captured["overrides"] == {"pretrained_path": str(speaker_root)}
     assert encoder.cache_root.is_dir()
     assert storage_root in encoder.cache_root.parents
     assert speaker_root not in encoder.cache_root.parents

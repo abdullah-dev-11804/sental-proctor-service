@@ -165,6 +165,10 @@ class SpeechBrainSpeakerEncoder:
             # Models are intentionally mounted read-only, so keep generated files
             # in the service's writable, persistent storage instead.
             savedir=str(self.cache_root),
+            # The upstream YAML names its Hugging Face repository as
+            # pretrained_path. Force all pretrainer loadables to resolve from
+            # our downloaded, checksum-verified local model directory.
+            overrides={"pretrained_path": str(self.root)},
             run_opts={"device": "cpu"},
         )
 
