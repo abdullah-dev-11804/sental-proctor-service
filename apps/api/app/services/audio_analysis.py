@@ -175,6 +175,10 @@ class SpeechBrainSpeakerEncoder:
             torch.backends.mkldnn.enabled = False
         except (AttributeError, RuntimeError):
             pass
+        try:
+            torch.backends.nnpack.set_flags(False)
+        except (AttributeError, RuntimeError):
+            pass
         cache_key = hashlib.sha256(
             f"{self.settings.audio_speaker_model}:{self.settings.audio_speaker_model_version}".encode("utf-8")
         ).hexdigest()[:16]
