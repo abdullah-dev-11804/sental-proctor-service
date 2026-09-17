@@ -250,6 +250,7 @@ def _build_recording(
         segment_media[segment] = {
             "path": output,
             "startedAt": int(entry.get("startedAt") or session.get("startedAt") or session.get("createdAt") or 0),
+            "stoppedAt": int(entry.get("stoppedAt") or 0),
             "strategy": strategy,
         }
         strategies.append(strategy)
@@ -392,6 +393,7 @@ def _create_violation_clips(
         }
         for item in violations.values()
     ]
+    source_durations: dict[Path, float] = {}
     for index, candidate in enumerate(candidates):
         if candidate.get("assetId"):
             continue
@@ -401,8 +403,18 @@ def _create_violation_clips(
         media = segment_media.get(segment)
         source = Path(media["path"]) if media else recording
         source_started_at = int(media.get("startedAt") or started_at) if media else started_at
-        start_offset = max(0, occurred_at - source_started_at - int(settings.clip_pre_seconds))
         duration = int(settings.clip_pre_seconds) + int(settings.clip_post_seconds)
+        if source not in source_durations:
+            source_durations[source] = _media_duration_seconds(source)
+        source_duration = source_durations[source]
+        start_offset, event_offset, timeline_mapping = _violation_clip_start_offset(
+            occurred_at=occurred_at,
+            source_started_at=source_started_at,
+            source_duration=source_duration,
+            clip_duration=duration,
+            pre_seconds=int(settings.clip_pre_seconds),
+            media=media,
+        )
         clip_path = work / f"clip_{index:04d}.mp4"
         frame_rate = _media_video_frame_rate(source)
         _run_ffmpeg([
@@ -431,6 +443,8 @@ def _create_violation_clips(
                 "source": "temporary_full_session",
                 "clipStartSeconds": start_offset,
                 "clipDurationSeconds": duration,
+                "eventOffsetSeconds": event_offset,
+                "timelineMapping": timeline_mapping,
                 "recordingSegment": segment,
                 "strategy": "ffmpeg_continuous_timeline_extract",
             },
@@ -443,6 +457,38 @@ def _create_violation_clips(
     missing = [str(candidate.get("violationId") or "unknown") for candidate in candidates if not candidate.get("assetId")]
     if missing:
         raise RuntimeError("violation_clip_creation_failed: " + ",".join(missing[:10]))
+
+
+def _violation_clip_start_offset(
+    *,
+    occurred_at: int,
+    source_started_at: int,
+    source_duration: float,
+    clip_duration: int,
+    pre_seconds: int,
+    media: dict[str, Any] | None,
+) -> tuple[float, float, str]:
+    """Map a wall-clock violation onto Egress or compact browser media."""
+    elapsed = float(max(0, occurred_at - source_started_at))
+    event_offset = elapsed
+    mapping = "wall_clock"
+    if media and media.get("strategy") == "browser_chunk_fallback":
+        stopped_at = int(media.get("stoppedAt") or 0)
+        wall_duration = max(0, stopped_at - source_started_at)
+        if wall_duration > 0 and source_duration > 0:
+            event_offset = min(source_duration, elapsed * source_duration / wall_duration)
+            mapping = "scaled_browser_timeline"
+
+    start_offset = max(0.0, event_offset - pre_seconds)
+    if source_duration > 0:
+        # If media was absent around the exact wall-clock point, retain the
+        # nearest complete evidence window instead of producing an empty file
+        # and keeping the entire report in an endless retry cycle.
+        latest_start = max(0.0, source_duration - clip_duration)
+        if start_offset > latest_start:
+            start_offset = latest_start
+            mapping += "_boundary_clamped"
+    return round(start_offset, 3), round(event_offset, 3), mapping
 
 
 def _run_ffmpeg(arguments: list[str]) -> None:

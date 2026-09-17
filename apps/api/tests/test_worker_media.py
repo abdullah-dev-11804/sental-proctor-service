@@ -107,3 +107,33 @@ def test_browser_recording_wins_when_egress_duration_is_mostly_timestamp_holes(
 
     assert selected == browser
     assert strategy == "browser_chunk_fallback"
+
+
+def test_browser_violation_time_is_mapped_onto_compacted_media() -> None:
+    start, event, mapping = jobs._violation_clip_start_offset(
+        occurred_at=160,
+        source_started_at=100,
+        source_duration=60.0,
+        clip_duration=30,
+        pre_seconds=15,
+        media={"strategy": "browser_chunk_fallback", "stoppedAt": 220},
+    )
+
+    assert event == 30.0
+    assert start == 15.0
+    assert mapping == "scaled_browser_timeline"
+
+
+def test_violation_after_available_media_uses_nearest_complete_window() -> None:
+    start, event, mapping = jobs._violation_clip_start_offset(
+        occurred_at=250,
+        source_started_at=100,
+        source_duration=60.0,
+        clip_duration=30,
+        pre_seconds=15,
+        media={"strategy": "livekit_egress_hls", "stoppedAt": 220},
+    )
+
+    assert event == 150.0
+    assert start == 30.0
+    assert mapping == "wall_clock_boundary_clamped"
