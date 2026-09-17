@@ -259,15 +259,11 @@ def _build_recording(
         return None, "no_media", {}
 
     paths = [segment_media[number]["path"] for number in sorted(segment_media)]
-    assembled = work / "recording_source.mp4"
-    if len(paths) == 1:
-        assembled.write_bytes(paths[0].read_bytes())
-    else:
-        concat_file = work / "recording_segments.txt"
-        concat_file.write_text("".join(f"file '{path.as_posix()}'\n" for path in paths), encoding="utf-8")
-        _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(assembled)])
     full = work / "recording.mp4"
-    _normalize_media_timeline(assembled, full)
+    if len(paths) == 1:
+        _normalize_media_timeline(paths[0], full)
+    else:
+        _concat_media_files(paths, full)
     strategy = "mixed_segment_reconciliation" if len(set(strategies)) > 1 else strategies[0]
     return full, strategy, segment_media
 
@@ -301,7 +297,7 @@ def _build_egress_segment(
         objects.download_file(objects.settings.s3_bucket_temp, key, local_root / relative)
     playlist = local_root / "index.m3u8"
     output = work / f"segment_{segment:03d}_egress.mp4"
-    _run_ffmpeg(["-i", str(playlist), "-map", "0:v?", "-map", "0:a?", "-c", "copy", str(output)])
+    _normalize_media_timeline(playlist, output)
     return output if output.is_file() and output.stat().st_size > 0 else None
 
 
@@ -334,10 +330,7 @@ def _build_browser_segment(
         joined = chunk_dir / f"stream_{index:04d}.webm"
         joined.write_bytes(content)
         converted_path = chunk_dir / f"stream_{index:04d}.mp4"
-        _run_ffmpeg([
-            "-i", str(joined), "-map", "0:v?", "-map", "0:a?", "-c:v", "libx264",
-            "-preset", "veryfast", "-c:a", "aac", "-movflags", "+faststart", str(converted_path),
-        ])
+        _normalize_media_timeline(joined, converted_path)
         if _media_duration_seconds(converted_path) > 0:
             converted.append(converted_path)
     if not converted:
@@ -347,15 +340,7 @@ def _build_browser_segment(
     if len(converted) == 1:
         output.write_bytes(converted[0].read_bytes())
     else:
-        concat_file = chunk_dir / "streams.txt"
-        concat_file.write_text(
-            "".join(f"file '{path.as_posix()}'\n" for path in converted),
-            encoding="utf-8",
-        )
-        _run_ffmpeg([
-            "-f", "concat", "-safe", "0", "-i", str(concat_file),
-            "-c", "copy", "-movflags", "+faststart", str(output),
-        ])
+        _concat_media_files(converted, output)
     return output if output.is_file() and output.stat().st_size > 0 else None
 
 
@@ -394,16 +379,28 @@ def _create_violation_clips(
         for item in violations.values()
     ]
     source_durations: dict[Path, float] = {}
-    for index, candidate in enumerate(candidates):
-        if candidate.get("assetId"):
-            continue
-        violation = violations.get(str(candidate.get("violationId")), {})
-        occurred_at = int(candidate.get("occurredAt") or violation.get("occurredAt") or started_at)
-        segment = int(candidate.get("segment") or 1)
+    groups = _group_clip_candidates(
+        candidates,
+        violations,
+        started_at=started_at,
+        pre_seconds=int(settings.clip_pre_seconds),
+        post_seconds=int(settings.clip_post_seconds),
+    )
+    for index, group in enumerate(groups):
+        primary = group[0]
+        candidate = primary["candidate"]
+        violation = primary["violation"]
+        occurred_at = int(primary["occurredAt"])
+        latest_occurred_at = max(int(item["occurredAt"]) for item in group)
+        segment = int(primary["segment"])
         media = segment_media.get(segment)
         source = Path(media["path"]) if media else recording
         source_started_at = int(media.get("startedAt") or started_at) if media else started_at
-        duration = int(settings.clip_pre_seconds) + int(settings.clip_post_seconds)
+        duration = min(
+            60,
+            int(settings.clip_pre_seconds) + int(settings.clip_post_seconds)
+            + max(0, latest_occurred_at - occurred_at),
+        )
         if source not in source_durations:
             source_durations[source] = _media_duration_seconds(source)
         source_duration = source_durations[source]
@@ -416,28 +413,32 @@ def _create_violation_clips(
             media=media,
         )
         clip_path = work / f"clip_{index:04d}.mp4"
-        frame_rate = _media_video_frame_rate(source)
         _run_ffmpeg([
             "-ss", str(start_offset), "-i", str(source), "-t", str(duration),
             "-map", "0:v:0?", "-map", "0:a:0?",
-            # Egress preserves timestamp discontinuities when the browser
-            # republishes tracks during Moodle page navigation. Rebuild time
-            # from actual decoded frames/samples so clips do not start with
-            # delayed video or contain multi-second frozen gaps.
-            "-vf", f"setpts=N/({frame_rate:g}*TB)",
-            "-af", "asetpts=N/SR/TB", "-fps_mode:v", "passthrough",
+            # Segment assembly already removes discontinuities. Preserve the
+            # shared A/V clock here instead of rebuilding the tracks from
+            # independent frame/sample counts, which can introduce lip drift.
+            "-vf", "setpts=PTS-STARTPTS",
+            "-af", "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS",
+            "-fps_mode:v", "passthrough", "-shortest",
             "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-ar", "48000", "-movflags", "+faststart", str(clip_path),
         ])
-        if _media_duration_seconds(clip_path) <= 0:
+        if not _media_av_payload_is_aligned(clip_path):
             continue
+        related_ids = [str(item["candidate"].get("violationId") or item["violation"].get("id")) for item in group]
+        related_types = [
+            str(item["candidate"].get("reason") or item["violation"].get("type") or "violation")
+            for item in group
+        ]
         asset = store.register_asset_bytes(
             session_id,
             "video_clip",
             clip_path.read_bytes(),
             ".mp4",
             "video/mp4",
-            str(candidate.get("reason") or violation.get("type") or "violation"),
+            "consolidated_violations" if len(group) > 1 else related_types[0],
             violation_id=candidate.get("violationId") or violation.get("id"),
             metadata={
                 "source": "temporary_full_session",
@@ -446,10 +447,14 @@ def _create_violation_clips(
                 "eventOffsetSeconds": event_offset,
                 "timelineMapping": timeline_mapping,
                 "recordingSegment": segment,
+                "relatedViolationIds": related_ids,
+                "relatedViolationTypes": related_types,
+                "violationCount": len(group),
                 "strategy": "ffmpeg_continuous_timeline_extract",
             },
         )
-        candidate["assetId"] = asset["assetId"]
+        for item in group:
+            item["candidate"]["assetId"] = asset["assetId"]
 
     current = store.get_session(session_id)
     current["pendingClips"] = candidates
@@ -457,6 +462,47 @@ def _create_violation_clips(
     missing = [str(candidate.get("violationId") or "unknown") for candidate in candidates if not candidate.get("assetId")]
     if missing:
         raise RuntimeError("violation_clip_creation_failed: " + ",".join(missing[:10]))
+
+
+def _group_clip_candidates(
+    candidates: list[dict[str, Any]],
+    violations: dict[str, dict[str, Any]],
+    *,
+    started_at: int,
+    pre_seconds: int,
+    post_seconds: int,
+) -> list[list[dict[str, Any]]]:
+    """Merge overlapping violation windows into one durable evidence clip."""
+    pending = []
+    for candidate in candidates:
+        if candidate.get("assetId"):
+            continue
+        violation = violations.get(str(candidate.get("violationId")), {})
+        occurred_at = int(candidate.get("occurredAt") or violation.get("occurredAt") or started_at)
+        pending.append({
+            "candidate": candidate,
+            "violation": violation,
+            "occurredAt": occurred_at,
+            "segment": int(candidate.get("segment") or 1),
+            "windowStart": occurred_at - pre_seconds,
+            "windowEnd": occurred_at + post_seconds,
+        })
+    pending.sort(key=lambda item: (item["segment"], item["windowStart"], item["occurredAt"]))
+
+    groups: list[list[dict[str, Any]]] = []
+    for item in pending:
+        if groups:
+            current = groups[-1]
+            group_start = min(entry["windowStart"] for entry in current)
+            group_end = max(entry["windowEnd"] for entry in current)
+            merged_end = max(group_end, item["windowEnd"])
+            if item["segment"] == current[0]["segment"] \
+                    and item["windowStart"] <= group_end \
+                    and merged_end - group_start <= 60:
+                current.append(item)
+                continue
+        groups.append([item])
+    return groups
 
 
 def _violation_clip_start_offset(
@@ -472,12 +518,12 @@ def _violation_clip_start_offset(
     elapsed = float(max(0, occurred_at - source_started_at))
     event_offset = elapsed
     mapping = "wall_clock"
-    if media and media.get("strategy") == "browser_chunk_fallback":
+    if media:
         stopped_at = int(media.get("stoppedAt") or 0)
         wall_duration = max(0, stopped_at - source_started_at)
         if wall_duration > 0 and source_duration > 0:
             event_offset = min(source_duration, elapsed * source_duration / wall_duration)
-            mapping = "scaled_browser_timeline"
+            mapping = "scaled_compact_timeline"
 
     start_offset = max(0.0, event_offset - pre_seconds)
     if source_duration > 0:
@@ -501,6 +547,34 @@ def _run_ffmpeg(arguments: list[str]) -> None:
     )
     if completed.returncode != 0:
         raise RuntimeError(f"ffmpeg_failed: {completed.stderr[-800:]}")
+
+
+def _concat_media_files(paths: list[Path], output: Path) -> None:
+    """Decode and concatenate normalized A/V streams without packet overlap."""
+    if not paths:
+        raise ValueError("media_concat_requires_input")
+    if len(paths) == 1:
+        _normalize_media_timeline(paths[0], output)
+        return
+    inputs: list[str] = []
+    filters: list[str] = []
+    concat_inputs = []
+    for index, path in enumerate(paths):
+        inputs.extend(["-i", str(path)])
+        filters.extend([
+            f"[{index}:v:0]setpts=PTS-STARTPTS[v{index}]",
+            f"[{index}:a:0]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a{index}]",
+        ])
+        concat_inputs.append(f"[v{index}][a{index}]")
+    filters.append(
+        "".join(concat_inputs) + f"concat=n={len(paths)}:v=1:a=1[vout][aout]"
+    )
+    _run_ffmpeg([
+        *inputs, "-filter_complex", ";".join(filters),
+        "-map", "[vout]", "-map", "[aout]",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ar", "48000", "-movflags", "+faststart", str(output),
+    ])
 
 
 def _normalize_media_timeline(source: Path, output: Path) -> None:
@@ -541,6 +615,24 @@ def _media_video_frame_rate(path: Path, default: float = 15.0) -> float:
 
 def _media_content_duration_seconds(path: Path) -> float:
     """Measure captured A/V payload duration while ignoring timestamp holes."""
+    durations = _media_payload_durations(path)
+    if not durations:
+        return _media_duration_seconds(path)
+    # A complete proctoring recording needs both streams, so its usable length
+    # is bounded by the stream with the least actual payload.
+    return min(durations.values())
+
+
+def _media_av_payload_is_aligned(path: Path, tolerance_seconds: float = 2.0) -> bool:
+    """Reject empty or severely divergent A/V output before it reaches reports."""
+    durations = _media_payload_durations(path)
+    if len(durations) < 2 or min(durations.values()) <= 0:
+        return False
+    return max(durations.values()) - min(durations.values()) <= tolerance_seconds
+
+
+def _media_payload_durations(path: Path) -> dict[int, float]:
+    """Estimate decoded payload per stream without counting timestamp holes."""
     completed = subprocess.run(
         [
             "ffprobe", "-v", "error", "-show_entries", "packet=stream_index,duration_time",
@@ -552,7 +644,7 @@ def _media_content_duration_seconds(path: Path) -> float:
         timeout=60,
     )
     if completed.returncode != 0:
-        return 0.0
+        return {}
     packet_durations: dict[int, list[float]] = {}
     for line in completed.stdout.splitlines():
         fields = line.split(",")
@@ -566,14 +658,11 @@ def _media_content_duration_seconds(path: Path) -> float:
         if duration > 0:
             packet_durations.setdefault(stream, []).append(duration)
     if not packet_durations:
-        return _media_duration_seconds(path)
+        return {}
     # A packet immediately before a timestamp discontinuity can itself report
     # the entire missing interval as its duration. Median packet duration times
     # packet count measures decoded payload without counting that hole.
-    stream_durations = [median(values) * len(values) for values in packet_durations.values()]
-    # A complete proctoring recording needs both streams, so its usable length
-    # is bounded by the stream with the least actual payload.
-    return min(stream_durations)
+    return {stream: median(values) * len(values) for stream, values in packet_durations.items()}
 
 
 def _media_duration_seconds(path: Path | None) -> float:
