@@ -212,7 +212,11 @@ class AudioEventEngine:
 
     FRAME_SAMPLES = 512
     SPEECH_HANGOVER_SECONDS = 0.30
-    MIN_SPEAKER_SEGMENT_SECONDS = 1.0
+    # Keep this below the default 0.8-second VAD event threshold. Previously,
+    # valid 0.8-0.99 second utterances produced speech violations but were
+    # silently excluded from speaker clustering, making a second voice
+    # impossible to establish in short conversational exchanges.
+    MIN_SPEAKER_SEGMENT_SECONDS = 0.75
     MAX_SPEAKER_AUDIO_SECONDS = 15.0
 
     def __init__(

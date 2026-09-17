@@ -145,6 +145,27 @@ def test_two_stable_speakers_create_second_voice_after_repeated_evidence() -> No
     assert second[0]["metadata"]["stableSpeakerClusters"] == 2
 
 
+def test_short_valid_utterances_are_included_in_speaker_clustering() -> None:
+    def encoder(samples):
+        return np.array([1.0, 0.0], dtype=np.float32) if float(np.mean(samples)) >= 0 else np.array([0.0, 1.0])
+
+    values = []
+    samples = []
+    # 28 frames are about 0.896 seconds: long enough for the configured VAD
+    # event, but previously rejected by the fixed one-second speaker gate.
+    for sign in (1.0, 1.0, -1.0, -1.0):
+        values.extend([0.95] * 28 + [0.0] * 14)
+        samples.extend([frames(28, 0.08, sign), frames(14)])
+    engine = AudioEventEngine(policy(speaker_min_segments=2), SequenceVad(values), encoder)
+    events = []
+    timestamp = 1000.0
+    for sample in samples:
+        events += engine.process(sample, timestamp)
+        timestamp += sample.size / 16000
+
+    assert len([event for event in events if event["type"] == "second_voice_detected"]) == 1
+
+
 def test_speaker_runtime_failure_preserves_speech_event() -> None:
     def failing_encoder(_samples):
         raise RuntimeError("could not create a primitive")

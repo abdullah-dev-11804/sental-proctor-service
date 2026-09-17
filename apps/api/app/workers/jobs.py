@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 import httpx
@@ -257,24 +258,29 @@ def _build_recording(
         return None, "no_media", {}
 
     paths = [segment_media[number]["path"] for number in sorted(segment_media)]
-    full = work / "recording.mp4"
+    assembled = work / "recording_source.mp4"
     if len(paths) == 1:
-        full.write_bytes(paths[0].read_bytes())
+        assembled.write_bytes(paths[0].read_bytes())
     else:
         concat_file = work / "recording_segments.txt"
         concat_file.write_text("".join(f"file '{path.as_posix()}'\n" for path in paths), encoding="utf-8")
-        _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(full)])
+        _run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(concat_file), "-c", "copy", str(assembled)])
+    full = work / "recording.mp4"
+    _normalize_media_timeline(assembled, full)
     strategy = "mixed_segment_reconciliation" if len(set(strategies)) > 1 else strategies[0]
     return full, strategy, segment_media
 
 
 def _prefer_complete_segment(egress: Path | None, browser: Path | None) -> tuple[Path | None, str]:
-    """Prefer Egress unless the browser safety copy has materially more media."""
+    """Prefer Egress unless the browser safety copy has materially more captured media."""
     if egress is None:
         return browser, "browser_chunk_fallback"
     if browser is None:
         return egress, "livekit_egress_hls"
-    if _media_duration_seconds(browser) > _media_duration_seconds(egress) + 2.0:
+    # Container duration includes HLS timestamp holes. Measure packet payload so
+    # a 30-second Egress file containing 17 seconds of missing frames does not
+    # beat a genuinely more complete browser safety recording.
+    if _media_content_duration_seconds(browser) > _media_content_duration_seconds(egress) + 2.0:
         return browser, "browser_chunk_fallback"
     return egress, "livekit_egress_hls"
 
@@ -398,10 +404,18 @@ def _create_violation_clips(
         start_offset = max(0, occurred_at - source_started_at - int(settings.clip_pre_seconds))
         duration = int(settings.clip_pre_seconds) + int(settings.clip_post_seconds)
         clip_path = work / f"clip_{index:04d}.mp4"
+        frame_rate = _media_video_frame_rate(source)
         _run_ffmpeg([
             "-ss", str(start_offset), "-i", str(source), "-t", str(duration),
-            "-map", "0:v?", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
-            "-c:a", "aac", "-movflags", "+faststart", str(clip_path),
+            "-map", "0:v:0?", "-map", "0:a:0?",
+            # Egress preserves timestamp discontinuities when the browser
+            # republishes tracks during Moodle page navigation. Rebuild time
+            # from actual decoded frames/samples so clips do not start with
+            # delayed video or contain multi-second frozen gaps.
+            "-vf", f"setpts=N/({frame_rate:g}*TB)",
+            "-af", "asetpts=N/SR/TB", "-fps_mode:v", "passthrough",
+            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-ar", "48000", "-movflags", "+faststart", str(clip_path),
         ])
         if _media_duration_seconds(clip_path) <= 0:
             continue
@@ -418,7 +432,7 @@ def _create_violation_clips(
                 "clipStartSeconds": start_offset,
                 "clipDurationSeconds": duration,
                 "recordingSegment": segment,
-                "strategy": "ffmpeg_timestamp_extract",
+                "strategy": "ffmpeg_continuous_timeline_extract",
             },
         )
         candidate["assetId"] = asset["assetId"]
@@ -441,6 +455,79 @@ def _run_ffmpeg(arguments: list[str]) -> None:
     )
     if completed.returncode != 0:
         raise RuntimeError(f"ffmpeg_failed: {completed.stderr[-800:]}")
+
+
+def _normalize_media_timeline(source: Path, output: Path) -> None:
+    """Remove timestamp holes introduced by LiveKit track republishing."""
+    frame_rate = _media_video_frame_rate(source)
+    _run_ffmpeg([
+        "-i", str(source), "-map", "0:v:0?", "-map", "0:a:0?",
+        "-vf", f"setpts=N/({frame_rate:g}*TB)",
+        "-af", "asetpts=N/SR/TB", "-fps_mode:v", "passthrough",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-ar", "48000", "-movflags", "+faststart", str(output),
+    ])
+
+
+def _media_video_frame_rate(path: Path, default: float = 15.0) -> float:
+    """Return a sane nominal frame rate without treating timestamp gaps as low FPS."""
+    completed = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=r_frame_rate",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        return default
+    value = completed.stdout.strip()
+    try:
+        numerator, denominator = value.split("/", 1)
+        frame_rate = float(numerator) / float(denominator)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return default
+    return frame_rate if 1.0 <= frame_rate <= 60.0 else default
+
+
+def _media_content_duration_seconds(path: Path) -> float:
+    """Measure captured A/V payload duration while ignoring timestamp holes."""
+    completed = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries", "packet=stream_index,duration_time",
+            "-of", "csv=p=0", str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if completed.returncode != 0:
+        return 0.0
+    packet_durations: dict[int, list[float]] = {}
+    for line in completed.stdout.splitlines():
+        fields = line.split(",")
+        if len(fields) < 2:
+            continue
+        try:
+            stream = int(fields[0])
+            duration = float(fields[1])
+        except (TypeError, ValueError):
+            continue
+        if duration > 0:
+            packet_durations.setdefault(stream, []).append(duration)
+    if not packet_durations:
+        return _media_duration_seconds(path)
+    # A packet immediately before a timestamp discontinuity can itself report
+    # the entire missing interval as its duration. Median packet duration times
+    # packet count measures decoded payload without counting that hole.
+    stream_durations = [median(values) * len(values) for values in packet_durations.values()]
+    # A complete proctoring recording needs both streams, so its usable length
+    # is bounded by the stream with the least actual payload.
+    return min(stream_durations)
 
 
 def _media_duration_seconds(path: Path | None) -> float:
