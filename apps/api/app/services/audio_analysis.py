@@ -166,6 +166,15 @@ class SpeechBrainSpeakerEncoder:
         self.root = self.settings.audio_model_root / self.settings.audio_speaker_model
         checkpoint = self.root / "embedding_model.ckpt"
         _require_model(checkpoint, self.settings.audio_speaker_model_sha256, "SpeechBrain ECAPA-TDNN")
+        # Some production CPUs cannot create oneDNN convolution primitives for
+        # ECAPA-TDNN. Use PyTorch's portable CPU kernels and bound inference
+        # threads; speaker embedding is off the real-time frame hot path.
+        if hasattr(torch, "set_num_threads"):
+            torch.set_num_threads(1)
+        try:
+            torch.backends.mkldnn.enabled = False
+        except (AttributeError, RuntimeError):
+            pass
         cache_key = hashlib.sha256(
             f"{self.settings.audio_speaker_model}:{self.settings.audio_speaker_model_version}".encode("utf-8")
         ).hexdigest()[:16]
@@ -231,6 +240,7 @@ class AudioEventEngine:
         self.diagnostic_speech_frames = 0
         self.diagnostic_max_vad = 0.0
         self.diagnostic_max_dbfs = -180.0
+        self.last_speaker_error: str | None = None
 
     def process(self, samples: np.ndarray, started_at: float) -> list[dict[str, Any]]:
         if not self.policy.enabled:
@@ -334,6 +344,11 @@ class AudioEventEngine:
             self.diagnostic_max_dbfs = -180.0
         return result
 
+    def pop_speaker_error(self) -> str | None:
+        error = self.last_speaker_error
+        self.last_speaker_error = None
+        return error
+
     def _finish_noise(self, ended_at: float) -> list[dict[str, Any]]:
         if self.noise_started_at is None:
             return []
@@ -391,26 +406,36 @@ class AudioEventEngine:
         if (self.policy.second_speaker_enabled or self.policy.prompt_multispeaker) \
                 and self.speaker_encoder is not None \
                 and segment.duration >= self.MIN_SPEAKER_SEGMENT_SECONDS:
-            embedding = np.asarray(self.speaker_encoder(segment.samples), dtype=np.float32).reshape(-1)
-            segment.cluster, similarity = self._assign_cluster(embedding, segment.end)
-            counts = self._cluster_counts()
-            stable_clusters = [cluster for cluster, count in counts.items() if count >= self.policy.speaker_min_segments]
-            self.second_speaker_active = len(stable_clusters) > 1
-            if self.policy.second_speaker_enabled and self.second_speaker_active and self._cooldown_ready(
-                "second_voice_detected", segment.end, self.policy.second_speaker_cooldown_seconds
-            ):
-                events.append(self._event(
-                    "second_voice_detected", self._window_start(segment.end), segment.end,
-                    confidence=max(0.0, min(1.0, 1.0 - similarity)),
-                    metadata={
-                        "detector": "speechbrain_ecapa_tdnn_temporal_clustering",
-                        "stableSpeakerClusters": len(stable_clusters),
-                        "clusterCounts": {str(key): value for key, value in counts.items()},
-                        "sameSpeakerSimilarityThreshold": self.policy.speaker_similarity_threshold,
-                        "minimumSegments": self.policy.speaker_min_segments,
-                        "analysisWindowSeconds": self.policy.speaker_window_seconds,
-                    },
-                ))
+            try:
+                embedding = np.asarray(self.speaker_encoder(segment.samples), dtype=np.float32).reshape(-1)
+            except Exception as exc:
+                # Speaker analysis is an optional enrichment. Never discard a
+                # valid VAD speech event or terminate the audio stream because
+                # the embedding runtime is unavailable on a particular CPU.
+                self.last_speaker_error = str(exc)[:500]
+            else:
+                segment.cluster, similarity = self._assign_cluster(embedding, segment.end)
+                counts = self._cluster_counts()
+                stable_clusters = [
+                    cluster for cluster, count in counts.items()
+                    if count >= self.policy.speaker_min_segments
+                ]
+                self.second_speaker_active = len(stable_clusters) > 1
+                if self.policy.second_speaker_enabled and self.second_speaker_active and self._cooldown_ready(
+                    "second_voice_detected", segment.end, self.policy.second_speaker_cooldown_seconds
+                ):
+                    events.append(self._event(
+                        "second_voice_detected", self._window_start(segment.end), segment.end,
+                        confidence=max(0.0, min(1.0, 1.0 - similarity)),
+                        metadata={
+                            "detector": "speechbrain_ecapa_tdnn_temporal_clustering",
+                            "stableSpeakerClusters": len(stable_clusters),
+                            "clusterCounts": {str(key): count for key, count in counts.items()},
+                            "sameSpeakerSimilarityThreshold": self.policy.speaker_similarity_threshold,
+                            "minimumSegments": self.policy.speaker_min_segments,
+                            "analysisWindowSeconds": self.policy.speaker_window_seconds,
+                        },
+                    ))
 
         if self.policy.prompting_enabled:
             rolling_duration = sum(item.duration for item in self.segments)

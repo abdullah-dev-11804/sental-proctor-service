@@ -117,6 +117,11 @@ only on speech segments of at least one second. Benchmark concurrent rooms on th
 before choosing capacity. Scale analyzer instances only after ensuring a session is assigned to one
 analyzer; duplicate event IDs protect Moodle, but duplicate inference wastes CPU.
 
+The analyzer uses single-threaded portable PyTorch CPU kernels for ECAPA instead of oneDNN. If
+speaker embedding still fails at runtime, the session is explicitly marked degraded for speaker
+analysis while VAD speech/noise events continue; an optional enrichment failure must never terminate
+the primary audio stream or discard an already detected speech event.
+
 ## Manual acceptance tests
 
 Use a new proctored attempt for each calibration case and verify the Server B session diagnostics,

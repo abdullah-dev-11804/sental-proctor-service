@@ -264,6 +264,20 @@ class AudioSupervisor:
                 started_at = ended_at - (samples.size / 16000.0)
                 for violation in engine.process(samples, started_at):
                     self._record_event(current, violation)
+                speaker_error = engine.pop_speaker_error()
+                if speaker_error:
+                    logger.error(
+                        "Speaker embedding degraded session=%s error=%s; continuing VAD analysis",
+                        session_id,
+                        speaker_error,
+                    )
+                    self.model_state["speakerRuntimeReady"] = False
+                    self.model_state["speakerRuntimeError"] = speaker_error
+                    self._mark_session_state(
+                        session_id,
+                        "degraded",
+                        f"speaker_inference_failed: {speaker_error}",
+                    )
                 if time.monotonic() >= next_diagnostic_at:
                     diagnostics = engine.diagnostics(reset=True)
                     logger.info(

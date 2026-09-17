@@ -145,6 +145,21 @@ def test_two_stable_speakers_create_second_voice_after_repeated_evidence() -> No
     assert second[0]["metadata"]["stableSpeakerClusters"] == 2
 
 
+def test_speaker_runtime_failure_preserves_speech_event() -> None:
+    def failing_encoder(_samples):
+        raise RuntimeError("could not create a primitive")
+
+    speech_frames = 40
+    vad = SequenceVad(([0.95] * speech_frames) + ([0.0] * 20))
+    engine = AudioEventEngine(policy(), vad, failing_encoder)
+    events = engine.process(frames(speech_frames, 0.08), 1000.0)
+    events += finish_with_silence(engine, 1000.0 + speech_frames * FRAME_SECONDS)
+
+    assert "speech_detected" in [event["type"] for event in events]
+    assert engine.pop_speaker_error() == "could not create a primitive"
+    assert engine.pop_speaker_error() is None
+
+
 def test_disabled_audio_analysis_emits_nothing() -> None:
     engine = AudioEventEngine(policy(enabled=False), SequenceVad([0.95] * 200))
     assert engine.process(frames(100, 0.2), 1000.0) == []
