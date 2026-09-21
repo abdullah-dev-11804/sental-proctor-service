@@ -308,40 +308,98 @@ def _build_browser_segment(
     work: Path,
 ) -> Path | None:
     selected = sorted(
-        [item for item in chunks if int(item.get("segment") or 1) == segment],
-        key=lambda item: int(item.get("sequence") or 0),
+        [
+            item
+            for item in chunks
+            if int(item.get("segment") or 1) == int(segment)
+        ],
+        key=lambda item: (
+            int(item.get("sequence") or 0),
+            int(item.get("receivedAt") or 0),
+        ),
     )
+
     if not selected:
         return None
-    chunk_contents = []
+
+    chunk_contents: list[bytes] = []
+
+    # Historical duplicate metadata could reference exactly the same object.
+    # Skip the same object reference twice, but DO NOT deduplicate solely by
+    # sequence number or content hash. Different chunks must be preserved.
+    seen_objects: set[tuple[str, str]] = set()
+
     for chunk in selected:
+        bucket = str(chunk.get("bucket") or "")
+        object_key = str(chunk.get("objectKey") or "")
+
+        if not bucket or not object_key:
+            continue
+
+        identity = (bucket, object_key)
+
+        if identity in seen_objects:
+            continue
+
+        seen_objects.add(identity)
+
         try:
-            chunk_contents.append(objects.get_bytes(str(chunk["bucket"]), str(chunk["objectKey"])))
+            content = objects.get_bytes(
+                bucket,
+                object_key,
+            )
         except Exception:
             continue
+
+        if not content:
+            continue
+
+        chunk_contents.append(content)
+
     streams = _group_webm_chunks(chunk_contents)
+
     if not streams:
         return None
 
     chunk_dir = work / "browser" / f"segment_{segment:03d}"
     chunk_dir.mkdir(parents=True, exist_ok=True)
-    converted = []
+
+    converted: list[Path] = []
+
     for index, content in enumerate(streams):
         joined = chunk_dir / f"stream_{index:04d}.webm"
         joined.write_bytes(content)
+
         converted_path = chunk_dir / f"stream_{index:04d}.mp4"
-        _normalize_media_timeline(joined, converted_path)
+
+        _normalize_media_timeline(
+            joined,
+            converted_path,
+        )
+
         if _media_duration_seconds(converted_path) > 0:
             converted.append(converted_path)
+
     if not converted:
         return None
 
     output = work / f"segment_{segment:03d}_browser.mp4"
+
     if len(converted) == 1:
-        output.write_bytes(converted[0].read_bytes())
+        output.write_bytes(
+            converted[0].read_bytes()
+        )
     else:
-        _concat_media_files(converted, output)
-    return output if output.is_file() and output.stat().st_size > 0 else None
+        _concat_media_files(
+            converted,
+            output,
+        )
+
+    return (
+        output
+        if output.is_file() and output.stat().st_size > 0
+        else None
+    )
 
 
 def _group_webm_chunks(contents: list[bytes]) -> list[bytes]:
@@ -356,6 +414,66 @@ def _group_webm_chunks(contents: list[bytes]) -> list[bytes]:
         groups[-1].extend(content)
     return [bytes(group) for group in groups if group]
 
+def _evidence_clip_title(
+    related_types: list[str],
+    event_count: int,
+) -> str:
+    """Build a human-readable evidence title for non-technical reviewers."""
+
+    labels = {
+        "speech_detected": "Speech detected",
+        "possible_prompting": "Possible prompting",
+        "identity_mismatch": "Identity mismatch",
+        "multiple_faces": "Multiple faces",
+        "face_missing": "Face not visible",
+        "face_absent": "Face not visible",
+        "disappearance": "Face not visible",
+        "gaze_away": "Looking away",
+        "tab_switch": "Tab switch",
+        "focus_loss": "Exam window lost focus",
+        "window_blur": "Exam window lost focus",
+        "leaving_exam_window": "Left exam window",
+    }
+
+    unique_codes: list[str] = []
+
+    for value in related_types:
+        code = str(value or "violation").strip()
+
+        if code and code not in unique_codes:
+            unique_codes.append(code)
+
+    readable: list[str] = []
+
+    for code in unique_codes:
+        label = labels.get(code)
+
+        if label is None:
+            label = (
+                code
+                .replace("_", " ")
+                .replace("-", " ")
+                .strip()
+                .capitalize()
+            )
+
+        readable.append(label)
+
+    if not readable:
+        readable = ["Violation"]
+
+    if len(readable) <= 3:
+        title = " + ".join(readable)
+    else:
+        title = (
+            " + ".join(readable[:3])
+            + f" + {len(readable) - 3} more"
+        )
+
+    if event_count > 1:
+        title += f" ({event_count} events)"
+
+    return title
 
 def _create_violation_clips(
     store: MediaStore,
@@ -414,16 +532,33 @@ def _create_violation_clips(
         )
         clip_path = work / f"clip_{index:04d}.mp4"
         _run_ffmpeg([
-            "-ss", str(start_offset), "-i", str(source), "-t", str(duration),
-            "-map", "0:v:0?", "-map", "0:a:0?",
-            # Segment assembly already removes discontinuities. Preserve the
-            # shared A/V clock here instead of rebuilding the tracks from
-            # independent frame/sample counts, which can introduce lip drift.
+            "-ss", str(start_offset),
+            "-i", str(source),
+            "-t", str(duration),
+
+            "-map", "0:v:0?",
+            "-map", "0:a:0?",
+
             "-vf", "setpts=PTS-STARTPTS",
-            "-af", "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS",
-            "-fps_mode:v", "passthrough", "-shortest",
-            "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-ar", "48000", "-movflags", "+faststart", str(clip_path),
+
+            "-af",
+            "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS",
+
+            "-fps_mode:v", "passthrough",
+            "-shortest",
+
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "19",
+            "-pix_fmt", "yuv420p",
+
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-ar", "48000",
+
+            "-movflags", "+faststart",
+
+            str(clip_path),
         ])
         if not _media_av_payload_is_aligned(clip_path):
             continue
@@ -432,16 +567,27 @@ def _create_violation_clips(
             str(item["candidate"].get("reason") or item["violation"].get("type") or "violation")
             for item in group
         ]
+        clip_title = _evidence_clip_title(
+            related_types,
+            len(group),
+        )
+
         asset = store.register_asset_bytes(
             session_id,
             "video_clip",
             clip_path.read_bytes(),
             ".mp4",
             "video/mp4",
-            "consolidated_violations" if len(group) > 1 else related_types[0],
+            clip_title,
             violation_id=candidate.get("violationId") or violation.get("id"),
             metadata={
                 "source": "temporary_full_session",
+                "displayTitle": clip_title,
+                "reasonCode": (
+                    "consolidated_violations"
+                    if len(group) > 1
+                    else related_types[0]
+                ),
                 "clipStartSeconds": start_offset,
                 "clipDurationSeconds": duration,
                 "eventOffsetSeconds": event_offset,
@@ -553,39 +699,86 @@ def _concat_media_files(paths: list[Path], output: Path) -> None:
     """Decode and concatenate normalized A/V streams without packet overlap."""
     if not paths:
         raise ValueError("media_concat_requires_input")
+
     if len(paths) == 1:
         _normalize_media_timeline(paths[0], output)
         return
+
     inputs: list[str] = []
     filters: list[str] = []
-    concat_inputs = []
+    concat_inputs: list[str] = []
+
     for index, path in enumerate(paths):
-        inputs.extend(["-i", str(path)])
+        inputs.extend([
+            "-i", str(path),
+        ])
+
         filters.extend([
             f"[{index}:v:0]setpts=PTS-STARTPTS[v{index}]",
-            f"[{index}:a:0]aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS[a{index}]",
+            f"[{index}:a:0]aresample=async=1:first_pts=0,"
+            f"asetpts=PTS-STARTPTS[a{index}]",
         ])
-        concat_inputs.append(f"[v{index}][a{index}]")
+
+        concat_inputs.append(
+            f"[v{index}][a{index}]"
+        )
+
     filters.append(
-        "".join(concat_inputs) + f"concat=n={len(paths)}:v=1:a=1[vout][aout]"
+        "".join(concat_inputs)
+        + f"concat=n={len(paths)}:v=1:a=1[vout][aout]"
     )
+
     _run_ffmpeg([
-        *inputs, "-filter_complex", ";".join(filters),
-        "-map", "[vout]", "-map", "[aout]",
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-ar", "48000", "-movflags", "+faststart", str(output),
+        *inputs,
+
+        "-filter_complex",
+        ";".join(filters),
+
+        "-map", "[vout]",
+        "-map", "[aout]",
+
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar", "48000",
+
+        "-movflags", "+faststart",
+
+        str(output),
     ])
 
 
 def _normalize_media_timeline(source: Path, output: Path) -> None:
-    """Remove timestamp holes introduced by LiveKit track republishing."""
+    """Remove timestamp holes while retaining high evidence quality."""
     frame_rate = _media_video_frame_rate(source)
+
     _run_ffmpeg([
-        "-i", str(source), "-map", "0:v:0?", "-map", "0:a:0?",
+        "-i", str(source),
+
+        "-map", "0:v:0?",
+        "-map", "0:a:0?",
+
         "-vf", f"setpts=N/({frame_rate:g}*TB)",
-        "-af", "asetpts=N/SR/TB", "-fps_mode:v", "passthrough",
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-ar", "48000", "-movflags", "+faststart", str(output),
+        "-af", "aresample=async=1:first_pts=0,asetpts=N/SR/TB",
+
+        "-fps_mode:v", "passthrough",
+
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar", "48000",
+
+        "-movflags", "+faststart",
+
+        str(output),
     ])
 
 
@@ -624,12 +817,127 @@ def _media_content_duration_seconds(path: Path) -> float:
 
 
 def _media_av_payload_is_aligned(path: Path, tolerance_seconds: float = 2.0) -> bool:
-    """Reject empty or severely divergent A/V output before it reaches reports."""
-    durations = _media_payload_durations(path)
-    if len(durations) < 2 or min(durations.values()) <= 0:
-        return False
-    return max(durations.values()) - min(durations.values()) <= tolerance_seconds
+    """Require usable video and audio streams with reasonably aligned durations."""
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v", "error",
+            "-count_frames",
+            "-show_entries",
+            "stream=codec_type,duration,nb_read_frames:format=duration",
+            "-of", "json",
+            str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
 
+    if completed.returncode != 0:
+        print(
+            f"[clip-debug] rejected={path} reason=ffprobe_failed "
+            f"stderr={completed.stderr[-1000:]}",
+            flush=True,
+        )
+        return False
+
+    try:
+        probe = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        print(
+            f"[clip-debug] rejected={path} reason=invalid_ffprobe_json",
+            flush=True,
+        )
+        return False
+
+    streams = probe.get("streams") or []
+
+    video = next(
+        (stream for stream in streams if stream.get("codec_type") == "video"),
+        None,
+    )
+    audio = next(
+        (stream for stream in streams if stream.get("codec_type") == "audio"),
+        None,
+    )
+
+    if video is None or audio is None:
+        print(
+            f"[clip-debug] rejected={path} reason=actual_missing_av_stream "
+            f"streams={streams}",
+            flush=True,
+        )
+        return False
+
+    def frame_count(stream: dict[str, Any]) -> int:
+        try:
+            return int(stream.get("nb_read_frames") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    if frame_count(video) <= 0 or frame_count(audio) <= 0:
+        print(
+            f"[clip-debug] rejected={path} reason=empty_av_stream "
+            f"video_frames={frame_count(video)} "
+            f"audio_frames={frame_count(audio)}",
+            flush=True,
+        )
+        return False
+
+    def stream_duration(stream: dict[str, Any]) -> float:
+        try:
+            return float(stream.get("duration"))
+        except (TypeError, ValueError):
+            return 0.0
+
+    video_duration = stream_duration(video)
+    audio_duration = stream_duration(audio)
+
+    # Freshly encoded MP4 should normally provide stream durations. If not,
+    # use the container duration only after confirming that both streams
+    # actually contain decoded frames.
+    try:
+        container_duration = float(
+            (probe.get("format") or {}).get("duration") or 0
+        )
+    except (TypeError, ValueError):
+        container_duration = 0.0
+
+    if video_duration <= 0:
+        video_duration = container_duration
+
+    if audio_duration <= 0:
+        audio_duration = container_duration
+
+    if video_duration <= 0 or audio_duration <= 0:
+        print(
+            f"[clip-debug] rejected={path} reason=invalid_av_duration "
+            f"video={video_duration} audio={audio_duration}",
+            flush=True,
+        )
+        return False
+
+    difference = abs(video_duration - audio_duration)
+
+    if difference > tolerance_seconds:
+        print(
+            f"[clip-debug] rejected={path} reason=av_duration_mismatch "
+            f"video={video_duration:.3f} audio={audio_duration:.3f} "
+            f"difference={difference:.3f}",
+            flush=True,
+        )
+        return False
+
+    print(
+        f"[clip-debug] accepted={path} "
+        f"video={video_duration:.3f} audio={audio_duration:.3f} "
+        f"video_frames={frame_count(video)} "
+        f"audio_frames={frame_count(audio)}",
+        flush=True,
+    )
+
+    return True
 
 def _media_payload_durations(path: Path) -> dict[int, float]:
     """Estimate decoded payload per stream without counting timestamp holes."""

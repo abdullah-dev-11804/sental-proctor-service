@@ -350,15 +350,84 @@ class MediaStore:
     ) -> dict[str, Any]:
         session = self.get_session(session_id)
         self._require_upload_token(session, token)
+
         if len(content) <= 0 or len(content) > int(self.settings.media_chunk_max_bytes):
             raise ValueError("invalid_chunk_size")
 
+        segment = int(segment)
+        client_sequence = int(sequence)
+
+        chunks = list(session.get("chunks") or [])
+        incoming_checksum = hashlib.sha256(content).hexdigest()
+
+        same_sequence = [
+            item
+            for item in chunks
+            if int(item.get("segment") or 1) == segment
+            and int(item.get("sequence") or 0) == client_sequence
+        ]
+
+        # Same sequence number does NOT necessarily mean the same media.
+        #
+        # First determine whether this is an actual network retry containing
+        # exactly the same bytes.
+        for existing in same_sequence:
+            existing_checksum = str(existing.get("checksum") or "")
+
+            if not existing_checksum:
+                try:
+                    existing_content = self.objects.get_bytes(
+                        str(existing["bucket"]),
+                        str(existing["objectKey"]),
+                    )
+                    existing_checksum = hashlib.sha256(
+                        existing_content
+                    ).hexdigest()
+                except Exception:
+                    existing_checksum = ""
+
+            if existing_checksum == incoming_checksum:
+                return {
+                    "ok": True,
+                    "chunk": existing,
+                    "duplicate": True,
+                    "sequenceCollision": False,
+                }
+
+        actual_sequence = client_sequence
+        sequence_collision = bool(same_sequence)
+
+        if sequence_collision:
+            # The browser reused a sequence number, but the media is different.
+            # Never overwrite/drop it. Give it the next free server-side sequence.
+            used_sequences = {
+                int(item.get("sequence") or 0)
+                for item in chunks
+                if int(item.get("segment") or 1) == segment
+            }
+
+            actual_sequence = max(used_sequences, default=-1) + 1
+
+            while actual_sequence in used_sequences:
+                actual_sequence += 1
+
+            print(
+                f"[chunk-debug] sequence_collision "
+                f"session={session_id} "
+                f"segment={segment} "
+                f"client_sequence={client_sequence} "
+                f"stored_sequence={actual_sequence}",
+                flush=True,
+            )
+
         now = _now()
         extension = ".webm" if "webm" in mime_type else ".bin"
+
         relative = (
             f"temp/{int(session.get('companyId') or 0)}/{_safe(session_id)}/browser/"
-            f"segment_{int(segment):03d}/chunk_{int(sequence):06d}{extension}"
+            f"segment_{segment:03d}/chunk_{actual_sequence:06d}{extension}"
         )
+
         stored = self.objects.put_bytes(
             self.settings.s3_bucket_temp,
             relative,
@@ -367,22 +436,32 @@ class MediaStore:
         )
 
         entry = {
-            "segment": int(segment),
-            "sequence": int(sequence),
+            "segment": segment,
+            "sequence": actual_sequence,
+            "clientSequence": client_sequence,
+            "sequenceCollision": sequence_collision,
             "receivedAt": now,
             "durationMs": int(duration_ms or 0),
             "bucket": stored.bucket,
             "objectKey": stored.key,
             "mimeType": mime_type or "video/webm",
             "sizeBytes": len(content),
+            "checksum": incoming_checksum,
         }
-        chunks = list(session.get("chunks") or [])
+
         chunks.append(entry)
         session["chunks"] = chunks
+
         # Every chunk can be needed to bridge an Egress gap during finalization.
         # Cleanup happens only after durable evidence is reconciled with Moodle.
         self._save_session(session)
-        return {"ok": True, "chunk": entry}
+
+        return {
+            "ok": True,
+            "chunk": entry,
+            "duplicate": False,
+            "sequenceCollision": sequence_collision,
+        }
 
     @_session_locked
     def capture_snapshot(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -916,13 +995,17 @@ class MediaStore:
         return recording if isinstance(recording, dict) else {"state": "not_started", "currentSegment": 0, "segments": {}}
 
     @staticmethod
-    def _next_chunk_sequence(session: dict[str, Any], segment: int) -> int:
+    def _next_chunk_sequence(
+        session: dict[str, Any],
+        segment: int,
+    ) -> int:
         sequences = [
             int(item.get("sequence") or 0)
             for item in (session.get("chunks") or [])
-            if int(item.get("segment") or 1) == segment
+            if int(item.get("segment") or 1) == int(segment)
         ]
-        return max(sequences, default=0)
+
+        return max(sequences, default=-1) + 1
 
     def _save_session(self, session: dict[str, Any]) -> None:
         self.state.save_session(session)
