@@ -109,6 +109,16 @@ def test_browser_recording_wins_when_egress_duration_is_mostly_timestamp_holes(
     assert strategy == "browser_chunk_fallback"
 
 
+def test_direct_browser_capture_is_primary_for_screen_evidence(tmp_path) -> None:
+    egress = tmp_path / "egress.mp4"
+    browser = tmp_path / "browser.mp4"
+
+    selected, strategy = jobs._prefer_screen_segment(egress, browser)
+
+    assert selected == browser
+    assert strategy == "browser_screen_primary"
+
+
 def test_browser_violation_time_is_mapped_onto_compacted_media() -> None:
     start, event, mapping = jobs._violation_clip_start_offset(
         occurred_at=160,

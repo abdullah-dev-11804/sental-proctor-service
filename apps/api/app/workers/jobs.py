@@ -375,7 +375,7 @@ def _build_screen_recording(
         entry = next((item for item in entries if int(item.get("segment") or 1) == segment), {})
         egress_output = _build_screen_egress_segment(entry, segment, objects, work)
         browser_output = _build_screen_browser_segment(chunks, segment, objects, work)
-        output, strategy = _prefer_complete_segment(egress_output, browser_output)
+        output, strategy = _prefer_screen_segment(egress_output, browser_output)
         if output is None:
             continue
         segment_media[segment] = {
@@ -395,6 +395,15 @@ def _build_screen_recording(
         _concat_video_files(paths, full)
     strategy = "mixed_segment_reconciliation" if len(set(strategies)) > 1 else strategies[0]
     return full, strategy, segment_media
+
+
+def _prefer_screen_segment(egress: Path | None, browser: Path | None) -> tuple[Path | None, str]:
+    """Use the browser's direct display capture; retain Egress as the safety fallback."""
+    if browser is not None:
+        return browser, "browser_screen_primary"
+    if egress is not None:
+        return egress, "livekit_screen_fallback"
+    return None, "no_screen_media"
 
 
 def _prefer_complete_segment(egress: Path | None, browser: Path | None) -> tuple[Path | None, str]:
