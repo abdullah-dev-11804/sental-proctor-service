@@ -62,6 +62,10 @@ class RecordingRequest(BaseModel):
     idempotencyKey: str | None = None
 
 
+class ScreenRecordingRequest(RecordingRequest):
+    displaySurface: str | None = None
+
+
 class SnapshotRequest(BaseModel):
     moodleSessionId: int | None = Field(default=None, ge=1)
     companyId: int = Field(default=0, ge=0)
@@ -86,6 +90,7 @@ class MediaTokenRequest(BaseModel):
     participantIdentity: str | None = None
     participantName: str | None = None
     permissions: dict | None = None
+    mediaRole: str = Field(default="camera", pattern="^(camera|screen)$")
     requestedAt: str | None = None
 
 
@@ -174,6 +179,7 @@ def get_moodle_session(session_id: str, x_proctorcore_company: int | None = Head
             "sessionId": session["sessionId"],
             "status": session["status"],
             "recording": session.get("recording", {}),
+            "screenRecording": session.get("screenRecording", {}),
             "assets": session.get("assets", []),
             "violations": session.get("violations", []),
             "processing": session.get("processing", {}),
@@ -237,6 +243,22 @@ def stop_moodle_recording(session_id: str, payload: RecordingRequest) -> dict:
         raise HTTPException(status_code=404, detail="session_not_found") from exc
 
 
+@compat_router.post("/{session_id}/screen-recording/start", dependencies=[Depends(require_api_auth)])
+def start_moodle_screen_recording(session_id: str, payload: ScreenRecordingRequest) -> dict:
+    try:
+        return MediaStore().start_screen_recording(session_id, payload.model_dump())
+    except (KeyError, PermissionError) as exc:
+        raise HTTPException(status_code=404, detail="session_not_found") from exc
+
+
+@compat_router.post("/{session_id}/screen-recording/stop", dependencies=[Depends(require_api_auth)])
+def stop_moodle_screen_recording(session_id: str, payload: ScreenRecordingRequest) -> dict:
+    try:
+        return MediaStore().stop_screen_recording(session_id, payload.model_dump())
+    except (KeyError, PermissionError) as exc:
+        raise HTTPException(status_code=404, detail="session_not_found") from exc
+
+
 @compat_router.post("/{session_id}/snapshots", dependencies=[Depends(require_api_auth)])
 def capture_moodle_snapshot(session_id: str, payload: SnapshotRequest) -> dict:
     try:
@@ -276,6 +298,7 @@ async def upload_moodle_media_chunk(
     segment: int = Form(1),
     sequence: int = Form(0),
     durationMs: int | None = Form(None),
+    stream: str = Form("camera"),
     x_proctorcore_upload_token: str = Header(""),
 ) -> dict:
     try:
@@ -288,6 +311,7 @@ async def upload_moodle_media_chunk(
             sequence=sequence,
             duration_ms=durationMs,
             mime_type=asset.content_type or "video/webm",
+            stream_type=stream,
         )
     except PermissionError as exc:
         raise HTTPException(status_code=401, detail="invalid_upload_token") from exc

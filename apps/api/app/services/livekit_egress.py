@@ -10,12 +10,16 @@ class LiveKitEgress:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
 
-    def start_participant(self, room: str, identity: str, object_prefix: str) -> dict[str, Any]:
+    def start_participant(
+        self, room: str, identity: str, object_prefix: str, *, screen_share: bool = False
+    ) -> dict[str, Any]:
         if not self.settings.livekit_egress_enabled:
             return {"enabled": False, "state": "browser_fallback"}
-        return asyncio.run(self._start_participant(room, identity, object_prefix))
+        return asyncio.run(self._start_participant(room, identity, object_prefix, screen_share=screen_share))
 
-    async def _start_participant(self, room: str, identity: str, object_prefix: str) -> dict[str, Any]:
+    async def _start_participant(
+        self, room: str, identity: str, object_prefix: str, *, screen_share: bool = False
+    ) -> dict[str, Any]:
         from livekit import api
 
         upload = api.S3Upload(
@@ -37,6 +41,7 @@ class LiveKitEgress:
         request = api.ParticipantEgressRequest(
             room_name=room,
             identity=identity,
+            screen_share=screen_share,
             segment_outputs=[output],
         )
         client = api.LiveKitAPI(

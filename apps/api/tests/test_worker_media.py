@@ -228,6 +228,32 @@ def test_media_concat_decodes_inputs_instead_of_stream_copy(monkeypatch, tmp_pat
     assert not ("-c" in command and command[command.index("-c") + 1] == "copy")
 
 
+def test_camera_and_screen_builders_keep_their_media_pipelines_separate(monkeypatch, tmp_path) -> None:
+    camera_source = tmp_path / "camera.mp4"
+    screen_source = tmp_path / "screen.mp4"
+    camera_source.write_bytes(b"camera")
+    screen_source.write_bytes(b"screen")
+    calls = []
+
+    monkeypatch.setattr(jobs, "_build_egress_segment", lambda *_args: camera_source)
+    monkeypatch.setattr(jobs, "_build_browser_segment", lambda *_args: None)
+    monkeypatch.setattr(jobs, "_build_screen_egress_segment", lambda *_args: screen_source)
+    monkeypatch.setattr(jobs, "_build_screen_browser_segment", lambda *_args: None)
+    monkeypatch.setattr(jobs, "_normalize_media_timeline", lambda source, output: calls.append(("camera", source, output)))
+    monkeypatch.setattr(jobs, "_normalize_video_timeline", lambda source, output: calls.append(("screen", source, output)))
+
+    session = {
+        "startedAt": 100,
+        "recording": {"segments": {"1": {"segment": 1, "startedAt": 100}}},
+        "screenRecording": {"segments": {"1": {"segment": 1, "startedAt": 100}}},
+    }
+    jobs._build_recording(session, object(), tmp_path / "camera-work")
+    jobs._build_screen_recording(session, object(), tmp_path / "screen-work")
+
+    assert calls[0][0:2] == ("camera", camera_source)
+    assert calls[1][0:2] == ("screen", screen_source)
+
+
 def test_corrupt_repeated_audio_payload_is_rejected(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         jobs,

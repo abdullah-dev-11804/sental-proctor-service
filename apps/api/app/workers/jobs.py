@@ -107,6 +107,34 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
                 work,
                 segment_media,
             )
+            screen_recording, screen_strategy, screen_segment_media = _build_screen_recording(
+                session, objects, work / "screen-source"
+            )
+            temporary_screen_recording = None
+            if screen_recording is not None:
+                temporary_screen_recording = objects.put_file(
+                    settings.s3_bucket_temp,
+                    (
+                        f"temp/{int(session.get('companyId') or 0)}/{session_id}/"
+                        "finalized/full-screen.mp4"
+                    ),
+                    screen_recording,
+                    "video/mp4",
+                    {
+                        "session-id": session_id,
+                        "company-id": str(int(session.get("companyId") or 0)),
+                        "temporary": "true",
+                        "media-role": "screen",
+                    },
+                )
+                _create_screen_violation_evidence(
+                    store,
+                    session_id,
+                    session,
+                    screen_recording,
+                    work / "screen-evidence",
+                    screen_segment_media,
+                )
 
         cleanup_not_before = int(time.time()) + max(1, int(settings.media_reconciliation_grace_seconds))
         with store.state.session_lock(session_id):
@@ -135,6 +163,13 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
                     "strategy": strategy,
                     "segmentCount": len(segment_media),
                 },
+                "fullScreenRecording": ({
+                    "bucket": temporary_screen_recording.bucket,
+                    "objectKey": temporary_screen_recording.key,
+                    "sizeBytes": temporary_screen_recording.size,
+                    "strategy": screen_strategy,
+                    "segmentCount": len(screen_segment_media),
+                } if temporary_screen_recording is not None else None),
                 "requiredAssetIds": required_assets,
                 "requiredEventIds": [
                     *[f"asset-{asset_id}" for asset_id in required_assets],
@@ -264,6 +299,100 @@ def _build_recording(
         _normalize_media_timeline(paths[0], full)
     else:
         _concat_media_files(paths, full)
+    strategy = "mixed_segment_reconciliation" if len(set(strategies)) > 1 else strategies[0]
+    return full, strategy, segment_media
+
+
+def _build_screen_egress_segment(
+    entry: dict[str, Any], segment: int, objects: ObjectStore, work: Path
+) -> Path | None:
+    prefix = str((entry.get("egress") or {}).get("objectPrefix") or "")
+    if not prefix or not _wait_for_object(objects, objects.settings.s3_bucket_temp, f"{prefix}/index.m3u8", 90):
+        return None
+    local_root = work / "egress" / f"segment_{segment:03d}"
+    for key in objects.list_keys(objects.settings.s3_bucket_temp, prefix):
+        relative = key[len(prefix):].lstrip("/")
+        objects.download_file(objects.settings.s3_bucket_temp, key, local_root / relative)
+    output = work / f"segment_{segment:03d}_egress.mp4"
+    _normalize_video_timeline(local_root / "index.m3u8", output)
+    return output if output.is_file() and output.stat().st_size > 0 else None
+
+
+def _build_screen_browser_segment(
+    chunks: list[dict[str, Any]], segment: int, objects: ObjectStore, work: Path
+) -> Path | None:
+    selected = sorted(
+        [item for item in chunks if int(item.get("segment") or 1) == segment],
+        key=lambda item: (int(item.get("sequence") or 0), int(item.get("receivedAt") or 0)),
+    )
+    contents: list[bytes] = []
+    seen: set[tuple[str, str]] = set()
+    for chunk in selected:
+        identity = (str(chunk.get("bucket") or ""), str(chunk.get("objectKey") or ""))
+        if not all(identity) or identity in seen:
+            continue
+        seen.add(identity)
+        try:
+            content = objects.get_bytes(*identity)
+        except Exception:
+            continue
+        if content:
+            contents.append(content)
+    streams = _group_webm_chunks(contents)
+    if not streams:
+        return None
+    chunk_dir = work / "browser" / f"segment_{segment:03d}"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    converted: list[Path] = []
+    for index, content in enumerate(streams):
+        joined = chunk_dir / f"stream_{index:04d}.webm"
+        joined.write_bytes(content)
+        converted_path = chunk_dir / f"stream_{index:04d}.mp4"
+        _normalize_video_timeline(joined, converted_path)
+        if _media_duration_seconds(converted_path) > 0:
+            converted.append(converted_path)
+    if not converted:
+        return None
+    output = work / f"segment_{segment:03d}_browser.mp4"
+    _normalize_video_timeline(converted[0], output) if len(converted) == 1 else _concat_video_files(converted, output)
+    return output if output.is_file() and output.stat().st_size > 0 else None
+
+
+def _build_screen_recording(
+    session: dict[str, Any],
+    objects: ObjectStore,
+    work: Path,
+) -> tuple[Path | None, str, dict[int, dict[str, Any]]]:
+    """Build the independently captured display timeline without requiring it for session finalization."""
+    work.mkdir(parents=True, exist_ok=True)
+    entries = list((session.get("screenRecording") or {}).get("segments", {}).values())
+    chunks = list(session.get("screenChunks") or [])
+    segment_numbers = {int(item.get("segment") or 1) for item in entries}
+    segment_numbers.update(int(item.get("segment") or 1) for item in chunks)
+    segment_media: dict[int, dict[str, Any]] = {}
+    strategies: list[str] = []
+    for segment in sorted(segment_numbers):
+        entry = next((item for item in entries if int(item.get("segment") or 1) == segment), {})
+        egress_output = _build_screen_egress_segment(entry, segment, objects, work)
+        browser_output = _build_screen_browser_segment(chunks, segment, objects, work)
+        output, strategy = _prefer_complete_segment(egress_output, browser_output)
+        if output is None:
+            continue
+        segment_media[segment] = {
+            "path": output,
+            "startedAt": int(entry.get("startedAt") or session.get("startedAt") or session.get("createdAt") or 0),
+            "stoppedAt": int(entry.get("stoppedAt") or 0),
+            "strategy": strategy,
+        }
+        strategies.append(strategy)
+    if not segment_media:
+        return None, "no_screen_media", {}
+    paths = [segment_media[number]["path"] for number in sorted(segment_media)]
+    full = work / "screen-recording.mp4"
+    if len(paths) == 1:
+        _normalize_video_timeline(paths[0], full)
+    else:
+        _concat_video_files(paths, full)
     strategy = "mixed_segment_reconciliation" if len(set(strategies)) > 1 else strategies[0]
     return full, strategy, segment_media
 
@@ -430,6 +559,7 @@ def _evidence_clip_title(
         "disappearance": "Face not visible",
         "gaze_away": "Looking away",
         "tab_switch": "Tab switch",
+        "tab_hidden": "Tab hidden",
         "focus_loss": "Exam window lost focus",
         "window_blur": "Exam window lost focus",
         "leaving_exam_window": "Left exam window",
@@ -610,6 +740,140 @@ def _create_violation_clips(
         raise RuntimeError("violation_clip_creation_failed: " + ",".join(missing[:10]))
 
 
+def _create_screen_violation_evidence(
+    store: MediaStore,
+    session_id: str,
+    session: dict[str, Any],
+    recording: Path,
+    work: Path,
+    segment_media: dict[int, dict[str, Any]],
+) -> None:
+    """Create display clips and exact-time stills for on-device browser violations."""
+    settings = get_settings()
+    work.mkdir(parents=True, exist_ok=True)
+    started_at = int(session.get("startedAt") or session.get("createdAt") or 0)
+    screen_types = {"tab_hidden", "tab_switch", "window_blur", "focus_loss", "leaving_exam_window"}
+    violations = {
+        str(item.get("id")): item
+        for item in session.get("violations") or []
+        if str(item.get("type") or "") in screen_types
+    }
+    screen_segments = list((session.get("screenRecording") or {}).get("segments", {}).values())
+
+    def screen_segment_for(occurred_at: Any) -> int:
+        timestamp = int(occurred_at or started_at)
+        eligible = [
+            item for item in screen_segments
+            if int(item.get("startedAt") or 0) <= timestamp
+            and (not int(item.get("stoppedAt") or 0) or timestamp <= int(item.get("stoppedAt") or 0))
+        ]
+        if eligible:
+            return int(max(eligible, key=lambda item: int(item.get("startedAt") or 0)).get("segment") or 1)
+        return 1
+
+    candidates = [
+        {
+            "violationId": item.get("id"),
+            "reason": item.get("type"),
+            "occurredAt": item.get("occurredAt"),
+            "segment": screen_segment_for(item.get("occurredAt")),
+        }
+        for item in violations.values()
+    ]
+    groups = _group_clip_candidates(
+        candidates,
+        violations,
+        started_at=started_at,
+        pre_seconds=int(settings.clip_pre_seconds),
+        post_seconds=int(settings.clip_post_seconds),
+    )
+    source_durations: dict[Path, float] = {}
+    for index, group in enumerate(groups):
+        primary = group[0]
+        violation = primary["violation"]
+        occurred_at = int(primary["occurredAt"])
+        latest_occurred_at = max(int(item["occurredAt"]) for item in group)
+        segment = int(primary["segment"])
+        media = segment_media.get(segment)
+        source = Path(media["path"]) if media else recording
+        source_started_at = int(media.get("startedAt") or started_at) if media else started_at
+        duration = min(
+            60,
+            int(settings.clip_pre_seconds) + int(settings.clip_post_seconds)
+            + max(0, latest_occurred_at - occurred_at),
+        )
+        if source not in source_durations:
+            source_durations[source] = _media_duration_seconds(source)
+        start_offset, event_offset, timeline_mapping = _violation_clip_start_offset(
+            occurred_at=occurred_at,
+            source_started_at=source_started_at,
+            source_duration=source_durations[source],
+            clip_duration=duration,
+            pre_seconds=int(settings.clip_pre_seconds),
+            media=media,
+        )
+        related_ids = [str(item["violation"].get("id") or item["candidate"].get("violationId")) for item in group]
+        related_types = [str(item["violation"].get("type") or "screen_violation") for item in group]
+        title = "Screen evidence: " + _evidence_clip_title(related_types, len(group))
+        clip_path = work / f"screen_clip_{index:04d}.mp4"
+        _run_ffmpeg([
+            "-ss", str(start_offset), "-i", str(source), "-t", str(duration),
+            "-map", "0:v:0", "-vf", "setpts=PTS-STARTPTS", "-an",
+            "-fps_mode:v", "passthrough", "-c:v", "libx264", "-preset", "veryfast",
+            "-crf", "19", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(clip_path),
+        ])
+        if clip_path.is_file() and clip_path.stat().st_size > 0 and _media_duration_seconds(clip_path) > 0:
+            store.register_asset_bytes(
+                session_id,
+                "video_clip",
+                clip_path.read_bytes(),
+                ".mp4",
+                "video/mp4",
+                title,
+                violation_id=violation.get("id"),
+                metadata={
+                    "source": "temporary_screen_recording",
+                    "evidenceSource": "screen",
+                    "displayTitle": title,
+                    "reasonCode": "screen_violations",
+                    "clipStartSeconds": start_offset,
+                    "clipDurationSeconds": duration,
+                    "eventOffsetSeconds": event_offset,
+                    "timelineMapping": timeline_mapping,
+                    "recordingSegment": segment,
+                    "relatedViolationIds": related_ids,
+                    "relatedViolationTypes": related_types,
+                    "violationCount": len(group),
+                },
+            )
+
+        snapshot_path = work / f"screen_snapshot_{index:04d}.jpg"
+        absolute_event_offset = min(source_durations[source], max(0.0, event_offset))
+        _run_ffmpeg([
+            "-ss", str(absolute_event_offset), "-i", str(source), "-frames:v", "1",
+            "-q:v", "2", str(snapshot_path),
+        ])
+        if snapshot_path.is_file() and snapshot_path.stat().st_size > 0:
+            store.register_asset_bytes(
+                session_id,
+                "snapshot",
+                snapshot_path.read_bytes(),
+                ".jpg",
+                "image/jpeg",
+                title,
+                violation_id=violation.get("id"),
+                metadata={
+                    "source": "temporary_screen_recording",
+                    "evidenceSource": "screen",
+                    "snapshotReason": "violation",
+                    "displayTitle": title,
+                    "occurredAt": occurred_at,
+                    "relatedViolationIds": related_ids,
+                    "relatedViolationTypes": related_types,
+                },
+            )
+
+
 def _group_clip_candidates(
     candidates: list[dict[str, Any]],
     violations: dict[str, dict[str, Any]],
@@ -752,6 +1016,28 @@ def _concat_media_files(paths: list[Path], output: Path) -> None:
     ])
 
 
+def _concat_video_files(paths: list[Path], output: Path) -> None:
+    """Concatenate screen-only sources without inventing or requiring audio."""
+    if not paths:
+        raise ValueError("video_concat_requires_input")
+    if len(paths) == 1:
+        _normalize_video_timeline(paths[0], output)
+        return
+    inputs: list[str] = []
+    filters: list[str] = []
+    concat_inputs: list[str] = []
+    for index, path in enumerate(paths):
+        inputs.extend(["-i", str(path)])
+        filters.append(f"[{index}:v:0]setpts=PTS-STARTPTS[v{index}]")
+        concat_inputs.append(f"[v{index}]")
+    filters.append("".join(concat_inputs) + f"concat=n={len(paths)}:v=1:a=0[vout]")
+    _run_ffmpeg([
+        *inputs, "-filter_complex", ";".join(filters), "-map", "[vout]", "-an",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart", str(output),
+    ])
+
+
 def _normalize_media_timeline(source: Path, output: Path) -> None:
     """Remove timestamp holes while retaining high evidence quality."""
     frame_rate = _media_video_frame_rate(source)
@@ -779,6 +1065,16 @@ def _normalize_media_timeline(source: Path, output: Path) -> None:
         "-movflags", "+faststart",
 
         str(output),
+    ])
+
+
+def _normalize_video_timeline(source: Path, output: Path) -> None:
+    """Normalize a screen-only source while preserving its native frame cadence."""
+    frame_rate = _media_video_frame_rate(source)
+    _run_ffmpeg([
+        "-i", str(source), "-map", "0:v:0", "-vf", f"setpts=N/({frame_rate:g}*TB)",
+        "-fps_mode:v", "passthrough", "-an", "-c:v", "libx264", "-preset", "veryfast",
+        "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output),
     ])
 
 

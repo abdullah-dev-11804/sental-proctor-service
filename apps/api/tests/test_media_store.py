@@ -18,8 +18,8 @@ class FakeJobs:
 
 
 class FakeEgress:
-    def start_participant(self, room, identity, prefix):
-        return {"egressId": "egress-1", "objectPrefix": prefix}
+    def start_participant(self, room, identity, prefix, **kwargs):
+        return {"egressId": "egress-1", "objectPrefix": prefix, "screenShare": kwargs.get("screen_share", False)}
 
     def stop(self, egress_id):
         return {"state": "stopping", "egressId": egress_id}
@@ -111,7 +111,39 @@ def test_reopened_fallback_segment_continues_chunk_sequence(store: MediaStore) -
     assert started["fallback"] is True
     assert resumed["duplicate"] is True
     assert resumed["fallback"] is True
-    assert resumed["nextSequence"] == 1
+    assert resumed["nextSequence"] == 2
+
+
+def test_screen_capture_uses_independent_token_chunks_and_egress(store: MediaStore) -> None:
+    session = store.create_session(_payload())
+    camera = store.create_media_token(session["id"], {**_scope(), "mediaRole": "camera"})
+    screen = store.create_media_token(session["id"], {
+        **_scope(),
+        "mediaRole": "screen",
+        "participantIdentity": "candidate-screen",
+    })
+
+    started = store.start_screen_recording(session["id"], {**_scope(), "displaySurface": "monitor"})
+    saved = store.save_media_chunk(
+        session["id"],
+        screen["uploadToken"],
+        b"screen-chunk",
+        segment=started["segment"],
+        sequence=0,
+        duration_ms=5000,
+        mime_type="video/webm",
+        stream_type="screen",
+    )
+
+    assert started["provider"] == "livekit_egress"
+    assert saved["chunk"]["stream"] == "screen"
+    assert len(store.get_session(session["id"])["screenChunks"]) == 1
+    assert store.get_session(session["id"])["chunks"] == []
+    with pytest.raises(PermissionError, match="invalid_upload_token"):
+        store.save_media_chunk(
+            session["id"], camera["uploadToken"], b"wrong-stream", segment=1, sequence=1,
+            mime_type="video/webm", stream_type="screen",
+        )
 
 
 def test_retention_begins_at_completion_and_classifies_assets(store: MediaStore) -> None:

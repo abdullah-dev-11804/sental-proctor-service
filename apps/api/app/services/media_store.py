@@ -104,6 +104,8 @@ class MediaStore:
                 "reportExpiresAt": None,
             },
             "chunks": [],
+            "screenChunks": [],
+            "screenRecording": {"state": "not_started", "currentSegment": 0, "segments": {}},
             "pendingClips": [],
             "assets": [],
             "violations": [],
@@ -147,11 +149,22 @@ class MediaStore:
             name=str(payload.get("participantName") or ""),
         )
         upload_token = uuid4().hex + uuid4().hex
-        session["participantIdentity"] = str(
-            payload.get("participantIdentity") or f"user-{session.get('userId') or 'unknown'}"
-        )
-        session["uploadTokenHash"] = hashlib.sha256(upload_token.encode("utf-8")).hexdigest()
-        session["uploadTokenExpiresAt"] = _now() + int(self.settings.media_upload_token_ttl_seconds)
+        role = "screen" if str(payload.get("mediaRole") or "camera") == "screen" else "camera"
+        identity = str(payload.get("participantIdentity") or f"user-{session.get('userId') or 'unknown'}")
+        identities = dict(session.get("participantIdentities") or {})
+        identities[role] = identity
+        session["participantIdentities"] = identities
+        if role == "camera":
+            session["participantIdentity"] = identity
+        tokens = dict(session.get("uploadTokens") or {})
+        tokens[role] = {
+            "hash": hashlib.sha256(upload_token.encode("utf-8")).hexdigest(),
+            "expiresAt": _now() + int(self.settings.media_upload_token_ttl_seconds),
+        }
+        session["uploadTokens"] = tokens
+        if role == "camera":
+            session["uploadTokenHash"] = tokens[role]["hash"]
+            session["uploadTokenExpiresAt"] = tokens[role]["expiresAt"]
         self._save_session(session)
         return {
             "ok": True,
@@ -162,7 +175,9 @@ class MediaStore:
             "tokenExpiresAt": _now() + 3600,
             "uploadUrl": f"/api/v1/sessions/{session_id}/media/chunks",
             "uploadToken": upload_token,
+            "uploadTokenExpiresAt": tokens[role]["expiresAt"],
             "chunkMilliseconds": 5000,
+            "mediaRole": role,
         }
 
     @_session_locked
@@ -230,6 +245,86 @@ class MediaStore:
         }
 
     @_session_locked
+    def start_screen_recording(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        session = self.get_session(session_id)
+        self._require_scope(session, payload)
+        recording = dict(session.get("screenRecording") or {})
+        if recording.get("state") == "active":
+            segment = int(recording.get("currentSegment") or 1)
+            return {
+                "ok": True,
+                "status": "active",
+                "segment": segment,
+                "nextSequence": self._next_chunk_sequence(session, segment, "screenChunks"),
+                "duplicate": True,
+            }
+
+        segment = max(1, int(recording.get("currentSegment") or 0) + 1)
+        now = _now()
+        provider = "browser_fallback"
+        egress_result: dict[str, Any] = {}
+        if self.settings.livekit_egress_enabled:
+            prefix = (
+                f"temp/{int(session.get('companyId') or 0)}/{_safe(session_id)}"
+                f"/screen/segment_{segment:03d}"
+            )
+            try:
+                identity = str((session.get("participantIdentities") or {}).get("screen") or "")
+                if not identity:
+                    raise ValueError("screen_participant_missing")
+                egress_result = self.egress.start_participant(
+                    str(session.get("roomId") or f"room-{session_id}"),
+                    identity,
+                    prefix,
+                    screen_share=True,
+                )
+                if egress_result.get("egressId"):
+                    provider = "livekit_egress"
+            except Exception as exc:
+                egress_result = {"state": "failed", "error": str(exc)[:500]}
+
+        recording.update({"state": "active", "provider": provider, "currentSegment": segment})
+        recording.setdefault("segments", {})[str(segment)] = {
+            "segment": segment,
+            "startedAt": now,
+            "stoppedAt": None,
+            "displaySurface": str(payload.get("displaySurface") or "unknown")[:32],
+            "egress": egress_result,
+        }
+        session["screenRecording"] = recording
+        self._save_session(session)
+        return {
+            "ok": True,
+            "status": "active",
+            "segment": segment,
+            "nextSequence": self._next_chunk_sequence(session, segment, "screenChunks"),
+            "provider": provider,
+            "fallback": provider != "livekit_egress",
+        }
+
+    @_session_locked
+    def stop_screen_recording(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        session = self.get_session(session_id)
+        self._require_scope(session, payload)
+        recording = dict(session.get("screenRecording") or {})
+        if recording.get("state") != "active":
+            return {"ok": True, "status": str(recording.get("state") or "not_started"), "duplicate": True}
+        segment = int(recording.get("currentSegment") or 1)
+        entry = recording.setdefault("segments", {}).setdefault(str(segment), {"segment": segment})
+        entry["stoppedAt"] = _now()
+        entry["stopReason"] = str(payload.get("reason") or "submitted")[:64]
+        egress_id = str((entry.get("egress") or {}).get("egressId") or "")
+        if egress_id:
+            try:
+                entry["egressStop"] = self.egress.stop(egress_id)
+            except Exception as exc:
+                entry["egressStop"] = {"state": "failed", "error": str(exc)[:500]}
+        recording["state"] = "stopped"
+        session["screenRecording"] = recording
+        self._save_session(session)
+        return {"ok": True, "status": "stopped", "segment": segment}
+
+    @_session_locked
     def stop_recording(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         session = self.get_session(session_id)
         self._require_scope(session, payload)
@@ -270,6 +365,23 @@ class MediaStore:
                 "segment": segment,
                 "partialMediaPreserved": True,
             }
+
+        screen_recording = dict(session.get("screenRecording") or {})
+        if screen_recording.get("state") == "active":
+            screen_segment = int(screen_recording.get("currentSegment") or 1)
+            screen_entry = screen_recording.setdefault("segments", {}).setdefault(
+                str(screen_segment), {"segment": screen_segment}
+            )
+            screen_entry["stoppedAt"] = now
+            screen_entry["stopReason"] = reason
+            screen_egress_id = str((screen_entry.get("egress") or {}).get("egressId") or "")
+            if screen_egress_id:
+                try:
+                    screen_entry["egressStop"] = self.egress.stop(screen_egress_id)
+                except Exception as exc:
+                    screen_entry["egressStop"] = {"state": "failed", "error": str(exc)[:500]}
+            screen_recording["state"] = "stopped"
+            session["screenRecording"] = screen_recording
 
         session["status"] = "processing"
         session["finalResult"] = "failed" if str(payload.get("result") or "").lower() == "failed" else "passed"
@@ -347,9 +459,11 @@ class MediaStore:
         sequence: int,
         mime_type: str,
         duration_ms: int | None = None,
+        stream_type: str = "camera",
     ) -> dict[str, Any]:
         session = self.get_session(session_id)
-        self._require_upload_token(session, token)
+        stream_type = "screen" if str(stream_type) == "screen" else "camera"
+        self._require_upload_token(session, token, stream_type)
 
         if len(content) <= 0 or len(content) > int(self.settings.media_chunk_max_bytes):
             raise ValueError("invalid_chunk_size")
@@ -357,7 +471,8 @@ class MediaStore:
         segment = int(segment)
         client_sequence = int(sequence)
 
-        chunks = list(session.get("chunks") or [])
+        chunks_key = "screenChunks" if stream_type == "screen" else "chunks"
+        chunks = list(session.get(chunks_key) or [])
         incoming_checksum = hashlib.sha256(content).hexdigest()
 
         same_sequence = [
@@ -424,7 +539,7 @@ class MediaStore:
         extension = ".webm" if "webm" in mime_type else ".bin"
 
         relative = (
-            f"temp/{int(session.get('companyId') or 0)}/{_safe(session_id)}/browser/"
+            f"temp/{int(session.get('companyId') or 0)}/{_safe(session_id)}/{stream_type}-browser/"
             f"segment_{segment:03d}/chunk_{actual_sequence:06d}{extension}"
         )
 
@@ -447,10 +562,11 @@ class MediaStore:
             "mimeType": mime_type or "video/webm",
             "sizeBytes": len(content),
             "checksum": incoming_checksum,
+            "stream": stream_type,
         }
 
         chunks.append(entry)
-        session["chunks"] = chunks
+        session[chunks_key] = chunks
 
         # Every chunk can be needed to bridge an Egress gap during finalization.
         # Cleanup happens only after durable evidence is reconciled with Moodle.
@@ -695,24 +811,33 @@ class MediaStore:
         session["chunks"] = kept
 
     def _delete_temporary_chunks(self, session: dict[str, Any]) -> None:
-        for chunk in session.get("chunks") or []:
-            self.objects.delete(str(chunk["bucket"]), str(chunk["objectKey"]))
-        session["chunks"] = []
+        for key in ("chunks", "screenChunks"):
+            for chunk in session.get(key) or []:
+                self.objects.delete(str(chunk["bucket"]), str(chunk["objectKey"]))
+            session[key] = []
         self._save_session(session)
 
     def _delete_temporary_media(self, session: dict[str, Any]) -> dict[str, Any]:
         temporary = dict(session.get("temporaryMedia") or {})
         full_recording = dict(temporary.get("fullRecording") or {})
+        full_screen_recording = dict(temporary.get("fullScreenRecording") or {})
         deleted_full_recording = False
         if full_recording.get("bucket") and full_recording.get("objectKey"):
             deleted_full_recording = self.objects.delete(
                 str(full_recording["bucket"]),
                 str(full_recording["objectKey"]),
             )
+        deleted_full_screen_recording = False
+        if full_screen_recording.get("bucket") and full_screen_recording.get("objectKey"):
+            deleted_full_screen_recording = self.objects.delete(
+                str(full_screen_recording["bucket"]),
+                str(full_screen_recording["objectKey"]),
+            )
         deleted_chunks = 0
-        for chunk in session.get("chunks") or []:
-            deleted_chunks += 1 if self.objects.delete(str(chunk["bucket"]), str(chunk["objectKey"])) else 0
-        session["chunks"] = []
+        for key in ("chunks", "screenChunks"):
+            for chunk in session.get(key) or []:
+                deleted_chunks += 1 if self.objects.delete(str(chunk["bucket"]), str(chunk["objectKey"])) else 0
+            session[key] = []
         deleted_egress_objects = 0
         prefixes = []
         for entry in (session.get("recording") or {}).get("segments", {}).values():
@@ -720,9 +845,15 @@ class MediaStore:
             if prefix:
                 prefixes.append(prefix)
                 deleted_egress_objects += self.objects.delete_prefix(self.settings.s3_bucket_temp, prefix)
+        for entry in (session.get("screenRecording") or {}).get("segments", {}).values():
+            prefix = str((entry.get("egress") or {}).get("objectPrefix") or "")
+            if prefix:
+                prefixes.append(prefix)
+                deleted_egress_objects += self.objects.delete_prefix(self.settings.s3_bucket_temp, prefix)
         receipt = {
             "deletedAt": _now(),
             "deletedFullRecording": deleted_full_recording,
+            "deletedFullScreenRecording": deleted_full_screen_recording,
             "deletedBrowserChunks": deleted_chunks,
             "deletedEgressObjects": deleted_egress_objects,
             "egressPrefixes": prefixes,
@@ -998,10 +1129,11 @@ class MediaStore:
     def _next_chunk_sequence(
         session: dict[str, Any],
         segment: int,
+        chunks_key: str = "chunks",
     ) -> int:
         sequences = [
             int(item.get("sequence") or 0)
-            for item in (session.get("chunks") or [])
+            for item in (session.get(chunks_key) or [])
             if int(item.get("segment") or 1) == int(segment)
         ]
 
@@ -1100,8 +1232,15 @@ class MediaStore:
         value = payload.get("userId") or payload.get("user_id")
         return int(value) if value else None
 
-    def _require_upload_token(self, session: dict[str, Any], token: str) -> None:
+    def _require_upload_token(self, session: dict[str, Any], token: str, role: str = "camera") -> None:
         digest = hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+        scoped = (session.get("uploadTokens") or {}).get(role)
+        if isinstance(scoped, dict):
+            expires = int(scoped.get("expiresAt") or 0)
+            expected = str(scoped.get("hash") or "")
+            if expected and expires >= _now() and hmac.compare_digest(digest, expected):
+                return
+            raise PermissionError("invalid_upload_token")
         expires = int(session.get("uploadTokenExpiresAt") or 0)
         if not session.get("uploadTokenHash") or expires < _now() or not hmac.compare_digest(digest, session["uploadTokenHash"]):
             raise PermissionError("invalid_upload_token")
