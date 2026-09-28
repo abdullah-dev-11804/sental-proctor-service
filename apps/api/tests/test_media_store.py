@@ -1,4 +1,5 @@
 import base64
+import time
 from pathlib import Path
 
 import pytest
@@ -86,6 +87,22 @@ def test_resume_uses_a_new_segment_then_submission_queues_finalization(store: Me
     assert result["status"] == "processing"
     assert store.get_session(session["id"])["processing"]["state"] == "queued"
     assert store.jobs.calls[0][0] == "app.workers.jobs.finalize_session_media"
+
+
+def test_final_webhook_uses_submission_time_as_session_end(store: MediaStore) -> None:
+    store.settings.moodle_webhook_url = "https://moodle.example.test/webhook"
+    store.settings.moodle_webhook_secret = "test-secret"
+    session = store.create_session(_payload())
+    store.start_recording(session["id"], {**_scope(), "segment": 1})
+    store.stop_recording(session["id"], {**_scope(), "segment": 1, "reason": "submitted"})
+    processing = store.get_session(session["id"])
+    ended_at = processing["endedAt"]
+
+    store._finalize_session(processing, result="passed", reason="submitted")
+
+    final_event = store.jobs.calls[-1][1][1]
+    assert final_event["completedAt"] == time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ended_at))
+    assert "processingCompletedAt" in final_event
 
 
 def test_reopened_fallback_segment_continues_chunk_sequence(store: MediaStore) -> None:
@@ -232,6 +249,7 @@ def test_finalization_retains_only_key_evidence_and_schedules_source_cleanup(
             "tab_hidden",
             violation_id="violation-1",
         )
+        return []
 
     monkeypatch.setattr(worker_jobs, "get_settings", lambda: store.settings)
     monkeypatch.setattr(worker_jobs, "MediaStore", lambda: store)
@@ -249,6 +267,33 @@ def test_finalization_retains_only_key_evidence_and_schedules_source_cleanup(
     assert store.objects.exists(full_recording["bucket"], full_recording["objectKey"])
     assert store.jobs.calls[-1][0] == "app.workers.jobs.cleanup_temporary_media"
     assert store.jobs.calls[-1][2]["delay_seconds"] == store.settings.media_reconciliation_grace_seconds
+
+
+def test_missing_clip_publishes_partial_result_and_preserves_temporary_source(
+    store: MediaStore, monkeypatch
+) -> None:
+    session = store.create_session(_payload())
+
+    def build_recording(_session, _objects, work):
+        recording = work / "recording.mp4"
+        recording.write_bytes(b"temporary-full-session")
+        return recording, "browser_chunk_fallback", {}
+
+    monkeypatch.setattr(worker_jobs, "get_settings", lambda: store.settings)
+    monkeypatch.setattr(worker_jobs, "MediaStore", lambda: store)
+    monkeypatch.setattr(worker_jobs, "ObjectStore", lambda _settings: store.objects)
+    monkeypatch.setattr(worker_jobs, "_build_recording", build_recording)
+    monkeypatch.setattr(worker_jobs, "_create_violation_clips", lambda *_args: ["violation-1"])
+
+    result = worker_jobs.finalize_session_media(session["id"])
+    current = store.get_session(session["id"])
+
+    assert result["status"] == "partial"
+    assert result["missingEvidence"] == ["violation-1"]
+    assert current["processing"]["state"] == "partial"
+    assert current["temporaryMedia"]["state"] == "manual_reconciliation_required"
+    assert current["temporaryMedia"].get("cleanupJobId") is None
+    assert not any(call[0] == "app.workers.jobs.cleanup_temporary_media" for call in store.jobs.calls)
 
 
 def test_deleting_one_asset_does_not_hide_other_assets(store: MediaStore) -> None:

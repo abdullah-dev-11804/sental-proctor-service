@@ -16,6 +16,10 @@ from app.core.config import get_settings
 from app.services.media_store import MediaStore
 from app.services.object_store import ObjectStore
 
+SCREEN_VIOLATION_TYPES = {
+    "tab_hidden", "tab_switch", "window_blur", "focus_loss", "leaving_exam_window",
+}
+
 
 def deliver_webhook(session_id: str, event: dict[str, Any]) -> dict[str, Any]:
     """Deliver one deterministic event; retryable failures are raised for RQ."""
@@ -99,7 +103,7 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
                     "temporary": "true",
                 },
             )
-            _create_violation_clips(
+            missing_camera_clips = _create_violation_clips(
                 store,
                 session_id,
                 session,
@@ -107,10 +111,14 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
                 work,
                 segment_media,
             )
+            # Camera clip registration updates pending candidates and asset
+            # delivery state. Reload before routing screen-only evidence.
+            session = store.get_session(session_id)
             screen_recording, screen_strategy, screen_segment_media = _build_screen_recording(
                 session, objects, work / "screen-source"
             )
             temporary_screen_recording = None
+            missing_screen_clips = _pending_clip_ids(session, SCREEN_VIOLATION_TYPES)
             if screen_recording is not None:
                 temporary_screen_recording = objects.put_file(
                     settings.s3_bucket_temp,
@@ -127,7 +135,7 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
                         "media-role": "screen",
                     },
                 )
-                _create_screen_violation_evidence(
+                missing_screen_clips = _create_screen_violation_evidence(
                     store,
                     session_id,
                     session,
@@ -136,13 +144,20 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
                     screen_segment_media,
                 )
 
+        missing_evidence = sorted(set(missing_camera_clips + missing_screen_clips))
+        partial_evidence = bool(missing_evidence)
+
         cleanup_not_before = int(time.time()) + max(1, int(settings.media_reconciliation_grace_seconds))
         with store.state.session_lock(session_id):
             session = store.get_session(session_id)
             session["processing"] = {
-                "state": "completed",
+                "state": "partial" if partial_evidence else "completed",
                 "jobId": _current_job_id(),
-                "error": None,
+                "error": (
+                    "evidence_clip_creation_failed: " + ",".join(missing_evidence[:20])
+                    if partial_evidence else None
+                ),
+                "evidenceFailures": missing_evidence,
                 "recordingStrategy": strategy,
             }
             recording = dict(session.get("recording") or {})
@@ -154,7 +169,7 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
                 if asset.get("status") == "active"
             ]
             session["temporaryMedia"] = {
-                "state": "awaiting_reconciliation",
+                "state": "manual_reconciliation_required" if partial_evidence else "awaiting_reconciliation",
                 "cleanupNotBefore": cleanup_not_before,
                 "fullRecording": {
                     "bucket": temporary_recording.bucket,
@@ -182,20 +197,25 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
                 result="failed" if result == "failed" else "passed",
                 reason=reason,
             )
-        cleanup = store.jobs.enqueue(
-            "app.workers.jobs.cleanup_temporary_media",
-            session_id,
-            job_id=f"cleanup-{session_id}",
-            retry=True,
-            delay_seconds=max(1, int(settings.media_reconciliation_grace_seconds)),
-        )
-        with store.state.session_lock(session_id):
-            session = store.get_session(session_id)
-            temporary = dict(session.get("temporaryMedia") or {})
-            temporary["cleanupJobId"] = cleanup["jobId"]
-            session["temporaryMedia"] = temporary
-            store._save_session(session)
-        return {"status": "completed", "sessionId": session_id}
+        if not partial_evidence:
+            cleanup = store.jobs.enqueue(
+                "app.workers.jobs.cleanup_temporary_media",
+                session_id,
+                job_id=f"cleanup-{session_id}",
+                retry=True,
+                delay_seconds=max(1, int(settings.media_reconciliation_grace_seconds)),
+            )
+            with store.state.session_lock(session_id):
+                session = store.get_session(session_id)
+                temporary = dict(session.get("temporaryMedia") or {})
+                temporary["cleanupJobId"] = cleanup["jobId"]
+                session["temporaryMedia"] = temporary
+                store._save_session(session)
+        return {
+            "status": "partial" if partial_evidence else "completed",
+            "sessionId": session_id,
+            "missingEvidence": missing_evidence,
+        }
     except Exception as exc:
         with store.state.session_lock(session_id):
             session = store.get_session(session_id)
@@ -621,12 +641,12 @@ def _create_violation_clips(
     recording: Path,
     work: Path,
     segment_media: dict[int, dict[str, Any]],
-) -> None:
+) -> list[str]:
     settings = get_settings()
     started_at = int(session.get("startedAt") or session.get("createdAt") or 0)
     pending = list(session.get("pendingClips") or [])
     violations = {str(item.get("id")): item for item in session.get("violations") or []}
-    candidates = pending or [
+    all_candidates = pending or [
         {
             "violationId": item.get("id"),
             "reason": item.get("type"),
@@ -634,6 +654,14 @@ def _create_violation_clips(
             "assetId": None,
         }
         for item in violations.values()
+    ]
+    candidates = [
+        candidate for candidate in all_candidates
+        if str(
+            candidate.get("reason")
+            or violations.get(str(candidate.get("violationId")), {}).get("type")
+            or ""
+        ) not in SCREEN_VIOLATION_TYPES
     ]
     source_durations: dict[Path, float] = {}
     groups = _group_clip_candidates(
@@ -670,35 +698,39 @@ def _create_violation_clips(
             media=media,
         )
         clip_path = work / f"clip_{index:04d}.mp4"
-        _run_ffmpeg([
-            "-ss", str(start_offset),
-            "-i", str(source),
-            "-t", str(duration),
+        try:
+            _run_ffmpeg([
+                "-ss", str(start_offset),
+                "-i", str(source),
+                "-t", str(duration),
 
-            "-map", "0:v:0?",
-            "-map", "0:a:0?",
+                "-map", "0:v:0?",
+                "-map", "0:a:0?",
 
-            "-vf", "setpts=PTS-STARTPTS",
+                "-vf", "setpts=PTS-STARTPTS",
 
-            "-af",
-            "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS",
+                "-af",
+                "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS",
 
-            "-fps_mode:v", "passthrough",
-            "-shortest",
+                "-fps_mode:v", "passthrough",
+                "-shortest",
 
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "19",
-            "-pix_fmt", "yuv420p",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "19",
+                "-pix_fmt", "yuv420p",
 
-            "-c:a", "aac",
-            "-b:a", "128k",
-            "-ar", "48000",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-ar", "48000",
 
-            "-movflags", "+faststart",
+                "-movflags", "+faststart",
 
-            str(clip_path),
-        ])
+                str(clip_path),
+            ])
+        except Exception as exc:
+            print(f"[clip-debug] rejected={clip_path} reason=ffmpeg_error error={exc}", flush=True)
+            continue
         if not _media_av_payload_is_aligned(clip_path):
             continue
         related_ids = [str(item["candidate"].get("violationId") or item["violation"].get("id")) for item in group]
@@ -742,11 +774,10 @@ def _create_violation_clips(
             item["candidate"]["assetId"] = asset["assetId"]
 
     current = store.get_session(session_id)
-    current["pendingClips"] = candidates
+    current["pendingClips"] = all_candidates
     store._save_session(current)
     missing = [str(candidate.get("violationId") or "unknown") for candidate in candidates if not candidate.get("assetId")]
-    if missing:
-        raise RuntimeError("violation_clip_creation_failed: " + ",".join(missing[:10]))
+    return missing
 
 
 def _create_screen_violation_evidence(
@@ -756,16 +787,15 @@ def _create_screen_violation_evidence(
     recording: Path,
     work: Path,
     segment_media: dict[int, dict[str, Any]],
-) -> None:
+) -> list[str]:
     """Create display clips and exact-time stills for on-device browser violations."""
     settings = get_settings()
     work.mkdir(parents=True, exist_ok=True)
     started_at = int(session.get("startedAt") or session.get("createdAt") or 0)
-    screen_types = {"tab_hidden", "tab_switch", "window_blur", "focus_loss", "leaving_exam_window"}
     violations = {
         str(item.get("id")): item
         for item in session.get("violations") or []
-        if str(item.get("type") or "") in screen_types
+        if str(item.get("type") or "") in SCREEN_VIOLATION_TYPES
     }
     screen_segments = list((session.get("screenRecording") or {}).get("segments", {}).values())
 
@@ -780,15 +810,27 @@ def _create_screen_violation_evidence(
             return int(max(eligible, key=lambda item: int(item.get("startedAt") or 0)).get("segment") or 1)
         return 1
 
+    all_candidates = list(session.get("pendingClips") or [])
     candidates = [
-        {
-            "violationId": item.get("id"),
-            "reason": item.get("type"),
-            "occurredAt": item.get("occurredAt"),
-            "segment": screen_segment_for(item.get("occurredAt")),
-        }
-        for item in violations.values()
+        candidate for candidate in all_candidates
+        if str(
+            candidate.get("reason")
+            or violations.get(str(candidate.get("violationId")), {}).get("type")
+            or ""
+        ) in SCREEN_VIOLATION_TYPES
     ]
+    if not all_candidates:
+        candidates = [
+            {
+                "violationId": item.get("id"),
+                "reason": item.get("type"),
+                "occurredAt": item.get("occurredAt"),
+                "segment": screen_segment_for(item.get("occurredAt")),
+                "assetId": None,
+            }
+            for item in violations.values()
+        ]
+        all_candidates = candidates
     groups = _group_clip_candidates(
         candidates,
         violations,
@@ -825,14 +867,17 @@ def _create_screen_violation_evidence(
         related_types = [str(item["violation"].get("type") or "screen_violation") for item in group]
         title = "Screen evidence: " + _evidence_clip_title(related_types, len(group))
         clip_path = work / f"screen_clip_{index:04d}.mp4"
-        _run_ffmpeg([
-            "-ss", str(start_offset), "-i", str(source), "-t", str(duration),
-            "-map", "0:v:0", "-vf", "setpts=PTS-STARTPTS", "-an",
-            "-fps_mode:v", "passthrough", "-c:v", "libx264", "-preset", "veryfast",
-            "-crf", "19", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(clip_path),
-        ])
+        try:
+            _run_ffmpeg([
+                "-ss", str(start_offset), "-i", str(source), "-t", str(duration),
+                "-map", "0:v:0", "-vf", "setpts=PTS-STARTPTS", "-an",
+                "-fps_mode:v", "passthrough", "-c:v", "libx264", "-preset", "veryfast",
+                "-crf", "19", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(clip_path),
+            ])
+        except Exception as exc:
+            print(f"[clip-debug] rejected={clip_path} reason=screen_ffmpeg_error error={exc}", flush=True)
         if clip_path.is_file() and clip_path.stat().st_size > 0 and _media_duration_seconds(clip_path) > 0:
-            store.register_asset_bytes(
+            asset = store.register_asset_bytes(
                 session_id,
                 "video_clip",
                 clip_path.read_bytes(),
@@ -855,13 +900,18 @@ def _create_screen_violation_evidence(
                     "violationCount": len(group),
                 },
             )
+            for item in group:
+                item["candidate"]["assetId"] = asset["assetId"]
 
         snapshot_path = work / f"screen_snapshot_{index:04d}.jpg"
         absolute_event_offset = min(source_durations[source], max(0.0, event_offset))
-        _run_ffmpeg([
-            "-ss", str(absolute_event_offset), "-i", str(source), "-frames:v", "1",
-            "-q:v", "2", str(snapshot_path),
-        ])
+        try:
+            _run_ffmpeg([
+                "-ss", str(absolute_event_offset), "-i", str(source), "-frames:v", "1",
+                "-q:v", "2", str(snapshot_path),
+            ])
+        except Exception as exc:
+            print(f"[clip-debug] rejected={snapshot_path} reason=screen_snapshot_error error={exc}", flush=True)
         if snapshot_path.is_file() and snapshot_path.stat().st_size > 0:
             store.register_asset_bytes(
                 session_id,
@@ -881,6 +931,30 @@ def _create_screen_violation_evidence(
                     "relatedViolationTypes": related_types,
                 },
             )
+
+    current = store.get_session(session_id)
+    current["pendingClips"] = all_candidates
+    store._save_session(current)
+    return [
+        str(candidate.get("violationId") or "unknown")
+        for candidate in candidates
+        if not candidate.get("assetId")
+    ]
+
+
+def _pending_clip_ids(session: dict[str, Any], types: set[str]) -> list[str]:
+    """Return unresolved pending violation ids belonging to selected types."""
+    violations = {str(item.get("id")): item for item in session.get("violations") or []}
+    return [
+        str(candidate.get("violationId") or "unknown")
+        for candidate in session.get("pendingClips") or []
+        if not candidate.get("assetId")
+        and str(
+            candidate.get("reason")
+            or violations.get(str(candidate.get("violationId")), {}).get("type")
+            or ""
+        ) in types
+    ]
 
 
 def _group_clip_candidates(

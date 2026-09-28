@@ -22,11 +22,11 @@ def test_mediarecorder_chunks_are_reassembled_and_page_streams_stay_separate() -
     ]
 
 
-def test_missing_violation_clip_keeps_temporary_source_for_retry(monkeypatch, tmp_path) -> None:
+def test_missing_camera_violation_clip_is_reported_without_throwing(monkeypatch, tmp_path) -> None:
     session = {
         "startedAt": 100,
         "pendingClips": [{"violationId": "v1", "occurredAt": 110, "segment": 1}],
-        "violations": [{"id": "v1", "type": "tab_hidden", "occurredAt": 110}],
+        "violations": [{"id": "v1", "type": "speech_detected", "occurredAt": 110}],
     }
 
     class Store:
@@ -40,15 +40,38 @@ def test_missing_violation_clip_keeps_temporary_source_for_retry(monkeypatch, tm
     monkeypatch.setattr(jobs, "_run_ffmpeg", lambda _arguments: None)
     monkeypatch.setattr(jobs, "_media_duration_seconds", lambda _path: 0.0)
 
-    with pytest.raises(RuntimeError, match="violation_clip_creation_failed: v1"):
-        jobs._create_violation_clips(
-            Store(),
-            "session-1",
-            session,
-            tmp_path / "temporary-recording.mp4",
-            tmp_path,
-            {},
-        )
+    missing = jobs._create_violation_clips(
+        Store(),
+        "session-1",
+        session,
+        tmp_path / "temporary-recording.mp4",
+        tmp_path,
+        {},
+    )
+
+    assert missing == ["v1"]
+
+
+def test_screen_violation_is_not_sent_to_camera_clip_pipeline(monkeypatch, tmp_path) -> None:
+    session = {
+        "startedAt": 100,
+        "pendingClips": [{"violationId": "v1", "reason": "tab_hidden", "occurredAt": 110, "segment": 1}],
+        "violations": [{"id": "v1", "type": "tab_hidden", "occurredAt": 110}],
+    }
+
+    class Store:
+        def get_session(self, _session_id):
+            return session
+
+        def _save_session(self, updated):
+            session.update(updated)
+
+    monkeypatch.setattr(jobs, "get_settings", lambda: SimpleNamespace(clip_pre_seconds=15, clip_post_seconds=15))
+    monkeypatch.setattr(jobs, "_run_ffmpeg", lambda _arguments: pytest.fail("camera FFmpeg must not run"))
+
+    assert jobs._create_violation_clips(
+        Store(), "session-1", session, tmp_path / "camera.mp4", tmp_path, {}
+    ) == []
 
 
 def test_violation_clip_rebuilds_continuous_audio_video_timestamps(monkeypatch, tmp_path) -> None:

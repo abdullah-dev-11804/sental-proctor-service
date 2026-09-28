@@ -384,6 +384,7 @@ class MediaStore:
             session["screenRecording"] = screen_recording
 
         session["status"] = "processing"
+        session["endedAt"] = int(session.get("endedAt") or now)
         session["finalResult"] = "failed" if str(payload.get("result") or "").lower() == "failed" else "passed"
         session["processing"] = {"state": "queued", "jobId": None, "error": None}
         self._save_session(session)
@@ -989,14 +990,15 @@ class MediaStore:
         if session.get("completedAt"):
             return
         now = _now()
+        ended_at = int(session.get("endedAt") or now)
         retention = dict(session.get("retention") or {})
         appeal_days = max(1, int(retention.get("appealDays") or self.settings.default_appeal_period_days))
         video_days = max(appeal_days, int(retention.get("videoDays") or self.settings.default_video_retention_days))
         report_days = max(183, int(retention.get("reportDays") or self.settings.default_report_retention_days))
         retention.update({
-            "appealUntil": now + (appeal_days * 86400),
-            "videoExpiresAt": now + (video_days * 86400),
-            "reportExpiresAt": now + (report_days * 86400),
+            "appealUntil": ended_at + (appeal_days * 86400),
+            "videoExpiresAt": ended_at + (video_days * 86400),
+            "reportExpiresAt": ended_at + (report_days * 86400),
         })
         session["retention"] = retention
         for asset in session.get("assets") or []:
@@ -1006,6 +1008,7 @@ class MediaStore:
             asset["held"] = bool(retention.get("held"))
             self.state.index_asset(asset)
         session["status"] = "completed" if result == "passed" else "failed"
+        session["endedAt"] = ended_at
         session["completedAt"] = now
         session["result"] = result
         self._save_session(session)
@@ -1021,8 +1024,12 @@ class MediaStore:
             "result": result,
             "reasonCode": reason,
             "mediaStatus": (session.get("processing") or {}).get("state"),
+            "evidenceFailures": list((session.get("processing") or {}).get("evidenceFailures") or []),
             "assetCount": len(session.get("assets") or []),
-            "completedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            # The official session end is submission/termination time. Media
+            # processing completion is separate and may be much later.
+            "completedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ended_at)),
+            "processingCompletedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
         })
 
     def _send_webhook(self, session: dict[str, Any], event: dict[str, Any]) -> None:
@@ -1105,6 +1112,7 @@ class MediaStore:
         recording["state"] = "stopping"
         session["recording"] = recording
         session["status"] = "processing"
+        session["endedAt"] = int(session.get("endedAt") or _now())
         session["finalResult"] = result
         session["processing"] = {"state": "queued", "jobId": None, "error": None}
         self._save_session(session)
