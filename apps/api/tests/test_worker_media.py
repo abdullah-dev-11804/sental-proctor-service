@@ -261,6 +261,28 @@ def test_media_concat_decodes_inputs_instead_of_stream_copy(monkeypatch, tmp_pat
     assert not ("-c" in command and command[command.index("-c") + 1] == "copy")
 
 
+def test_screen_concat_normalizes_mixed_dimensions_and_sample_aspect_ratio(
+    monkeypatch, tmp_path
+) -> None:
+    calls = []
+    first = tmp_path / "full-hd.mp4"
+    second = tmp_path / "hd.mp4"
+    monkeypatch.setattr(jobs, "_run_ffmpeg", calls.append)
+    monkeypatch.setattr(
+        jobs,
+        "_media_video_dimensions",
+        lambda path: (1920, 1080) if path == first else (1280, 720),
+    )
+
+    jobs._concat_video_files([first, second], tmp_path / "joined.mp4")
+
+    filters = calls[0][calls[0].index("-filter_complex") + 1]
+    assert filters.count("scale=1920:1080") == 2
+    assert filters.count("pad=1920:1080") == 2
+    assert filters.count("setsar=1") == 2
+    assert "concat=n=2:v=1:a=0[vout]" in filters
+
+
 def test_camera_and_screen_builders_keep_their_media_pipelines_separate(monkeypatch, tmp_path) -> None:
     camera_source = tmp_path / "camera.mp4"
     screen_source = tmp_path / "screen.mp4"

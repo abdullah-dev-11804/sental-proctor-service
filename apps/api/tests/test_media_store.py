@@ -296,6 +296,47 @@ def test_missing_clip_publishes_partial_result_and_preserves_temporary_source(
     assert not any(call[0] == "app.workers.jobs.cleanup_temporary_media" for call in store.jobs.calls)
 
 
+def test_screen_assembly_failure_does_not_block_report_finalization(
+    store: MediaStore, monkeypatch
+) -> None:
+    session = store.create_session(_payload())
+    current = store.get_session(session["id"])
+    current["violations"] = [{"id": "screen-v1", "type": "tab_hidden", "occurredAt": 100}]
+    current["pendingClips"] = [
+        {"violationId": "screen-v1", "reason": "tab_hidden", "occurredAt": 100, "segment": 1}
+    ]
+    store._save_session(current)
+
+    def build_recording(_session, _objects, work):
+        recording = work / "recording.mp4"
+        recording.write_bytes(b"temporary-full-session")
+        return recording, "browser_chunk_fallback", {}
+
+    monkeypatch.setattr(worker_jobs, "get_settings", lambda: store.settings)
+    monkeypatch.setattr(worker_jobs, "MediaStore", lambda: store)
+    monkeypatch.setattr(worker_jobs, "ObjectStore", lambda _settings: store.objects)
+    monkeypatch.setattr(worker_jobs, "_build_recording", build_recording)
+    monkeypatch.setattr(worker_jobs, "_create_violation_clips", lambda *_args: [])
+    monkeypatch.setattr(
+        worker_jobs,
+        "_build_screen_recording",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("mixed screen dimensions")),
+    )
+
+    result = worker_jobs.finalize_session_media(session["id"])
+    current = store.get_session(session["id"])
+
+    assert result == {
+        "status": "partial",
+        "sessionId": session["id"],
+        "missingEvidence": ["screen-v1"],
+    }
+    assert current["processing"]["state"] == "partial"
+    assert current["processing"]["screenEvidenceError"] == "mixed screen dimensions"
+    assert current["temporaryMedia"]["state"] == "manual_reconciliation_required"
+    assert current["status"] in {"completed", "failed"}
+
+
 def test_deleting_one_asset_does_not_hide_other_assets(store: MediaStore) -> None:
     session = store.create_session(_payload())
     first = store.register_asset_bytes(session["id"], "snapshot", b"first", ".jpg", "image/jpeg", "one")

@@ -114,9 +114,19 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
             # Camera clip registration updates pending candidates and asset
             # delivery state. Reload before routing screen-only evidence.
             session = store.get_session(session_id)
-            screen_recording, screen_strategy, screen_segment_media = _build_screen_recording(
-                session, objects, work / "screen-source"
-            )
+            screen_processing_error = None
+            try:
+                screen_recording, screen_strategy, screen_segment_media = _build_screen_recording(
+                    session, objects, work / "screen-source"
+                )
+            except Exception as exc:
+                # Display capture is independent evidence. A corrupt or
+                # incompatible screen timeline must not suppress the camera
+                # evidence and final Moodle report for the whole session.
+                screen_recording = None
+                screen_strategy = "screen_media_processing_failed"
+                screen_segment_media = {}
+                screen_processing_error = str(exc)[:1000]
             temporary_screen_recording = None
             missing_screen_clips = _pending_clip_ids(session, SCREEN_VIOLATION_TYPES)
             if screen_recording is not None:
@@ -145,7 +155,7 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
                 )
 
         missing_evidence = sorted(set(missing_camera_clips + missing_screen_clips))
-        partial_evidence = bool(missing_evidence)
+        partial_evidence = bool(missing_evidence or screen_processing_error)
 
         cleanup_not_before = int(time.time()) + max(1, int(settings.media_reconciliation_grace_seconds))
         with store.state.session_lock(session_id):
@@ -154,10 +164,15 @@ def finalize_session_media(session_id: str, reason: str = "submitted", result: s
                 "state": "partial" if partial_evidence else "completed",
                 "jobId": _current_job_id(),
                 "error": (
-                    "evidence_clip_creation_failed: " + ",".join(missing_evidence[:20])
-                    if partial_evidence else None
+                    "screen_evidence_processing_failed: " + screen_processing_error
+                    if screen_processing_error
+                    else (
+                        "evidence_clip_creation_failed: " + ",".join(missing_evidence[:20])
+                        if missing_evidence else None
+                    )
                 ),
                 "evidenceFailures": missing_evidence,
+                "screenEvidenceError": screen_processing_error,
                 "recordingStrategy": strategy,
             }
             recording = dict(session.get("recording") or {})
@@ -1100,7 +1115,7 @@ def _concat_media_files(paths: list[Path], output: Path) -> None:
 
 
 def _concat_video_files(paths: list[Path], output: Path) -> None:
-    """Concatenate screen-only sources without inventing or requiring audio."""
+    """Concatenate screen-only sources on one display canvas without audio."""
     if not paths:
         raise ValueError("video_concat_requires_input")
     if len(paths) == 1:
@@ -1109,9 +1124,22 @@ def _concat_video_files(paths: list[Path], output: Path) -> None:
     inputs: list[str] = []
     filters: list[str] = []
     concat_inputs: list[str] = []
+    dimensions = [_media_video_dimensions(path) for path in paths]
+    target_width = max(width for width, _height in dimensions)
+    target_height = max(height for _width, height in dimensions)
+    # H.264 yuv420p requires even dimensions. Preserve every source's aspect
+    # ratio and letterbox it instead of stretching or cropping evidence.
+    target_width += target_width % 2
+    target_height += target_height % 2
     for index, path in enumerate(paths):
         inputs.extend(["-i", str(path)])
-        filters.append(f"[{index}:v:0]setpts=PTS-STARTPTS[v{index}]")
+        filters.append(
+            f"[{index}:v:0]"
+            f"scale={target_width}:{target_height}:force_original_aspect_ratio=decrease:"
+            "force_divisible_by=2,"
+            f"pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"setsar=1,setpts=PTS-STARTPTS,format=yuv420p[v{index}]"
+        )
         concat_inputs.append(f"[v{index}]")
     filters.append("".join(concat_inputs) + f"concat=n={len(paths)}:v=1:a=0[vout]")
     _run_ffmpeg([
@@ -1119,6 +1147,29 @@ def _concat_video_files(paths: list[Path], output: Path) -> None:
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
         "-movflags", "+faststart", str(output),
     ])
+
+
+def _media_video_dimensions(path: Path, default: tuple[int, int] = (1280, 720)) -> tuple[int, int]:
+    """Return usable video dimensions for cross-navigation screen capture."""
+    completed = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if completed.returncode != 0:
+        return default
+    try:
+        width, height = (int(value) for value in completed.stdout.strip().split("x", 1))
+    except (TypeError, ValueError):
+        return default
+    if width <= 0 or height <= 0:
+        return default
+    return width, height
 
 
 def _normalize_media_timeline(source: Path, output: Path) -> None:
