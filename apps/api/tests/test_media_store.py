@@ -229,6 +229,28 @@ def test_duplicate_violation_does_not_queue_duplicate_clip(store: MediaStore) ->
     assert len(pending) == 1
 
 
+def test_moodle_owned_violation_queues_evidence_without_echo_webhook(store: MediaStore) -> None:
+    session = store.create_session(_payload())
+    payload = {
+        **_scope(),
+        "sessionId": session["id"],
+        "violationId": "481",
+        "violationType": "tab_hidden",
+        "occurredAt": 100,
+        "source": "moodle_browser",
+    }
+
+    result = store.record_violation(payload, send_webhook=False)
+    current = store.get_session(session["id"])
+
+    assert result["status"] == "recorded"
+    assert current["pendingClips"][0]["reason"] == "tab_hidden"
+    assert not any(
+        delivery.get("eventId") == "481"
+        for delivery in current.get("webhookDeliveries", [])
+    )
+
+
 def test_finalization_retains_only_key_evidence_and_schedules_source_cleanup(
     store: MediaStore, monkeypatch
 ) -> None:

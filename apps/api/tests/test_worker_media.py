@@ -261,6 +261,23 @@ def test_media_concat_decodes_inputs_instead_of_stream_copy(monkeypatch, tmp_pat
     assert not ("-c" in command and command[command.index("-c") + 1] == "copy")
 
 
+def test_timeline_normalization_preserves_source_pts_and_uses_safe_h264_level(
+    monkeypatch, tmp_path
+) -> None:
+    calls = []
+    monkeypatch.setattr(jobs, "_run_ffmpeg", calls.append)
+
+    jobs._normalize_media_timeline(tmp_path / "source.webm", tmp_path / "output.mp4")
+
+    command = calls[0]
+    assert command[command.index("-vf") + 1] == "setpts=PTS-STARTPTS"
+    assert command[command.index("-af") + 1] == (
+        "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS"
+    )
+    assert command[command.index("-level:v") + 1] == "5.1"
+    assert command[command.index("-video_track_timescale") + 1] == "90000"
+
+
 def test_screen_concat_normalizes_mixed_dimensions_and_sample_aspect_ratio(
     monkeypatch, tmp_path
 ) -> None:

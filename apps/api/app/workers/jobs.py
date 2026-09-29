@@ -733,6 +733,8 @@ def _create_violation_clips(
                 "-c:v", "libx264",
                 "-preset", "veryfast",
                 "-crf", "19",
+                "-profile:v", "high",
+                "-level:v", "5.1",
                 "-pix_fmt", "yuv420p",
 
                 "-c:a", "aac",
@@ -740,6 +742,7 @@ def _create_violation_clips(
                 "-ar", "48000",
 
                 "-movflags", "+faststart",
+                "-video_track_timescale", "90000",
 
                 str(clip_path),
             ])
@@ -887,11 +890,18 @@ def _create_screen_violation_evidence(
                 "-ss", str(start_offset), "-i", str(source), "-t", str(duration),
                 "-map", "0:v:0", "-vf", "setpts=PTS-STARTPTS", "-an",
                 "-fps_mode:v", "passthrough", "-c:v", "libx264", "-preset", "veryfast",
-                "-crf", "19", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(clip_path),
+                "-crf", "19", "-profile:v", "high", "-level:v", "5.1",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-video_track_timescale", "90000", str(clip_path),
             ])
         except Exception as exc:
             print(f"[clip-debug] rejected={clip_path} reason=screen_ffmpeg_error error={exc}", flush=True)
-        if clip_path.is_file() and clip_path.stat().st_size > 0 and _media_duration_seconds(clip_path) > 0:
+        if (
+            clip_path.is_file()
+            and clip_path.stat().st_size > 0
+            and _media_duration_seconds(clip_path) > 0
+            and _video_decodes_cleanly(clip_path)
+        ):
             asset = store.register_asset_bytes(
                 session_id,
                 "video_clip",
@@ -1102,6 +1112,8 @@ def _concat_media_files(paths: list[Path], output: Path) -> None:
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "18",
+        "-profile:v", "high",
+        "-level:v", "5.1",
         "-pix_fmt", "yuv420p",
 
         "-c:a", "aac",
@@ -1109,6 +1121,7 @@ def _concat_media_files(paths: list[Path], output: Path) -> None:
         "-ar", "48000",
 
         "-movflags", "+faststart",
+        "-video_track_timescale", "90000",
 
         str(output),
     ])
@@ -1144,8 +1157,9 @@ def _concat_video_files(paths: list[Path], output: Path) -> None:
     filters.append("".join(concat_inputs) + f"concat=n={len(paths)}:v=1:a=0[vout]")
     _run_ffmpeg([
         *inputs, "-filter_complex", ";".join(filters), "-map", "[vout]", "-an",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart", str(output),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-profile:v", "high", "-level:v", "5.1", "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart", "-video_track_timescale", "90000", str(output),
     ])
 
 
@@ -1173,23 +1187,25 @@ def _media_video_dimensions(path: Path, default: tuple[int, int] = (1280, 720)) 
 
 
 def _normalize_media_timeline(source: Path, output: Path) -> None:
-    """Remove timestamp holes while retaining high evidence quality."""
-    frame_rate = _media_video_frame_rate(source)
-
+    """Rebase both streams without inventing a new video timeline."""
     _run_ffmpeg([
         "-i", str(source),
 
         "-map", "0:v:0?",
         "-map", "0:a:0?",
 
-        "-vf", f"setpts=N/({frame_rate:g}*TB)",
-        "-af", "aresample=async=1:first_pts=0,asetpts=N/SR/TB",
+        # Preserve the recorder's real frame timing. Rebuilding timestamps from
+        # frame number silently advances delayed/dropped video ahead of audio.
+        "-vf", "setpts=PTS-STARTPTS",
+        "-af", "aresample=async=1:first_pts=0,asetpts=PTS-STARTPTS",
 
         "-fps_mode:v", "passthrough",
 
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "18",
+        "-profile:v", "high",
+        "-level:v", "5.1",
         "-pix_fmt", "yuv420p",
 
         "-c:a", "aac",
@@ -1197,6 +1213,7 @@ def _normalize_media_timeline(source: Path, output: Path) -> None:
         "-ar", "48000",
 
         "-movflags", "+faststart",
+        "-video_track_timescale", "90000",
 
         str(output),
     ])
@@ -1204,11 +1221,12 @@ def _normalize_media_timeline(source: Path, output: Path) -> None:
 
 def _normalize_video_timeline(source: Path, output: Path) -> None:
     """Normalize a screen-only source while preserving its native frame cadence."""
-    frame_rate = _media_video_frame_rate(source)
     _run_ffmpeg([
-        "-i", str(source), "-map", "0:v:0", "-vf", f"setpts=N/({frame_rate:g}*TB)",
+        "-i", str(source), "-map", "0:v:0", "-vf", "setpts=PTS-STARTPTS",
         "-fps_mode:v", "passthrough", "-an", "-c:v", "libx264", "-preset", "veryfast",
-        "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output),
+        "-crf", "18", "-profile:v", "high", "-level:v", "5.1",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        "-video_track_timescale", "90000", str(output),
     ])
 
 
@@ -1359,6 +1377,9 @@ def _media_av_payload_is_aligned(path: Path, tolerance_seconds: float = 2.0) -> 
         )
         return False
 
+    if not _media_decodes_cleanly(path):
+        return False
+
     print(
         f"[clip-debug] accepted={path} "
         f"video={video_duration:.3f} audio={audio_duration:.3f} "
@@ -1368,6 +1389,51 @@ def _media_av_payload_is_aligned(path: Path, tolerance_seconds: float = 2.0) -> 
     )
 
     return True
+
+
+def _media_decodes_cleanly(path: Path) -> bool:
+    """Reject MP4s whose headers look valid but whose frames cannot be decoded."""
+    completed = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-xerror",
+            "-i", str(path), "-map", "0:v:0", "-map", "0:a:0",
+            "-f", "null", "-",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if completed.returncode == 0:
+        return True
+    print(
+        f"[clip-debug] rejected={path} reason=decode_failed "
+        f"stderr={completed.stderr[-1000:]}",
+        flush=True,
+    )
+    return False
+
+
+def _video_decodes_cleanly(path: Path) -> bool:
+    """Validate screen-only evidence by decoding every video frame."""
+    completed = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-xerror",
+            "-i", str(path), "-map", "0:v:0", "-an", "-f", "null", "-",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if completed.returncode == 0:
+        return True
+    print(
+        f"[clip-debug] rejected={path} reason=video_decode_failed "
+        f"stderr={completed.stderr[-1000:]}",
+        flush=True,
+    )
+    return False
 
 def _media_payload_durations(path: Path) -> dict[int, float]:
     """Estimate decoded payload per stream without counting timestamp holes."""

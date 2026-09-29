@@ -627,7 +627,12 @@ class MediaStore:
         return {"ok": True, "status": "captured", "reason": reason, "assetId": asset["assetId"]}
 
     @_session_locked
-    def record_violation(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def record_violation(
+        self,
+        payload: dict[str, Any],
+        *,
+        send_webhook: bool = True,
+    ) -> dict[str, Any]:
         session = self.get_session(str(payload.get("sessionId") or payload.get("session_id")))
         self._require_scope(session, payload)
         now = self._timestamp(payload.get("occurredAt") or payload.get("occurred_at")) or _now()
@@ -641,7 +646,10 @@ class MediaStore:
                 item for item in session.get("webhookDeliveries") or []
                 if str(item.get("eventId")) == violation_id
             ]
-            if not deliveries or str(deliveries[-1].get("status")) in {"queue_failed", "retrying"}:
+            if send_webhook and (
+                not deliveries
+                or str(deliveries[-1].get("status")) in {"queue_failed", "retrying"}
+            ):
                 self._send_violation_webhook(session, existing)
             return {"ok": True, "status": "duplicate", "violation": existing}
         violation = {
@@ -665,7 +673,8 @@ class MediaStore:
             segment=int(self._recording(session).get("currentSegment") or 1),
         )
         self._save_session(session)
-        self._send_violation_webhook(session, violation)
+        if send_webhook:
+            self._send_violation_webhook(session, violation)
         return {"ok": True, "status": "recorded", "violation": violation}
 
     def get_asset_content(self, asset_id: str) -> tuple[bytes, str]:

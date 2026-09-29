@@ -80,6 +80,22 @@ class SnapshotRequest(BaseModel):
     snapshotImage: str | None = None
 
 
+class MoodleViolationEvidenceRequest(BaseModel):
+    """A Moodle-owned violation that Server B needs only for media evidence."""
+
+    moodleSessionId: int | None = Field(default=None, ge=1)
+    companyId: int = Field(default=0, ge=0)
+    attemptId: int | None = Field(default=None, ge=1)
+    userId: int | None = Field(default=None, ge=1)
+    violationId: int | str
+    violationType: str
+    severity: int | str = "warning"
+    occurredAt: int | str
+    durationMs: int = Field(default=0, ge=0)
+    description: str | None = None
+    metadata: dict | None = None
+
+
 class MediaTokenRequest(BaseModel):
     moodleSessionId: int | None = Field(default=None, ge=1)
     attemptId: int | None = Field(default=None, ge=1)
@@ -263,6 +279,21 @@ def stop_moodle_screen_recording(session_id: str, payload: ScreenRecordingReques
 def capture_moodle_snapshot(session_id: str, payload: SnapshotRequest) -> dict:
     try:
         return MediaStore().capture_snapshot(session_id, payload.model_dump())
+    except (KeyError, PermissionError) as exc:
+        raise HTTPException(status_code=404, detail="session_not_found") from exc
+
+
+@compat_router.post("/{session_id}/violations", dependencies=[Depends(require_api_auth)])
+def register_moodle_violation_evidence(
+    session_id: str,
+    payload: MoodleViolationEvidenceRequest,
+) -> dict:
+    """Queue evidence for an existing Moodle violation without echoing it back."""
+    try:
+        data = payload.model_dump()
+        data["sessionId"] = session_id
+        data["source"] = "moodle_browser"
+        return MediaStore().record_violation(data, send_webhook=False)
     except (KeyError, PermissionError) as exc:
         raise HTTPException(status_code=404, detail="session_not_found") from exc
 
